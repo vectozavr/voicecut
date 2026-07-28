@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voicecut"
+version = "0.1.0"
+description = "Local, script-aware editing and mastering for retake-heavy narration"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { file = "LICENSE" }
+authors = [{ name = "VoiceCut contributors" }]
+keywords = ["audio", "narration", "speech", "whisper", "voice-over"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+[project.urls]
+Homepage = "https://github.com/vectozavr/voicecut"
+Repository = "https://github.com/vectozavr/voicecut"
+Issues = "https://github.com/vectozavr/voicecut/issues"
+
+[project.optional-dependencies]
+audio = [
+  "numpy==2.4.6",
+  "scipy==1.17.1",
+  "soundfile==0.14.0",
+  "rapidfuzz==3.14.5",
+  "torch==2.8.0",
+  "torchaudio==2.8.0",
+  "whisperx==3.8.6",
+  "faster-whisper==1.2.1",
+  "silero-vad==6.2.1",
+  "librosa==0.11.0",
+]
+mlx = [
+  "mlx==0.32.0",
+  "mlx-whisper==0.4.3",
+  "numpy==2.4.6",
+]
+
+[project.scripts]
+voicecut = "voicecut.pipeline:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

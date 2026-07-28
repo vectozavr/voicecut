@@ -1,0 +1,10 @@
+numpy==2.4.6
+scipy==1.17.1
+soundfile==0.14.0
+rapidfuzz==3.14.5
+torch==2.8.0
+torchaudio==2.8.0
+whisperx==3.8.6
+faster-whisper==1.2.1
+silero-vad==6.2.1
+librosa==0.11.0

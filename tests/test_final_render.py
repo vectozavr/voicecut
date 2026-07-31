@@ -11,6 +11,11 @@ import pytest
 import soundfile as sf
 
 import voicecut.final_render as final_render_module
+from voicecut.breath_detection import (
+    RESPIRO_CHECKPOINT_SHA256,
+    RESPIRO_FRAME_HOP_MS,
+    RESPIRO_UPSTREAM_COMMIT,
+)
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.final_render import FinalRenderError, render_final_cut
 from voicecut.mfa_alignment import MFA_MODEL_ID, MFA_VERSION
@@ -664,6 +669,161 @@ def _familiar_repair_fixture(
     return audio_path, plan_path, pause_path, words
 
 
+def _breath_cleanup_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, list[dict[str, Any]]]:
+    source = np.empty((2200, 1), dtype=np.float32)
+    time = np.arange(len(source), dtype=np.float32) / SAMPLE_RATE
+    source[:, 0] = 0.001 * np.sin(2.0 * np.pi * 13.0 * time)
+    _speech(source, 100, 500, frequency=173.0)
+    breath_time = np.arange(130, dtype=np.float32) / SAMPLE_RATE
+    source[650:780, 0] += 0.002 * np.sin(2.0 * np.pi * 47.0 * breath_time)
+    _speech(source, 1000, 1400, frequency=211.0)
+    audio_path = tmp_path / "breath_source.wav"
+    sf.write(audio_path, source, SAMPLE_RATE, subtype="FLOAT")
+
+    transcript_path = tmp_path / "breath_source_transcript.json"
+    write_json(
+        transcript_path,
+        {
+            "schema_version": 1,
+            "artifact_role": "source_transcript",
+            "audio": str(audio_path),
+            "audio_sha256": sha256_file(audio_path),
+            "atoms": [],
+        },
+    )
+    words = [
+        {"id": 0, "text": "words", "start": 0.10, "end": 0.50},
+        {"id": 1, "text": "continue.", "start": 1.00, "end": 1.40},
+    ]
+    committed = [
+        _familiar_thought(
+            words=words,
+            ranges=[(0, 2)],
+            canonical_text="Words continue.",
+        )
+    ]
+    grounding_path = tmp_path / "breath_grounding_validation.json"
+    plan_path = tmp_path / "breath_streaming_plan.json"
+    plan = {
+        "schema_version": 1,
+        "planner": "streaming_narration_v1",
+        "status": "complete",
+        "backend": "gemini",
+        "model": "cached-test-model",
+        "transcript": str(transcript_path),
+        "transcript_sha256": sha256_file(transcript_path),
+        "grounding_validation": str(grounding_path),
+        "word_count": len(words),
+        "words": words,
+        "committed": committed,
+        "selected_source_ranges": [{"start_word_id": 0, "end_word_id": 2}],
+        "reconstructed_narration": "Words continue.",
+    }
+    write_json(plan_path, plan)
+    write_json(
+        grounding_path,
+        {
+            "schema_version": 1,
+            "validator": "strict_bidirectional_range_source_grounding_v2",
+            "status": "valid",
+            "finalized_thoughts": 1,
+            "source_ranges": 1,
+            "canonical_tokens": 2,
+            "supported_tokens": 2,
+            "unsupported_tokens": [],
+            "unrepresented_source_tokens": [],
+            "planner_retries": 0,
+            "plan_accepted": True,
+            "error": None,
+            "thoughts": [copy.deepcopy(committed[0]["grounding_validation"])],
+        },
+    )
+    pause_path = tmp_path / "breath_pause_plan.json"
+    write_json(
+        pause_path,
+        {
+            "schema_version": 1,
+            "planner": "semantic_pause_planner_v1",
+            "backend": "gemini",
+            "model": "cached-test-model",
+            "streaming_plan": str(plan_path),
+            "streaming_plan_sha256": sha256_file(plan_path),
+            "thought_count": 1,
+            "transition_count": 0,
+            "transitions": [],
+            "attempts": [],
+        },
+    )
+    return audio_path, plan_path, pause_path, words
+
+
+def _breath_cleanup_alignment_evidence(
+    *,
+    words: list[dict[str, Any]],
+    audio_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    eof_words, eof_crop = _context_geometry(
+        words,
+        role_word_ids=(1,),
+        total_samples=2200,
+    )
+    gap_words, gap_crop = _context_geometry(
+        words,
+        role_word_ids=(0, 1),
+        total_samples=2200,
+    )
+    completeness = _completeness_payload(
+        words=words,
+        contexts=[(eof_words, None)],
+    )
+    mfa = _mfa_payload(
+        words=words,
+        selected_word_ids={0, 1},
+        source_audio_sha256=sha256_file(audio_path),
+        contexts=[
+            ("eof_tail", eof_words, eof_crop, None),
+            (
+                "breath_retained_gap_0000",
+                gap_words,
+                gap_crop,
+                None,
+            ),
+        ],
+    )
+    return completeness, mfa
+
+
+def _breath_detector_payload() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "backend": "respiro-en",
+        "upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+        "checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+        "frame_hop_ms": RESPIRO_FRAME_HOP_MS,
+        "threshold": 0.5,
+        "minimum_duration_ms": 80,
+        "status": "complete",
+        "events": [
+            {
+                "start_sample": 450,
+                "end_sample": 530,
+                "start_seconds": 0.45,
+                "end_seconds": 0.53,
+                "peak_probability": 0.91,
+            },
+            {
+                "start_sample": 650,
+                "end_sample": 780,
+                "start_seconds": 0.65,
+                "end_seconds": 0.78,
+                "peak_probability": 0.97,
+            },
+        ],
+    }
+
+
 def _grounded_evidence(
     *,
     words: list[dict[str, Any]],
@@ -895,7 +1055,8 @@ def test_debug_flag_does_not_reintroduce_staged_production_wavs(
     )
 
     assert manifest["debug_artifacts_requested"] is True
-    assert manifest["debug_artifacts_written"] is False
+    assert manifest["debug_artifacts_written"] is True
+    assert Path(manifest["breath_debug_manifest"]).is_file()
     assert not (output_dir / "work").exists()
     assert not list(output_dir.rglob("rough_cut*.wav"))
     assert not list(output_dir.rglob("*aligned.wav"))
@@ -1210,3 +1371,258 @@ def test_weak_first_familiar_is_repaired_to_complete_later_occurrence(
         if "completeness_contexts" not in path.parts
     )
     assert rendered_wavs == [Path(manifest["final_cut_wav"])]
+
+
+def test_breath_cleanup_replaces_only_mfa_confirmed_non_speech_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_path, words = _breath_cleanup_fixture(tmp_path)
+    completeness, mfa = _breath_cleanup_alignment_evidence(
+        words=words,
+        audio_path=audio_path,
+    )
+    output_dir = tmp_path / "breath_cleanup_final"
+
+    def reject_detector_adapter(**_: Any) -> dict[str, Any]:
+        raise AssertionError("injected breath evidence must bypass the adapter")
+
+    monkeypatch.setattr(
+        final_render_module,
+        "analyze_breath_evidence",
+        reject_detector_adapter,
+    )
+    original_render = final_render_module.render_boundary_plan
+    render_hashes: list[tuple[str, str]] = []
+
+    def count_immutable_render(**kwargs: Any) -> dict[str, Any]:
+        boundary_path = Path(kwargs["boundary_plan_path"])
+        before = sha256_file(boundary_path)
+        result = original_render(**kwargs)
+        render_hashes.append((before, sha256_file(boundary_path)))
+        return result
+
+    monkeypatch.setattr(
+        final_render_module,
+        "render_boundary_plan",
+        count_immutable_render,
+    )
+
+    manifest = render_final_cut(
+        audio_path=audio_path,
+        plan_path=plan_path,
+        output_dir=output_dir,
+        pause_plan_path=pause_path,
+        alignment_python=tmp_path / "model-must-not-run",
+        alignment_payload=completeness,
+        mfa_payload=mfa,
+        breath_cleanup="replace",
+        breath_payload=_breath_detector_payload(),
+        max_acoustic_retries=0,
+    )
+
+    assert manifest["breath_cleanup_status"] == "complete"
+    assert manifest["breaths_detected"] == 2
+    assert manifest["breaths_replaced"] == 1
+    assert manifest["breaths_skipped_phone_overlap"] == 1
+    assert render_hashes == [
+        (
+            manifest["final_boundary_plan_sha256"],
+            manifest["final_boundary_plan_sha256"],
+        )
+    ]
+
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    cleanup = boundary_plan["breath_cleanup"]
+    assert cleanup["status"] == "complete"
+    assert len(cleanup["events"]) == 2
+    false_s_event = next(
+        event for event in cleanup["events"] if event["start_sample"] == 450
+    )
+    assert false_s_event["status"] == "breath_cleanup_skipped_phone_overlap"
+    assert false_s_event["replacements"] == []
+    assert false_s_event["protected_phone_intersections"]
+    assert {
+        interval["phone"] for interval in false_s_event["protected_phone_intersections"]
+    } == {"S"}
+    assert false_s_event["editable_intersection"] == [
+        {
+            "start_sample": 510,
+            "end_sample": 990,
+            "source_interval_index": 0,
+            "verification": "mfa_confirmed_editable_non_speech",
+            "intersection_start_sample": 510,
+            "intersection_end_sample": 530,
+        }
+    ]
+
+    real_breath = next(
+        event for event in cleanup["events"] if event["start_sample"] == 650
+    )
+    assert real_breath["status"] == "breath_replaced_with_verified_room_tone"
+    assert len(real_breath["replacements"]) == 1
+    replacement = cleanup["replacements"][0]
+    assert replacement["target_start_sample"] == 620
+    assert replacement["target_end_sample"] == 810
+    assert replacement["target_duration_samples"] == 190
+    assert replacement["replacement_duration_samples"] == 190
+    assert (
+        sum(
+            source_range["source_end_sample"] - source_range["source_start_sample"]
+            for source_range in replacement["replacement_room_tone_source_ranges"]
+        )
+        == 190
+    )
+
+    protected_mask = boundary_plan["protected_speech_mask"]
+    assert any(
+        item["phone"] == "S"
+        and item["phone_start_sample"] == 100
+        and item["phone_end_sample"] == 500
+        for item in protected_mask
+    )
+    for transition in replacement["transition_ranges"]:
+        transition_start = int(transition["target_start_sample"])
+        transition_end = int(transition["target_end_sample"])
+        assert all(
+            max(transition_start, int(protected["start_sample"]))
+            >= min(transition_end, int(protected["end_sample"]))
+            for protected in protected_mask
+        )
+
+    exclusions = cleanup["room_tone_exclusions"]
+    assert any(
+        exclusion["reason"] == "breath_event"
+        and exclusion["start_sample"] == 650
+        and exclusion["end_sample"] == 780
+        for exclusion in exclusions
+    )
+    for source_range in replacement["replacement_room_tone_source_ranges"]:
+        assert all(
+            max(
+                int(source_range["source_start_sample"]),
+                int(exclusion["start_sample"]),
+            )
+            >= min(
+                int(source_range["source_end_sample"]),
+                int(exclusion["end_sample"]),
+            )
+            for exclusion in exclusions
+        )
+    assert {
+        rejection["reason"] for rejection in cleanup["room_tone_candidate_rejections"]
+    } >= {"breath_event", "breath_guard"}
+
+    assert manifest["frame_count"] == boundary_plan["expected_output_frame_count"]
+    assert manifest["frame_count"] == sum(
+        int(segment["output_end_sample"]) - int(segment["output_start_sample"])
+        for segment in boundary_plan["output_segments"]
+    )
+    source_segment = next(
+        segment
+        for segment in boundary_plan["output_segments"]
+        if segment["kind"] == "source"
+        and int(segment["source_start_sample"]) <= 450
+        and int(segment["source_end_sample"]) >= 530
+    )
+    false_tail_output_start = int(source_segment["output_start_sample"]) + (
+        450 - int(source_segment["source_start_sample"])
+    )
+    source_audio, _ = sf.read(audio_path, dtype="float32", always_2d=True)
+    rendered_audio, _ = sf.read(
+        Path(manifest["final_cut_wav"]),
+        dtype="float32",
+        always_2d=True,
+    )
+    assert np.array_equal(
+        rendered_audio[false_tail_output_start : false_tail_output_start + 80],
+        source_audio[450:530],
+    )
+
+    production_wavs = sorted(
+        path
+        for path in output_dir.rglob("*.wav")
+        if "completeness_contexts" not in path.parts
+    )
+    assert production_wavs == [Path(manifest["final_cut_wav"])]
+
+
+def test_breath_detector_failure_preserves_valid_boundary_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_path, words = _breath_cleanup_fixture(tmp_path)
+    completeness, mfa = _breath_cleanup_alignment_evidence(
+        words=words,
+        audio_path=audio_path,
+    )
+    output_dir = tmp_path / "breath_detector_failure"
+    render_calls = 0
+    original_render = final_render_module.render_boundary_plan
+
+    def count_authoritative_render(**kwargs: Any) -> dict[str, Any]:
+        nonlocal render_calls
+        render_calls += 1
+        return original_render(**kwargs)
+
+    monkeypatch.setattr(
+        final_render_module,
+        "render_boundary_plan",
+        count_authoritative_render,
+    )
+
+    with pytest.warns(RuntimeWarning, match="breath cleanup was skipped"):
+        manifest = render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_path,
+            alignment_python=tmp_path / "model-must-not-run",
+            alignment_payload=completeness,
+            mfa_payload=mfa,
+            breath_cleanup="replace",
+            breath_payload={"backend": "incompatible-detector"},
+            max_acoustic_retries=0,
+        )
+
+    assert render_calls == 1
+    assert manifest["status"] == "complete"
+    assert manifest["breath_cleanup_status"] == (
+        "breath_cleanup_skipped_detector_failure"
+    )
+    assert manifest["breaths_detected"] == 0
+    assert manifest["breaths_replaced"] == 0
+
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert boundary_plan["status"] == "safe"
+    assert boundary_plan["breath_cleanup"]["status"] == (
+        "breath_cleanup_skipped_detector_failure"
+    )
+    assert boundary_plan["breath_cleanup"]["replacements"] == []
+    assert boundary_plan["breath_cleanup"]["error"] is not None
+    source_segment = next(
+        segment
+        for segment in boundary_plan["output_segments"]
+        if segment["kind"] == "source"
+        and int(segment["source_start_sample"]) <= 650
+        and int(segment["source_end_sample"]) >= 780
+    )
+    breath_output_start = int(source_segment["output_start_sample"]) + (
+        650 - int(source_segment["source_start_sample"])
+    )
+    source_audio, _ = sf.read(audio_path, dtype="float32", always_2d=True)
+    rendered_audio, _ = sf.read(
+        Path(manifest["final_cut_wav"]),
+        dtype="float32",
+        always_2d=True,
+    )
+    assert np.array_equal(
+        rendered_audio[breath_output_start : breath_output_start + 130],
+        source_audio[650:780],
+    )
+    production_wavs = sorted(
+        path
+        for path in output_dir.rglob("*.wav")
+        if "completeness_contexts" not in path.parts
+    )
+    assert production_wavs == [Path(manifest["final_cut_wav"])]

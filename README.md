@@ -3,7 +3,8 @@
 VoiceCut turns a retake-heavy spoken recording into coherent narration. It
 transcribes the recording once, asks a selected language model which source
 word occurrences belong in the intended take, validates that decision against
-the source transcript, and renders waveform-safe cuts.
+the source transcript, aligns retained boundaries to phones with Montreal
+Forced Aligner (MFA), and renders the accepted edit once from the source.
 
 It accepts audio or video. Video is edited from its speech track: selected
 audio intervals select the corresponding picture intervals, and an inserted
@@ -19,16 +20,20 @@ adds generated background noise. The final voice samples come from the input.
 - macOS
 - Python 3.11 or 3.12
 - FFmpeg and FFprobe
+- micromamba (installed by the repository installer through Homebrew when
+  absent)
 
-The first run downloads the selected Whisper and alignment models. A local
-language model is downloaded only when a local planner backend is selected.
-Model files can require several gigabytes of disk space.
+The first transcription downloads the selected Whisper model. The first
+alignment run downloads the `english_us_arpa` MFA model into VoiceCut's
+persistent cache at `.voicecut-cache/runtime/mfa`. A local language model is
+downloaded only when a local planner backend is selected. Model files can
+require several gigabytes of disk space.
 
 ## Install
 
 The supported distribution is a source checkout installed by the repository
 installer. A bare wheel or `pip install voicecut` does not create the separate
-MLX helper environment required by the pipeline.
+MLX and pinned MFA helper runtimes required by the pipeline.
 
 Clone the repository and run the installer:
 
@@ -42,18 +47,22 @@ source .venv/bin/activate
 The installer:
 
 1. verifies Apple Silicon and Python;
-2. installs FFmpeg with Homebrew when it is missing;
-3. creates the primary `.venv` and an internal `.venv-mlx` helper environment;
-4. installs VoiceCut, audio/alignment dependencies, and cloud SDKs in `.venv`;
-5. installs MLX Whisper and local-planner dependencies in `.venv-mlx`;
-6. creates an empty `.env` from `.env.example` without overwriting an existing
+2. installs FFmpeg and micromamba with Homebrew when they are missing;
+3. creates the repository-local `.mfa-env` from `environment-mfa.yml` and
+   verifies that it contains exactly MFA 3.4.1;
+4. creates the primary `.venv` and an internal `.venv-mlx` helper environment;
+5. installs VoiceCut, audio dependencies, the WhisperX completeness-veto
+   runtime, and cloud SDKs in `.venv`;
+6. installs MLX Whisper and local-planner dependencies in `.venv-mlx`;
+7. creates an empty `.env` from `.env.example` without overwriting an existing
    file and restricts it to the current user (`0600`).
 
-You invoke only the `voicecut` command from `.venv`. The helper environment is
-launched automatically. It is separate because current `mlx-lm` requires
-Transformers 5 and Hugging Face Hub 1.x, while WhisperX requires Hugging Face
-Hub below 1; forcing both into one environment produces an unsatisfiable
-installation.
+You invoke only the `voicecut` command from `.venv`; VoiceCut launches both
+helper runtimes automatically. `.venv-mlx` is separate because current
+`mlx-lm` requires Transformers 5 and Hugging Face Hub 1.x, while WhisperX
+requires Hugging Face Hub below 1. `.mfa-env` separately pins the Conda/Kaldi
+stack required by MFA 3.4.1. The installer does not initialize or modify your
+shell for micromamba.
 
 To use a different Python installation:
 
@@ -64,7 +73,16 @@ VOICECUT_PYTHON=/opt/homebrew/bin/python3.12 ./scripts/install.sh
 Manual installation is also supported:
 
 ```bash
-brew install python@3.12 ffmpeg
+brew install python@3.12 ffmpeg micromamba
+
+micromamba create -y \
+  -p "$PWD/.mfa-env" \
+  -f "$PWD/environment-mfa.yml"
+mkdir -p "$PWD/.voicecut-cache/runtime/mfa/huggingface"
+MFA_ROOT_DIR="$PWD/.voicecut-cache/runtime/mfa" \
+HF_HOME="$PWD/.voicecut-cache/runtime/mfa/huggingface" \
+  micromamba run -p "$PWD/.mfa-env" mfa version
+
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip setuptools wheel
 .venv/bin/python -m pip install -e ".[audio,cloud]"
@@ -78,12 +96,19 @@ source .venv/bin/activate
 chmod 600 .env
 ```
 
+The version command in the manual installation must report exactly `3.4.1`.
+VoiceCut invokes MFA only through `micromamba run -p .mfa-env`; it does not
+import undocumented MFA Python internals into either virtual environment.
+
 Cloud SDKs are optional when only local planning is needed:
 
 ```bash
 .venv/bin/python -m pip install -e ".[audio]"
 .venv-mlx/bin/python -m pip install -e ".[mlx]"
 ```
+
+The `.mfa-env` runtime is required for production cuts regardless of which
+semantic planner backend is selected.
 
 ## Quick start
 
@@ -267,13 +292,15 @@ voicecut interview.mov \
 ```
 
 The work directory contains the canonical input WAV, analysis, word transcript,
-acoustic retry evidence, streaming semantic plan, grounding report, alignment
-context crops required by WhisperX, the semantic pause plan, one authoritative
-`final_boundary_plan.json`, and one final internal WAV. No rendered preview WAV
-feeds another production step. Completed stages are reused only when their input
-hashes, relevant model settings, and VoiceCut implementation fingerprint match.
-A software update therefore cannot silently reuse a plan or render produced by
-older code.
+acoustic retry evidence, streaming semantic plan, grounding report, local
+WhisperX completeness-veto crops, the batched MFA corpus and word/phone
+alignment JSON, the semantic pause plan, one authoritative
+`final_boundary_plan.json`, and one final internal WAV. MFA context WAVs are
+crops from the canonical source used only as alignment input; they are not
+rendered narration. No rendered preview WAV feeds another production step.
+Completed stages are reused only when their input hashes, relevant model
+settings, and VoiceCut implementation fingerprint match. A software update
+therefore cannot silently reuse a plan or render produced by older code.
 
 Legacy rough, trailing, hard-boundary, leading-boundary, and semantic-pause WAV
 renderers remain available to developers as isolated preview helpers. They are
@@ -357,35 +384,66 @@ The LLM selects occurrences; it never selects sample coordinates.
 ### 6. One authoritative boundary plan and one render
 
 VoiceCut first resolves every real source discontinuity without rendering any
-output audio. For each omitted region, one local WhisperX context covers the
-retained and omitted words on both sides. Character or word alignments define
-protected speech spans with a small safety margin. Whisper timestamps remain
-approximate anchors and are never clamped together or used as hard cut limits.
-WhisperX word and character scores are preserved in the boundary plan. Before
-a retained word can become a cut edge, VoiceCut verifies complete character
-coverage, monotonic timing, and leading or trailing character confidence
-relative to the same local alignment context. A weak or incomplete occurrence
-is rejected as `weak_retained_word_alignment` rather than treated as a complete
-word merely because forced alignment returned timestamps.
+output audio. WhisperX remains in production only as a retained-word
+completeness veto: its character coverage and edge scores can reject an
+incomplete occurrence as `weak_retained_word_alignment`, but no WhisperX
+timestamp is allowed to become a final cut coordinate. Weak word occurrences
+and rejected source edges remain forbidden during the bounded, source-grounded
+semantic repair loop. If no acceptable selection is found within the retry
+limit, the run stops before rendering.
 
-Waveform energy is secondary evidence: it may choose a splice only inside an
-alignment-established interval that also contains verified quiet audio. If no
-such interval exists, the boundary is recorded as `unsafe_dense_boundary`.
-Before giving up, the existing semantic planner receives that acoustic report
-and may reselect a more contiguous, source-grounded take. Every rejected edge
-remains forbidden, and every acoustically weak word occurrence remains
-forbidden, so retries cannot oscillate between unsafe cuts or reuse a partial
-take. The revised plan is grounded and aligned again; after the configured
-retry limit, the run stops before rendering instead of guessing. Fades are
-confined to verified quiet intervals, so retained speech—including quiet final
-fricatives such as `/s/`—remains sample-identical to the canonical WAV.
+After the completeness veto passes, VoiceCut creates all local alignment
+contexts from the canonical source WAV. Each context contains the actual
+chronological source words—including retained and omitted attempts—not the
+LLM's polished narration. Whisper timestamps are used only as approximate
+anchors for generous local crops. All contexts for a render attempt are sent
+through one batched MFA 3.4.1 CLI invocation (the variables below are paths
+inside the current VoiceCut run):
+
+```bash
+MFA_ROOT_DIR="$MFA_CACHE_ROOT" \
+HF_HOME="$MFA_CACHE_ROOT/huggingface" \
+micromamba run -p "$REPO_ROOT/.mfa-env" \
+  mfa align_hf \
+  "$CORPUS_DIR" \
+  english_us_arpa \
+  "$OUTPUT_DIR" \
+  --use_g2p \
+  --no_tokenization \
+  --fine_tune \
+  --output_format json \
+  --no_textgrid_cleanup \
+  --temporary_directory "$TEMP_DIR" \
+  --num_jobs "$MFA_NUM_JOBS" \
+  --clean \
+  --overwrite
+```
+
+MFA word and phone intervals are mapped back to the ordered source word IDs.
+The final non-silence phone of the retained word on the left and the first
+non-silence phone of the retained word on the right define the protected speech
+edges and authoritative source sample coordinates. Missing or ambiguous word
+mapping, missing phones, invalid phone geometry, or an endpoint inside a
+retained phone fails closed as an MFA alignment error. VoiceCut never falls
+back to a Whisper timestamp.
+
+When MFA confirms a phone-free or silence-phone interval, waveform energy and
+zero crossings may choose a convenient splice only inside that interval. They
+cannot decide that speech has ended or move a cut into a retained phone. A
+dense word-to-word boundary does not require silence: if both retained words
+are complete and their MFA phone geometry is valid, VoiceCut uses
+`mfa_dense_phone_boundary` at the phone edge without fading either retained
+phone. Fades are allowed only in MFA-confirmed non-speech, so retained speech,
+including quiet final fricatives such as `/s/`, remains copied directly from
+the canonical WAV.
 
 A separate semantic pause classification still assigns `continuation`, `short`,
 `thought`, or `section`. Existing natural quiet counts toward the target total
-gap. Any deficit is filled with verified room tone only at a resolved safe join,
-or inside an aligned natural inter-word gap within a contiguous take. If there
-is no safe internal gap, the extra pause is skipped. The final word uses a safe
-EOF tail because no later unwanted word can be included.
+gap. Any deficit is filled with verified room tone only at an MFA-resolved
+join, or inside an MFA-confirmed inter-word non-speech interval within a
+contiguous take. If there is no confirmed internal gap, the extra pause is
+skipped. At EOF, the complete final MFA phone is protected before the existing
+safe tail is retained and any fade can begin.
 
 Only after all boundaries, pauses, room-tone source ranges, and fade intervals
 have been frozen in `final_boundary_plan.json` does `final_render.py` slice the
@@ -420,15 +478,46 @@ Important options:
 | `--local-files-only` | Do not download a local planner model |
 | `--language en` | Source language; currently English |
 | `--whisper-model NAME` | Override the MLX Whisper repository |
+| `--alignment-backend mfa` | Production cut-coordinate backend; MFA is mandatory and the default |
+| `--mfa-prefix PATH` | Repository-local micromamba prefix containing MFA 3.4.1; defaults to `.mfa-env` |
+| `--mfa-cache-root PATH` | Persistent MFA model/cache directory passed as `MFA_ROOT_DIR`; defaults to `.voicecut-cache/runtime/mfa` |
+| `--mfa-micromamba PATH` | micromamba executable used to run the pinned MFA prefix |
+| `--mfa-num-jobs N` | Parallel jobs inside the one batched `mfa align_hf` invocation |
 | `--window-seconds N` | New transcript look-ahead added per planner iteration |
 | `--max-output-tokens N` | Maximum structured planner response size |
-| `--max-acoustic-retries N` | Planner reselections after a dense boundary or weak retained-word occurrence; defaults to 3 |
+| `--max-acoustic-retries N` | Bounded planner reselections after an acoustic failure or weak retained-word occurrence; defaults to 3 |
 | `--debug-artifacts` | Request optional diagnostics without changing the single-pass render graph |
 | `--asr-python PATH` | Advanced: Python executable for MLX ASR/local CTC stages |
-| `--alignment-python PATH` | Advanced: Python executable for WhisperX alignment |
+| `--alignment-python PATH` | Advanced: Python executable containing WhisperX for the completeness veto only; it never supplies cut coordinates |
 | `--planner-python PATH` | Advanced: Python executable for local MLX LLMs |
 
 Run `voicecut --help` for the authoritative option list.
+
+## MFA troubleshooting
+
+Check the isolated runtime without activating or initializing micromamba:
+
+```bash
+MFA_ROOT_DIR="$PWD/.voicecut-cache/runtime/mfa" \
+HF_HOME="$PWD/.voicecut-cache/runtime/mfa/huggingface" \
+  micromamba run -p "$PWD/.mfa-env" mfa version
+```
+
+The command must report exactly `3.4.1`. If `.mfa-env` is missing or contains a
+different version, remove that repository-local environment and rerun
+`./scripts/install.sh`; do not install MFA into `.venv` or `.venv-mlx`.
+
+The first real alignment needs network access to download `english_us_arpa`.
+Later runs reuse the persistent directory selected by `--mfa-cache-root`.
+Changing the cache root can therefore cause a new model download. The work
+directory's `mfa_alignment/` artifacts and `final_boundary_plan.json` contain
+the batch contexts, mapped word/phone intervals, final coordinates, and safety
+statuses needed to diagnose a failed run.
+
+An MFA mapping or phone-geometry failure is intentionally fatal. VoiceCut does
+not automatically switch to WhisperX coordinates, Whisper timestamps, an RMS
+minimum, or another aligner. Use a fresh `--work-dir` after correcting the
+runtime, transcript, or input problem so the result is unambiguous.
 
 ## Privacy
 
@@ -462,7 +551,8 @@ run manifests.
 
 ## Development
 
-Install development and cloud dependencies:
+Run `./scripts/install.sh` first so the pinned MFA runtime exists, then install
+development and cloud dependencies:
 
 ```bash
 source .venv/bin/activate
@@ -479,10 +569,13 @@ ruff format --check src tests
 ```
 
 The tests include semantic validation and retry behavior, source grounding,
-alignment-protected `/s/` and leading-word regressions, overlapping Whisper
-timestamps, confidence-aware weak-word rejection, fail-closed dense boundaries,
-semantic pauses, EOF tails, sample-trace invariants, media conversion, video
-timeline construction, caching, and one-command orchestration.
+MFA phone-protected `/s/` and leading-word regressions, dense phone-to-phone
+boundaries, overlapping Whisper anchors, confidence-aware weak-word rejection,
+fail-closed MFA mapping and geometry errors, semantic pauses, EOF tails,
+sample-trace invariants, media conversion, video timeline construction,
+caching, and one-command orchestration. The real MFA integration test is opt-in
+with `VOICECUT_RUN_MFA_INTEGRATION=1`; ordinary CI uses recorded JSON fixtures
+and does not download the alignment model.
 
 ## License
 

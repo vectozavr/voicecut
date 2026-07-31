@@ -8,6 +8,12 @@ MLX_VENV_DIR="${PROJECT_DIR}/.venv-mlx"
 MFA_ENV_DIR="${PROJECT_DIR}/.mfa-env"
 MFA_CACHE_ROOT="${VOICECUT_MFA_CACHE_ROOT:-${PROJECT_DIR}/.voicecut-cache/runtime/mfa}"
 MFA_HF_CACHE="${MFA_CACHE_ROOT}/huggingface"
+RESPIRO_UPSTREAM_COMMIT="70e01c60c2f582c41092730680f2894ab24d6467"
+RESPIRO_MODULES_SHA256="f789e0986e3090d7df5f9f0f596d9e3601c6da514c3ac01a65920a493b840e46"
+RESPIRO_CHECKPOINT_SHA256="1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
+RESPIRO_LICENSE_SHA256="a34ad1af58dc7c02f867f620f7ddc952029b383c9b0dce349d54f6b875e079cd"
+RESPIRO_CACHE_ROOT="${VOICECUT_RESPIRO_CACHE_ROOT:-${PROJECT_DIR}/.voicecut-cache/runtime/respiro-en/${RESPIRO_UPSTREAM_COMMIT}}"
+RESPIRO_RAW_URL="https://raw.githubusercontent.com/ydqmkkx/Respiro-en/${RESPIRO_UPSTREAM_COMMIT}"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "VoiceCut currently supports Apple Silicon macOS (arm64)." >&2
@@ -69,6 +75,56 @@ if ! command -v ffmpeg >/dev/null 2>&1 \
 fi
 
 cd "${PROJECT_DIR}"
+
+sha256_file() {
+  shasum -a 256 "$1" | awk '{print $1}'
+}
+
+download_respiro_file() {
+  local filename="$1"
+  local expected_sha256="$2"
+  local destination="${RESPIRO_CACHE_ROOT}/${filename}"
+  local actual_sha256
+
+  if [[ -e "${destination}" ]]; then
+    if [[ ! -f "${destination}" || -L "${destination}" ]]; then
+      echo "Refusing unsafe Respiro-en cache entry: ${destination}" >&2
+      exit 1
+    fi
+    actual_sha256="$(sha256_file "${destination}")"
+    if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+      echo "Respiro-en hash mismatch for existing ${destination}." >&2
+      echo "Expected ${expected_sha256}, got ${actual_sha256}." >&2
+      exit 1
+    fi
+    return
+  fi
+
+  local temporary
+  temporary="$(mktemp "${RESPIRO_CACHE_ROOT}/.${filename}.XXXXXX")"
+  if ! curl --fail --location --retry 3 \
+    --output "${temporary}" \
+    "${RESPIRO_RAW_URL}/${filename}"; then
+    rm -f "${temporary}"
+    echo "Failed to download pinned Respiro-en ${filename}." >&2
+    exit 1
+  fi
+  actual_sha256="$(sha256_file "${temporary}")"
+  if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+    rm -f "${temporary}"
+    echo "Respiro-en hash mismatch for downloaded ${filename}." >&2
+    echo "Expected ${expected_sha256}, got ${actual_sha256}." >&2
+    exit 1
+  fi
+  chmod 600 "${temporary}"
+  mv "${temporary}" "${destination}"
+}
+
+mkdir -p "${RESPIRO_CACHE_ROOT}"
+download_respiro_file "modules.py" "${RESPIRO_MODULES_SHA256}"
+download_respiro_file "respiro-en.pt" "${RESPIRO_CHECKPOINT_SHA256}"
+download_respiro_file "LICENSE" "${RESPIRO_LICENSE_SHA256}"
+echo "Verified Respiro-en ${RESPIRO_UPSTREAM_COMMIT}."
 
 if [[ ! -x "${MFA_ENV_DIR}/bin/mfa" ]]; then
   echo "Creating the pinned MFA 3.4.1 environment..."

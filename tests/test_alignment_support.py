@@ -97,6 +97,43 @@ def test_support_gate_reports_weak_initial_word_support() -> None:
     assert support["monotonic_character_timestamps"] is True
 
 
+def test_single_weak_terminal_character_without_nearby_retry_is_not_a_veto() -> None:
+    example = _span(
+        word_id=16,
+        text="example",
+        word_score=0.826,
+        scores=[0.95, 0.91, 0.93, 0.92, 0.70, 1.0, 0.25],
+    )
+    audio = _span(
+        word_id=36,
+        text="audio",
+        word_score=0.595,
+        scores=[0.91, 0.88, 0.848, 0.513, 0.003],
+    )
+    unrelated = _span(
+        word_id=37,
+        text="from",
+        word_score=0.94,
+        scores=[0.9] * 4,
+    )
+
+    example_support = evaluate_retained_word_support(
+        example,
+        [example, unrelated],
+        edge="terminal",
+    )
+    audio_support = evaluate_retained_word_support(
+        audio,
+        [audio, unrelated],
+        edge="terminal",
+    )
+
+    assert example_support["status"] == "supported_complete_word"
+    assert audio_support["status"] == "supported_complete_word"
+    assert example_support["nearby_same_word_retry"] is False
+    assert audio_support["nearby_same_word_retry"] is False
+
+
 def test_support_gate_requires_complete_ordered_character_evidence() -> None:
     incomplete = _span(
         word_id=1,
@@ -185,3 +222,34 @@ def test_alignment_spans_preserve_zero_score_character_evidence() -> None:
     assert span["characters"][-1]["score"] == 0.0
     assert span["terminal_edge_score"] == 0.0
     assert span["aligned_end"] == 0.9
+
+
+def test_unaligned_neighbor_does_not_invalidate_retained_word_evidence() -> None:
+    job = {
+        "crop_start_seconds": 0.0,
+        "crop_end_seconds": 1.0,
+        "local_words": [
+            {"id": 10, "text": "abandoned", "start": 0.1, "end": 0.4},
+            {"id": 11, "text": "retained", "start": 0.5, "end": 0.9},
+        ],
+    }
+    worker_job = {
+        "error": None,
+        "aligned": {
+            "word_segments": [
+                {"word": "abandoned", "score": 0.0},
+                {"word": "retained", "start": 0.5, "end": 0.9, "score": 0.9},
+            ],
+            "segments": [],
+        },
+    }
+
+    spans = _alignment_spans(
+        job=job,
+        worker_job=worker_job,
+        sample_rate=1000,
+        total_samples=1000,
+    )
+
+    assert 10 not in spans
+    assert spans[11]["word_score"] == 0.9

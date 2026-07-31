@@ -27,7 +27,7 @@ from typing import Any
 
 import soundfile as sf
 
-from .common import read_json, write_json
+from .common import read_json, sha256_file, write_json
 
 MFA_VERSION = "3.4.1"
 MFA_MODEL_ID = "english_us_arpa"
@@ -544,6 +544,7 @@ def prepare_mfa_batch(
             "model_id": MFA_MODEL_ID,
             "fine_tune": True,
             "source_audio": str(audio_path),
+            "source_audio_sha256": sha256_file(audio_path),
             "sample_rate": sample_rate,
             "contexts": batch_metadata,
         },
@@ -982,6 +983,7 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
         "fine_tune": True,
         "sample_rate": sample_rate,
         "source_audio": batch.get("source_audio"),
+        "source_audio_sha256": batch.get("source_audio_sha256"),
         "contexts": parsed_contexts,
     }
 

@@ -33,6 +33,12 @@ from .media import (
     prepare_media_input,
     publish_audio,
 )
+from .mfa_alignment import (
+    DEFAULT_MFA_CACHE_ROOT,
+    DEFAULT_MFA_PREFIX,
+    MFA_MODEL_ID,
+    MFA_VERSION,
+)
 from .planner_backends import (
     API_KEY_ENV_BY_BACKEND,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -48,7 +54,12 @@ from .video_render import render_edited_video
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-PIPELINE_SCHEMA_VERSION = 4
+DEFAULT_ALIGNMENT_BACKEND = "mfa"
+MFA_MODEL = MFA_MODEL_ID
+MFA_FINE_TUNE = True
+DEFAULT_MFA_MICROMAMBA = Path("micromamba")
+DEFAULT_MFA_NUM_JOBS = max(1, min(os.cpu_count() or 1, 4))
+PIPELINE_SCHEMA_VERSION = 5
 
 
 def _preferred_python(relative_path: str) -> Path:
@@ -198,7 +209,11 @@ def _render_is_current(
     effective_plan_sha = value.get("effective_streaming_plan_sha256")
     return (
         value.get("status") == "complete"
-        and value.get("renderer") == "authoritative_single_pass_final_render_v2"
+        and value.get("renderer") == "authoritative_single_pass_final_render_v3"
+        and value.get("alignment_backend") == DEFAULT_ALIGNMENT_BACKEND
+        and value.get("mfa_version") == MFA_VERSION
+        and value.get("mfa_model") == MFA_MODEL
+        and value.get("mfa_fine_tune") is MFA_FINE_TUNE
         and value.get("source_audio_sha256") == audio_sha256
         and value.get("streaming_plan") == str(plan_path.resolve())
         and value.get("streaming_plan_sha256") == sha256_file(plan_path)
@@ -388,6 +403,67 @@ def _default_output(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_edited{extension}")
 
 
+def _resolve_executable(value: Path, *, label: str) -> Path:
+    """Resolve a configured executable without relying on a child shell."""
+
+    expanded = value.expanduser()
+    if expanded.is_absolute() or expanded.parent != Path("."):
+        resolved = expanded.absolute()
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise FullPipelineError(f"{label} is not executable: {resolved}")
+        return resolved
+    discovered = shutil.which(str(expanded))
+    if discovered is None:
+        raise FullPipelineError(
+            f"{label} was not found on PATH: {expanded}; run scripts/install.sh"
+        )
+    # Preserve the configured command name/symlink (notably the Homebrew
+    # `micromamba` link) so provenance records the CLI that was invoked.
+    return Path(discovered).absolute()
+
+
+def _validate_mfa_runtime(
+    *,
+    backend: str,
+    prefix: Path,
+    cache_root: Path,
+    micromamba: Path,
+    num_jobs: int,
+) -> tuple[Path, Path, Path]:
+    """Validate the pinned MFA runtime paths before any media work starts."""
+
+    if backend != DEFAULT_ALIGNMENT_BACKEND:
+        raise FullPipelineError(
+            "MFA is the sole production alignment backend; "
+            f"unsupported --alignment-backend: {backend}"
+        )
+    if num_jobs <= 0:
+        raise FullPipelineError("--mfa-num-jobs must be positive")
+    resolved_prefix = prefix.expanduser().absolute()
+    if not resolved_prefix.is_dir():
+        raise FullPipelineError(
+            f"MFA environment prefix does not exist: {resolved_prefix}; "
+            "run scripts/install.sh"
+        )
+    mfa_executable = resolved_prefix / "bin" / "mfa"
+    if not mfa_executable.is_file() or not os.access(mfa_executable, os.X_OK):
+        raise FullPipelineError(
+            "MFA executable is missing from the configured prefix: "
+            f"{mfa_executable}; run scripts/install.sh"
+        )
+    resolved_micromamba = _resolve_executable(
+        micromamba,
+        label="micromamba executable",
+    )
+    resolved_cache_root = cache_root.expanduser().absolute()
+    if resolved_cache_root.exists() and not resolved_cache_root.is_dir():
+        raise FullPipelineError(
+            f"MFA cache root is not a directory: {resolved_cache_root}"
+        )
+    resolved_cache_root.mkdir(parents=True, exist_ok=True)
+    return resolved_prefix, resolved_cache_root, resolved_micromamba
+
+
 def _configuration(
     *,
     input_path: Path,
@@ -398,6 +474,9 @@ def _configuration(
     asr_python: Path,
     alignment_python: Path,
     planner_python: Path,
+    mfa_prefix: Path,
+    mfa_cache_root: Path,
+    mfa_micromamba: Path,
 ) -> dict[str, Any]:
     return {
         "schema_version": PIPELINE_SCHEMA_VERSION,
@@ -416,7 +495,18 @@ def _configuration(
         "max_acoustic_retries": int(args.max_acoustic_retries),
         "debug_artifacts": bool(args.debug_artifacts),
         "asr_python": str(asr_python),
+        "alignment_backend": args.alignment_backend,
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL,
+        "mfa_fine_tune": MFA_FINE_TUNE,
+        "mfa_prefix": str(mfa_prefix),
+        "mfa_cache_root": str(mfa_cache_root),
+        "mfa_micromamba": str(mfa_micromamba),
+        "mfa_num_jobs": int(args.mfa_num_jobs),
+        # WhisperX remains only as a retained-word completeness veto. It is
+        # not permitted to provide production source-sample coordinates.
         "alignment_python": str(alignment_python),
+        "alignment_python_role": "whisperx_retained_word_completeness_veto_only",
         "planner_python": str(planner_python),
     }
 
@@ -557,7 +647,16 @@ def run_full_pipeline(
     if not asr_python.is_file():
         raise FullPipelineError(f"ASR Python does not exist: {asr_python}")
     if not alignment_python.is_file():
-        raise FullPipelineError(f"alignment Python does not exist: {alignment_python}")
+        raise FullPipelineError(
+            f"WhisperX completeness-veto Python does not exist: {alignment_python}"
+        )
+    mfa_prefix, mfa_cache_root, mfa_micromamba = _validate_mfa_runtime(
+        backend=args.alignment_backend,
+        prefix=args.mfa_prefix,
+        cache_root=args.mfa_cache_root,
+        micromamba=args.mfa_micromamba,
+        num_jobs=args.mfa_num_jobs,
+    )
     if args.planner_backend in {"local", "qwen", "gemma"}:
         if not planner_python.is_file() and asr_python.is_file():
             planner_python = asr_python
@@ -588,6 +687,9 @@ def run_full_pipeline(
         asr_python=asr_python,
         alignment_python=alignment_python,
         planner_python=planner_python,
+        mfa_prefix=mfa_prefix,
+        mfa_cache_root=mfa_cache_root,
+        mfa_micromamba=mfa_micromamba,
     )
     work_dir = _resolve_work_dir(
         requested=args.work_dir,
@@ -820,6 +922,16 @@ def run_full_pipeline(
             str(final_dir),
             "--alignment-python",
             str(alignment_python),
+            "--alignment-backend",
+            args.alignment_backend,
+            "--mfa-prefix",
+            str(mfa_prefix),
+            "--mfa-cache-root",
+            str(mfa_cache_root),
+            "--mfa-micromamba",
+            str(mfa_micromamba),
+            "--mfa-num-jobs",
+            str(args.mfa_num_jobs),
             "--max-acoustic-retries",
             str(args.max_acoustic_retries),
             *planner_arguments,
@@ -912,6 +1024,9 @@ def run_full_pipeline(
         "pipeline_configuration": str(configuration_path),
         "planner_backend": args.planner_backend,
         "planner_model": planner_model,
+        "alignment_backend": args.alignment_backend,
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL,
         "stages": stages,
         "media_input_manifest": str(media_manifest_path),
         "analysis": str(analysis_path),
@@ -970,7 +1085,44 @@ def build_parser() -> argparse.ArgumentParser:
         "--alignment-python",
         type=Path,
         default=DEFAULT_ALIGNMENT_PYTHON,
-        help="Python executable containing WhisperX.",
+        help=(
+            "Python executable containing WhisperX for the retained-word "
+            "completeness veto only; it never supplies production cut "
+            "coordinates."
+        ),
+    )
+    parser.add_argument(
+        "--alignment-backend",
+        choices=(DEFAULT_ALIGNMENT_BACKEND,),
+        default=DEFAULT_ALIGNMENT_BACKEND,
+        help=(
+            "Production cut-coordinate backend. MFA is authoritative; "
+            "Whisper timestamps remain approximate crop anchors only."
+        ),
+    )
+    parser.add_argument(
+        "--mfa-prefix",
+        type=Path,
+        default=DEFAULT_MFA_PREFIX,
+        help="Repository-local micromamba prefix containing MFA 3.4.1.",
+    )
+    parser.add_argument(
+        "--mfa-cache-root",
+        type=Path,
+        default=DEFAULT_MFA_CACHE_ROOT,
+        help="Persistent MFA model/cache directory passed as MFA_ROOT_DIR.",
+    )
+    parser.add_argument(
+        "--mfa-micromamba",
+        type=Path,
+        default=DEFAULT_MFA_MICROMAMBA,
+        help="micromamba executable used to invoke the pinned MFA prefix.",
+    )
+    parser.add_argument(
+        "--mfa-num-jobs",
+        type=int,
+        default=DEFAULT_MFA_NUM_JOBS,
+        help="Parallel MFA jobs used by the single batched align_hf invocation.",
     )
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL)
     parser.add_argument(

@@ -5,12 +5,18 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pytest
 import soundfile as sf
 
 from voicecut.common import read_json, sha256_file, write_json
-from voicecut.final_render import FinalRenderError, render_final_cut
-
+from voicecut.final_render import (
+    _alignment_event_specs,
+    _prepare_alignment_jobs,
+    _ranges_from_selection,
+    _thought_bounds,
+    render_final_cut,
+)
+from voicecut.mfa_alignment import MFA_MODEL_ID, MFA_VERSION, normalize_mfa_token
+from voicecut.rough_render import load_plan_words
 
 SAMPLE_RATE = 1000
 
@@ -183,59 +189,172 @@ def _write_grounded_case(
     return audio_path, plan_path, pause_path
 
 
-def _aligned_payload(
-    words: list[dict[str, Any]],
+def _completeness_payload(
+    jobs: list[dict[str, Any]],
     spans: list[tuple[float, float]],
 ) -> dict[str, Any]:
-    aligned_words = [
-        {
-            "word": word["text"],
-            "start": start,
-            "end": end,
-            "score": 0.99,
-        }
-        for word, (start, end) in zip(words, spans, strict=True)
-    ]
-    characters: list[dict[str, Any]] = []
-    for index, (word, (start, end)) in enumerate(zip(words, spans, strict=True)):
-        alphabetic = [
-            character for character in str(word["text"]) if character.isalpha()
-        ]
-        duration = (end - start) / len(alphabetic)
-        for character_index, character in enumerate(alphabetic):
-            character_start = start + character_index * duration
-            character_end = start + (character_index + 1) * duration
-            characters.append(
+    worker_jobs: list[dict[str, Any]] = []
+    for job in jobs:
+        crop_start = float(job["crop_start_seconds"])
+        aligned_words: list[dict[str, Any]] = []
+        characters: list[dict[str, Any]] = []
+        local_words = job["local_words"]
+        for index, word in enumerate(local_words):
+            start, end = spans[int(word["id"])]
+            relative_start = start - crop_start
+            relative_end = end - crop_start
+            aligned_words.append(
                 {
-                    "char": character,
-                    "start": character_start,
-                    "end": character_end,
+                    "word": word["text"],
+                    "start": relative_start,
+                    "end": relative_end,
                     "score": 0.99,
                 }
             )
-        if index < len(words) - 1:
-            characters.append({"char": " "})
-    return {
-        "schema_version": 1,
-        "backend": "whisperx_alignment",
-        "language": "en",
-        "device": "cpu",
-        "jobs": [
+            alphabetic = [
+                character for character in str(word["text"]) if character.isalpha()
+            ]
+            duration = (relative_end - relative_start) / len(alphabetic)
+            for character_index, character in enumerate(alphabetic):
+                character_start = relative_start + character_index * duration
+                character_end = relative_start + (character_index + 1) * duration
+                characters.append(
+                    {
+                        "char": character,
+                        "start": character_start,
+                        "end": character_end,
+                        "score": 0.99,
+                    }
+                )
+            if index < len(local_words) - 1:
+                characters.append({"char": " "})
+        worker_jobs.append(
             {
-                "clip_index": 0,
+                "clip_index": int(job["clip_index"]),
                 "error": None,
                 "aligned": {
                     "word_segments": aligned_words,
                     "segments": [
                         {
-                            "text": " ".join(str(word["text"]) for word in words),
+                            "text": job["local_source_text"],
                             "words": aligned_words,
                             "chars": characters,
                         }
                     ],
                 },
             }
-        ],
+        )
+    return {
+        "schema_version": 1,
+        "backend": "whisperx_alignment",
+        "language": "en",
+        "device": "cpu",
+        "purpose": "retained_word_completeness_veto",
+        "coordinate_authority": False,
+        "jobs": worker_jobs,
+    }
+
+
+def _phone_records(
+    token: str,
+    *,
+    start: float,
+    end: float,
+) -> list[dict[str, Any]]:
+    labels = [character.upper() for character in token if character.isalnum()]
+    if not labels:
+        labels = ["SPN"]
+    duration = (end - start) / len(labels)
+    return [
+        {
+            "phone": label,
+            "start_seconds": start + index * duration,
+            "end_seconds": start + (index + 1) * duration,
+            "start_sample": round((start + index * duration) * SAMPLE_RATE),
+            "end_sample": round((start + (index + 1) * duration) * SAMPLE_RATE),
+            "is_silence": False,
+        }
+        for index, label in enumerate(labels)
+    ]
+
+
+def _mfa_payload(
+    jobs: list[dict[str, Any]],
+    spans: list[tuple[float, float]],
+    *,
+    source_audio_sha256: str,
+) -> dict[str, Any]:
+    contexts: list[dict[str, Any]] = []
+    for job in jobs:
+        mapped_words: list[dict[str, Any]] = []
+        speech_phones: list[dict[str, Any]] = []
+        for word in job["local_words"]:
+            word_id = int(word["id"])
+            word_start, word_end = spans[word_id]
+            tokens = normalize_mfa_token(str(word["text"]))
+            token_duration = (word_end - word_start) / len(tokens)
+            for token_index, token in enumerate(tokens):
+                start = word_start + token_index * token_duration
+                end = word_start + (token_index + 1) * token_duration
+                phones = _phone_records(token, start=start, end=end)
+                mapped_words.append(
+                    {
+                        "source_word_ids": [word_id],
+                        "source_text": word["text"],
+                        "mfa_token": token,
+                        "start_seconds": start,
+                        "end_seconds": end,
+                        "start_sample": round(start * SAMPLE_RATE),
+                        "end_sample": round(end * SAMPLE_RATE),
+                        "phones": phones,
+                    }
+                )
+                speech_phones.extend(phones)
+
+        all_phones: list[dict[str, Any]] = []
+        for index, phone in enumerate(speech_phones):
+            if index:
+                previous = speech_phones[index - 1]
+                if int(previous["end_sample"]) < int(phone["start_sample"]):
+                    all_phones.append(
+                        {
+                            "phone": "sil",
+                            "start_seconds": previous["end_seconds"],
+                            "end_seconds": phone["start_seconds"],
+                            "start_sample": previous["end_sample"],
+                            "end_sample": phone["start_sample"],
+                            "is_silence": True,
+                        }
+                    )
+            all_phones.append(phone)
+
+        contexts.append(
+            {
+                "context_id": job["event_key"],
+                "crop_source_start_seconds": job["crop_start_seconds"],
+                "crop_source_end_seconds": job["crop_end_seconds"],
+                "crop_source_start_sample": job["crop_start_sample"],
+                "crop_source_end_sample": job["crop_end_sample"],
+                "ordered_source_word_ids": [
+                    int(word["id"]) for word in job["local_words"]
+                ],
+                "original_source_words": copy.deepcopy(job["local_words"]),
+                "boundary_ids": list(job["boundary_ids"]),
+                "words": mapped_words,
+                "phones": all_phones,
+                "mfa_output_json": f"mock://{job['event_key']}.json",
+            }
+        )
+    return {
+        "schema_version": 1,
+        "backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "model_id": MFA_MODEL_ID,
+        "fine_tune": True,
+        "sample_rate": SAMPLE_RATE,
+        "source_audio": "mock canonical source",
+        "source_audio_sha256": source_audio_sha256,
+        "contexts": contexts,
     }
 
 
@@ -245,7 +364,7 @@ def _render(
     source: np.ndarray,
     words: list[dict[str, Any]],
     thought_ranges: list[list[tuple[int, int]]],
-    spans: list[tuple[float, float]] | None,
+    spans: list[tuple[float, float]],
     pause_types: list[str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], np.ndarray, Path]:
     audio_path, plan_path, pause_path = _write_grounded_case(
@@ -255,6 +374,25 @@ def _render(
         thought_ranges=thought_ranges,
         pause_types=pause_types,
     )
+    semantic_plan = read_json(plan_path)
+    plan_words = load_plan_words(semantic_plan)
+    merged_ranges = _ranges_from_selection(
+        semantic_plan,
+        word_count=len(plan_words),
+    )
+    specs = _alignment_event_specs(
+        words=plan_words,
+        ranges=merged_ranges,
+        thought_bounds=_thought_bounds(semantic_plan),
+    )
+    jobs = _prepare_alignment_jobs(
+        specs=specs,
+        words=plan_words,
+        ranges=merged_ranges,
+        source_audio=source,
+        sample_rate=SAMPLE_RATE,
+        output_dir=tmp_path / "mock_alignment_preflight",
+    )
     output_dir = tmp_path / "final"
     manifest = render_final_cut(
         audio_path=audio_path,
@@ -262,11 +400,22 @@ def _render(
         output_dir=output_dir,
         pause_plan_path=pause_path,
         alignment_python=tmp_path / "model-must-not-run",
-        alignment_payload=(
-            _aligned_payload(words, spans) if spans is not None else {"jobs": []}
+        alignment_payload=_completeness_payload(jobs, spans),
+        mfa_payload=_mfa_payload(
+            jobs,
+            spans,
+            source_audio_sha256=sha256_file(audio_path),
         ),
+        max_acoustic_retries=0,
     )
     boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert boundary_plan["schema_version"] == 2
+    assert boundary_plan["planner"] == "authoritative_single_pass_boundary_plan_v2"
+    assert boundary_plan["alignment_backend"] == "mfa"
+    assert boundary_plan["mfa_version"] == MFA_VERSION
+    assert boundary_plan["mfa_model"] == MFA_MODEL_ID
+    assert boundary_plan["mfa_fine_tune"] is True
+    assert boundary_plan["configuration"]["whisperx_coordinate_authority"] is False
     rendered, _ = sf.read(
         Path(manifest["final_cut_wav"]), dtype="float32", always_2d=True
     )
@@ -346,7 +495,7 @@ def test_retained_word_onset_close_to_removed_material_is_preserved(
     )
 
     start = _boundary(plan, "omitted_to_selected")
-    assert start["selected_source_sample"] <= 950
+    assert 900 <= start["selected_source_sample"] <= 970
     retained = next(
         interval
         for interval in start["protected_speech_intervals"]
@@ -395,10 +544,10 @@ def test_overlapping_whisper_timestamps_are_not_clamped_into_speech(
 
     left = _boundary(plan, "selected_to_omitted")
     right = _boundary(plan, "omitted_to_selected")
-    assert left["selected_source_sample"] >= 520
+    assert left["selected_source_sample"] >= 500
     assert left["selected_source_sample"] <= 650
     assert right["selected_source_sample"] >= 900
-    assert right["selected_source_sample"] <= 1080
+    assert right["selected_source_sample"] <= 1100
     assert left["whisper_timestamps"]["retained_end_seconds"] == 0.70
     assert left["aligned_timestamps"]["retained_end_seconds"] == 0.50
 
@@ -439,7 +588,9 @@ def test_semantic_pause_inside_contiguous_range_uses_aligned_quiet_gap(
     assert len(rendered) == plan["expected_output_frame_count"]
 
 
-def test_dense_boundary_fails_closed_instead_of_guessing(tmp_path: Path) -> None:
+def test_dense_boundary_uses_mfa_phone_boundary_instead_of_guessing(
+    tmp_path: Path,
+) -> None:
     source = _source(1800)
     _speech(source, 100, 600, 173.0)
     _speech(source, 600, 900, 191.0)
@@ -449,36 +600,23 @@ def test_dense_boundary_fails_closed_instead_of_guessing(tmp_path: Path) -> None
         {"id": 1, "text": "removed", "start": 0.55, "end": 0.90},
         {"id": 2, "text": "after", "start": 0.98, "end": 1.30},
     ]
-    audio_path, plan_path, pause_path = _write_grounded_case(
+    _, plan, rendered, _ = _render(
         tmp_path,
         source=source,
         words=words,
         thought_ranges=[[(0, 1), (2, 3)]],
+        spans=[(0.10, 0.60), (0.60, 0.90), (0.98, 1.30)],
     )
-    output_dir = tmp_path / "final"
 
-    with pytest.raises(FinalRenderError, match="unsafe_dense_boundary"):
-        render_final_cut(
-            audio_path=audio_path,
-            plan_path=plan_path,
-            output_dir=output_dir,
-            pause_plan_path=pause_path,
-            alignment_python=tmp_path / "model-must-not-run",
-            alignment_payload=_aligned_payload(
-                words,
-                [(0.10, 0.60), (0.60, 0.90), (0.98, 1.30)],
-            ),
-            max_acoustic_retries=0,
-        )
-
-    boundary_plan = read_json(output_dir / "final_boundary_plan.json")
-    assert boundary_plan["status"] == "unsafe"
-    assert boundary_plan["unsafe_dense_boundaries"] >= 1
-    assert any(
-        boundary["safety_status"] == "unsafe_dense_boundary"
-        for boundary in boundary_plan["boundaries"]
-    )
-    assert not (output_dir / "final_cut.wav").exists()
+    boundary = _boundary(plan, "selected_to_omitted")
+    assert plan["status"] == "safe"
+    assert boundary["boundary_method"] == "mfa_dense_phone_boundary"
+    assert boundary["safety_status"] == "safe"
+    assert boundary["selected_source_sample"] == 600
+    assert boundary["final_retained_phone"]["end_sample"] == 600
+    assert boundary["fade_intervals"] == []
+    assert plan["mfa_dense_phone_boundaries"] >= 1
+    assert len(rendered) == plan["expected_output_frame_count"]
 
 
 def test_final_word_at_eof_keeps_decay_and_has_no_speech_fade(tmp_path: Path) -> None:
@@ -494,11 +632,15 @@ def test_final_word_at_eof_keeps_decay_and_has_no_speech_fade(tmp_path: Path) ->
         source=source,
         words=words,
         thought_ranges=[[(0, 1)]],
-        spans=None,
+        spans=[(0.10, 0.78)],
     )
 
     final_boundary = plan["final_boundary"]
     assert final_boundary["boundary_method"] == "eof_safe_tail"
+    assert final_boundary["final_word_id"] == 0
+    assert final_boundary["final_word_text"] == "finals"
+    assert final_boundary["final_retained_phone"]["end_sample"] == 780
+    assert final_boundary["mfa_phone_end"] == 0.78
     assert final_boundary["selected_source_sample"] >= 780
     for fade in final_boundary["fade_intervals"]:
         assert fade["source_start_sample"] >= 780

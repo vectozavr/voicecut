@@ -9,10 +9,10 @@ import pytest
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.full_pipeline import (
     FullPipelineError,
-    _WorkDirectoryLock,
     _implementation_fingerprint,
     _run,
     _subprocess_environment,
+    _WorkDirectoryLock,
     build_parser,
     run_full_pipeline,
 )
@@ -20,6 +20,14 @@ from voicecut.planner_backends import PlannerRuntimeConfiguration
 
 
 def _args(tmp_path: Path, source: Path):
+    mfa_prefix = tmp_path / ".mfa-env"
+    mfa_executable = mfa_prefix / "bin" / "mfa"
+    mfa_executable.parent.mkdir(parents=True, exist_ok=True)
+    mfa_executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    mfa_executable.chmod(0o755)
+    micromamba = tmp_path / "micromamba"
+    micromamba.write_text("#!/bin/sh\n", encoding="utf-8")
+    micromamba.chmod(0o755)
     return build_parser().parse_args(
         [
             str(source),
@@ -31,6 +39,16 @@ def _args(tmp_path: Path, source: Path):
             sys.executable,
             "--alignment-python",
             sys.executable,
+            "--alignment-backend",
+            "mfa",
+            "--mfa-prefix",
+            str(mfa_prefix),
+            "--mfa-cache-root",
+            str(tmp_path / "mfa-cache"),
+            "--mfa-micromamba",
+            str(micromamba),
+            "--mfa-num-jobs",
+            "2",
             "--planner-python",
             sys.executable,
             "--planner-backend",
@@ -143,6 +161,20 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                 },
             )
         elif module == "voicecut.final_render":
+            assert command[command.index("--alignment-python") + 1] == str(
+                Path(sys.executable).absolute()
+            )
+            assert command[command.index("--alignment-backend") + 1] == "mfa"
+            assert command[command.index("--mfa-prefix") + 1] == str(
+                args.mfa_prefix.absolute()
+            )
+            assert command[command.index("--mfa-cache-root") + 1] == str(
+                args.mfa_cache_root.absolute()
+            )
+            assert command[command.index("--mfa-micromamba") + 1] == str(
+                args.mfa_micromamba.absolute()
+            )
+            assert command[command.index("--mfa-num-jobs") + 1] == "2"
             output_dir = Path(command[command.index("--output-dir") + 1])
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
@@ -154,7 +186,11 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                 output_dir / "final_render_manifest.json",
                 {
                     "status": "complete",
-                    "renderer": "authoritative_single_pass_final_render_v2",
+                    "renderer": "authoritative_single_pass_final_render_v3",
+                    "alignment_backend": "mfa",
+                    "mfa_version": "3.4.1",
+                    "mfa_model": "english_us_arpa",
+                    "mfa_fine_tune": True,
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),
@@ -194,6 +230,16 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
         command for command in calls if "voicecut.transcribe_mlx" in command
     )
     assert transcription_command[0] == str(Path(sys.executable).absolute())
+    configuration = read_json(args.work_dir / "pipeline_config.json")
+    assert configuration["alignment_backend"] == "mfa"
+    assert configuration["mfa_prefix"] == str(args.mfa_prefix.absolute())
+    assert configuration["mfa_cache_root"] == str(args.mfa_cache_root.absolute())
+    assert configuration["mfa_micromamba"] == str(args.mfa_micromamba.absolute())
+    assert configuration["mfa_num_jobs"] == 2
+    assert (
+        configuration["alignment_python_role"]
+        == "whisperx_retained_word_completeness_veto_only"
+    )
     assert created["output"] == str((tmp_path / "edited.mp3").absolute())
 
     def unexpected_runner(*_: object, **__: object) -> None:
@@ -231,6 +277,7 @@ def test_public_parser_is_one_input_to_one_output(tmp_path: Path) -> None:
     assert parsed.planner_backend == "gemma"
     assert parsed.planner_model == "mlx-community/custom-gemma"
     assert parsed.alignment_python == Path(sys.executable)
+    assert parsed.alignment_backend == "mfa"
     assert parsed.debug_artifacts is False
 
 
@@ -342,25 +389,8 @@ def test_full_pipeline_routes_video_input_to_video_publication(
 ) -> None:
     source = tmp_path / "source.mp4"
     source.write_bytes(b"source video")
-    args = build_parser().parse_args(
-        [
-            str(source),
-            "--output",
-            str(tmp_path / "edited.mp4"),
-            "--work-dir",
-            str(tmp_path / "work"),
-            "--asr-python",
-            sys.executable,
-            "--alignment-python",
-            sys.executable,
-            "--planner-python",
-            sys.executable,
-            "--planner-backend",
-            "gemini",
-            "--planner-model",
-            "gemini-3.6-flash",
-        ]
-    )
+    args = _args(tmp_path, source)
+    args.output = tmp_path / "edited.mp4"
     calls: list[list[str]] = []
     video_calls = 0
 
@@ -428,7 +458,11 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                 output_dir / "final_render_manifest.json",
                 {
                     "status": "complete",
-                    "renderer": "authoritative_single_pass_final_render_v2",
+                    "renderer": "authoritative_single_pass_final_render_v3",
+                    "alignment_backend": "mfa",
+                    "mfa_version": "3.4.1",
+                    "mfa_model": "english_us_arpa",
+                    "mfa_fine_tune": True,
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),

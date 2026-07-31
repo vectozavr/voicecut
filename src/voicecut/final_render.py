@@ -18,6 +18,16 @@ import numpy as np
 import soundfile as sf
 
 from .common import read_json, sha256_file, write_json
+from .mfa_alignment import (
+    DEFAULT_MFA_CACHE_ROOT,
+    DEFAULT_MFA_PREFIX,
+    MFA_MODEL_ID,
+    MFA_VERSION,
+    MFAAlignmentError,
+    align_mfa_contexts,
+    seconds_to_sample,
+    source_word_alignment,
+)
 from .planner_backends import (
     DEFAULT_LOCAL_PYTHON,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -42,27 +52,26 @@ from .semantic_pause import (
     refine_eof_tail,
     validate_pause_response,
 )
-from .trailing_refine import (
-    VerifiedQuietEvidence,
-    find_verified_quiet_evidence,
-)
 from .streaming_narration import repair_plan_for_acoustic_safety
 
 
 DEFAULT_ALIGNMENT_PYTHON = Path(sys.executable)
-CONTEXT_WORDS_PER_SIDE = 2
-CROP_CONTEXT_MS = 300.0
-PROTECTED_SPEECH_MARGIN_MS = 20.0
+CONTEXT_WORDS_PER_SIDE = 3
+CROP_CONTEXT_MS = 400.0
+PROTECTED_SPEECH_MARGIN_MS = 10.0
 MINIMUM_VERIFIED_QUIET_MS = 20.0
 QUIET_FADE_MS = 5.0
+MFA_ZERO_CROSSING_SNAP_MS = 2.0
 ALIGNMENT_LANGUAGE = "en"
 DEFAULT_MAX_ACOUSTIC_RETRIES = 3
 RETAINED_WORD_EDGE_CHARACTER_COUNT = 3
 RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT = 8
+RETAINED_WORD_NEARBY_RETRY_DISTANCE = 4
 MIN_RETAINED_WORD_SCORE = 0.45
 MIN_RETAINED_EDGE_CHARACTER_SCORE = 0.48
 MIN_RETAINED_EDGE_TO_CONTEXT_RATIO = 0.55
 ALIGNMENT_GEOMETRY_EPSILON_SECONDS = 1e-6
+MFA_SAMPLE_ROUNDING_OVERLAP = 1
 
 
 class FinalRenderError(RuntimeError):
@@ -454,6 +463,49 @@ def _nearby_context_scores(
     return scores
 
 
+def _has_nearby_same_word_retry(
+    *,
+    span: dict[str, Any],
+    context_spans: Sequence[dict[str, Any]],
+    edge: str,
+) -> bool:
+    """Detect a nearby repeated occurrence that corroborates a weak edge.
+
+    WhisperX character scores are not calibrated phoneme confidences: a
+    single orthographic character can score poorly even for a complete word
+    (notably silent letters).  A nearby repetition in the retry direction is
+    independent source evidence that a weak edge belongs to an abandoned
+    occurrence.  This keeps the veto conservative without globally lowering
+    its confidence thresholds.
+    """
+
+    target_id = int(span["word_id"])
+    target_text = "".join(
+        character.casefold()
+        for character in str(span.get("text", ""))
+        if character.isalpha()
+    )
+    if not target_text:
+        return False
+    for candidate in context_spans:
+        candidate_id = int(candidate.get("word_id", -1))
+        distance = candidate_id - target_id
+        if edge == "terminal":
+            in_retry_direction = 0 < distance <= RETAINED_WORD_NEARBY_RETRY_DISTANCE
+        else:
+            in_retry_direction = -RETAINED_WORD_NEARBY_RETRY_DISTANCE <= distance < 0
+        if not in_retry_direction:
+            continue
+        candidate_text = "".join(
+            character.casefold()
+            for character in str(candidate.get("text", ""))
+            if character.isalpha()
+        )
+        if candidate_text == target_text:
+            return True
+    return False
+
+
 def evaluate_retained_word_support(
     span: dict[str, Any],
     context_spans: Sequence[dict[str, Any]],
@@ -524,6 +576,18 @@ def evaluate_retained_word_support(
         and local_context_score > 0.0
         else None
     )
+    median_score_ratio = (
+        median_edge_score / local_context_score
+        if median_edge_score is not None
+        and local_context_score is not None
+        and local_context_score > 0.0
+        else None
+    )
+    nearby_same_word_retry = _has_nearby_same_word_retry(
+        span=span,
+        context_spans=context_spans,
+        edge=edge,
+    )
 
     if not complete_coverage:
         status = "incomplete_character_coverage"
@@ -537,9 +601,17 @@ def evaluate_retained_word_support(
         or score_ratio is None
     ):
         status = "incomplete_character_coverage"
-    elif word_score < MIN_RETAINED_WORD_SCORE or (
-        minimum_edge_score < MIN_RETAINED_EDGE_CHARACTER_SCORE
-        and score_ratio < MIN_RETAINED_EDGE_TO_CONTEXT_RATIO
+    elif (
+        word_score < MIN_RETAINED_WORD_SCORE
+        or (
+            median_edge_score < MIN_RETAINED_EDGE_CHARACTER_SCORE
+            and median_score_ratio < MIN_RETAINED_EDGE_TO_CONTEXT_RATIO
+        )
+        or (
+            nearby_same_word_retry
+            and minimum_edge_score < MIN_RETAINED_EDGE_CHARACTER_SCORE
+            and score_ratio < MIN_RETAINED_EDGE_TO_CONTEXT_RATIO
+        )
     ):
         status = (
             "weak_initial_word_support"
@@ -565,10 +637,13 @@ def evaluate_retained_word_support(
         "minimum_edge_score": minimum_edge_score,
         "local_context_median_score": local_context_score,
         "edge_to_context_score_ratio": score_ratio,
+        "median_edge_to_context_score_ratio": median_score_ratio,
+        "nearby_same_word_retry": nearby_same_word_retry,
         "character_records": [dict(character) for character in alphabetic],
         "thresholds": {
             "edge_character_count": RETAINED_WORD_EDGE_CHARACTER_COUNT,
             "local_context_character_count": RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT,
+            "nearby_retry_word_distance": RETAINED_WORD_NEARBY_RETRY_DISTANCE,
             "minimum_word_score": MIN_RETAINED_WORD_SCORE,
             "minimum_edge_character_score": MIN_RETAINED_EDGE_CHARACTER_SCORE,
             "minimum_edge_to_context_ratio": MIN_RETAINED_EDGE_TO_CONTEXT_RATIO,
@@ -627,7 +702,11 @@ def _alignment_spans(
                 or word_score is None
                 or word_score <= 0.0
             ):
-                raise ValueError(f"local word {index} has no positive alignment")
+                # Neighboring context words can be unaligned without making
+                # the retained boundary word unusable.  The caller evaluates
+                # the required retained occurrence explicitly and fails
+                # closed when that specific word is absent.
+                continue
             relative = (aligned_word_start, aligned_word_end)
         absolute_start = crop_start + relative[0]
         absolute_end = crop_start + relative[1]
@@ -774,6 +853,13 @@ def _alignment_event_specs(
     ranges: Sequence[MergedRange],
     thought_bounds: Sequence[tuple[int, int]],
 ) -> list[dict[str, Any]]:
+    """Describe every MFA context needed before any coordinate is selected.
+
+    The two physical endpoints of a source gap deliberately use separate local
+    contexts.  This keeps a long omitted region out of a single forced-
+    alignment crop while all contexts still run in one MFA batch.
+    """
+
     specs: list[dict[str, Any]] = []
     if ranges[0].start_word_id > 0:
         specs.append(
@@ -792,13 +878,23 @@ def _alignment_event_specs(
             raise FinalRenderError("merged source ranges are not disjoint")
         specs.append(
             {
-                "event_key": f"source_gap_{gap_index:04d}",
-                "event_kind": "source_gap",
+                "event_key": f"source_gap_{gap_index:04d}_left",
+                "event_kind": "source_gap_left",
+                "source_gap_index": gap_index,
                 "left_range_index": gap_index,
-                "right_range_index": gap_index + 1,
                 "role_word_ids": {
                     "last_retained_left": left.end_word_id - 1,
                     "first_omitted": left.end_word_id,
+                },
+            }
+        )
+        specs.append(
+            {
+                "event_key": f"source_gap_{gap_index:04d}_right",
+                "event_kind": "source_gap_right",
+                "source_gap_index": gap_index,
+                "right_range_index": gap_index + 1,
+                "role_word_ids": {
                     "last_omitted": right.start_word_id - 1,
                     "first_retained_right": right.start_word_id,
                 },
@@ -813,6 +909,17 @@ def _alignment_event_specs(
                 "role_word_ids": {
                     "last_retained_left": ranges[-1].end_word_id - 1,
                     "first_omitted": ranges[-1].end_word_id,
+                },
+            }
+        )
+    if ranges[-1].end_word_id == len(words):
+        specs.append(
+            {
+                "event_key": "eof_tail",
+                "event_kind": "eof_tail",
+                "range_index": len(ranges) - 1,
+                "role_word_ids": {
+                    "final_retained": ranges[-1].end_word_id - 1,
                 },
             }
         )
@@ -846,15 +953,24 @@ def _prepare_alignment_jobs(
     *,
     specs: Sequence[dict[str, Any]],
     words: Sequence[PlanWord],
+    ranges: Sequence[MergedRange],
     source_audio: np.ndarray,
     sample_rate: int,
     output_dir: Path,
 ) -> list[dict[str, Any]]:
     context_samples = round(CROP_CONTEXT_MS * sample_rate / 1000.0)
     total_samples = len(source_audio)
-    contexts_dir = output_dir / "alignment_contexts"
+    contexts_dir = output_dir / "completeness_contexts"
     if specs:
         contexts_dir.mkdir(parents=True, exist_ok=True)
+    selected_word_ids = {
+        word_id
+        for source_range in ranges
+        for word_id in range(
+            source_range.start_word_id,
+            source_range.end_word_id,
+        )
+    }
     jobs: list[dict[str, Any]] = []
     for context_index, spec in enumerate(specs):
         role_ids = [int(value) for value in spec["role_word_ids"].values()]
@@ -895,6 +1011,7 @@ def _prepare_alignment_jobs(
                 "text": words[word_id].text,
                 "start": words[word_id].start,
                 "end": words[word_id].end,
+                "selected": word_id in selected_word_ids,
             }
             for word_id in range(context_start_id, context_end_id)
         ]
@@ -910,6 +1027,7 @@ def _prepare_alignment_jobs(
                     for role, word_id in spec["role_word_ids"].items()
                 },
                 "local_words": local_words,
+                "boundary_ids": [str(spec["event_key"])],
                 "local_source_text": " ".join(
                     str(word["text"]) for word in local_words
                 ),
@@ -924,7 +1042,7 @@ def _prepare_alignment_jobs(
     return jobs
 
 
-def _run_alignment_worker(
+def _run_completeness_worker(
     *,
     jobs_path: Path,
     result_path: Path,
@@ -967,53 +1085,149 @@ def _run_alignment_worker(
     )
     if not result_path.is_file():
         raise FinalRenderError(
-            f"WhisperX alignment worker produced no result; see {log_path}"
+            f"WhisperX completeness worker produced no result; see {log_path}"
         )
     result = read_json(result_path)
     if not isinstance(result, dict):
-        raise FinalRenderError("WhisperX result root must be an object")
+        raise FinalRenderError("WhisperX completeness result must be an object")
     return result
 
 
-def _protected_intervals(
+def _mfa_protected_intervals(
     *,
     spec: dict[str, Any],
-    spans: dict[int, dict[str, Any]],
+    context: dict[str, Any],
     sample_rate: int,
     total_samples: int,
 ) -> list[dict[str, Any]]:
+    """Protect required words using MFA phones, never Whisper timestamps."""
+
     margin = round(PROTECTED_SPEECH_MARGIN_MS * sample_rate / 1000.0)
-    ordered_spans = sorted(spans.values(), key=lambda item: int(item["start_sample"]))
+    all_context_phones = [
+        phone for phone in context.get("phones", []) if isinstance(phone, dict)
+    ]
+    previous_end = -1
+    previous_end_seconds = -math.inf
+    for phone in all_context_phones:
+        phone_start = int(phone["start_sample"])
+        phone_end = int(phone["end_sample"])
+        phone_start_seconds = float(phone["start_seconds"])
+        phone_end_seconds = float(phone["end_seconds"])
+        if not 0 <= phone_start < phone_end <= total_samples:
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                f"phone {phone.get('phone')!r} has invalid source samples",
+            )
+        if (
+            phone_start_seconds
+            < previous_end_seconds - ALIGNMENT_GEOMETRY_EPSILON_SECONDS
+            or phone_start < previous_end - MFA_SAMPLE_ROUNDING_OVERLAP
+        ):
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                "MFA context contains overlapping phone intervals",
+            )
+        previous_end = phone_end
+        previous_end_seconds = phone_end_seconds
+    context_phones = [
+        phone for phone in all_context_phones if not bool(phone.get("is_silence"))
+    ]
     protected: list[dict[str, Any]] = []
     for role, raw_word_id in spec["role_word_ids"].items():
         word_id = int(raw_word_id)
-        span = spans.get(word_id)
-        if span is None:
-            raise ValueError(f"required role {role} word {word_id} was not aligned")
-        start = int(span["start_sample"])
-        end = int(span["end_sample"])
+        aligned = source_word_alignment(context, word_id)
+        word_start_sample = int(aligned["start_sample"])
+        word_end_sample = int(aligned["end_sample"])
+        nested_previous_end = word_start_sample
+        nested_previous_end_seconds = float(aligned["start_seconds"])
+        for phone in aligned["phones"]:
+            phone_start = int(phone["start_sample"])
+            phone_end = int(phone["end_sample"])
+            phone_start_seconds = float(phone["start_seconds"])
+            phone_end_seconds = float(phone["end_seconds"])
+            if (
+                phone_start < word_start_sample
+                or phone_end > word_end_sample
+                or phone_start < nested_previous_end - MFA_SAMPLE_ROUNDING_OVERLAP
+                or phone_start_seconds
+                < nested_previous_end_seconds - ALIGNMENT_GEOMETRY_EPSILON_SECONDS
+                or phone_end <= phone_start
+            ):
+                raise MFAAlignmentError(
+                    "mfa_word_mapping_failed",
+                    f"word {word_id} has invalid nested phone geometry",
+                )
+            nested_previous_end = phone_end
+            nested_previous_end_seconds = phone_end_seconds
+        first_phone = dict(aligned["first_non_silence_phone"])
+        last_phone = dict(aligned["last_non_silence_phone"])
+        start = int(first_phone["start_sample"])
+        end = int(last_phone["end_sample"])
+        boundary_start = seconds_to_sample(
+            float(first_phone["start_seconds"]),
+            sample_rate,
+            boundary="ceil",
+        )
+        boundary_end = seconds_to_sample(
+            float(last_phone["end_seconds"]),
+            sample_rate,
+            boundary="ceil",
+        )
+        if not (0 <= start <= boundary_start < boundary_end <= end <= total_samples):
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                f"word {word_id} has invalid absolute phone samples",
+            )
+        # MFA intervals are continuous half-open times.  Mapping both edges
+        # with ceil yields a discrete half-open sample span without assigning
+        # the shared boundary sample to both adjacent phones.  The original
+        # floor/ceil coordinates remain preserved in the phone evidence.
+        start = boundary_start
+        end = boundary_end
         margin_start = max(0, start - margin)
         margin_end = min(total_samples, end + margin)
-        for neighbor in ordered_spans:
-            neighbor_start = int(neighbor["start_sample"])
-            neighbor_end = int(neighbor["end_sample"])
-            if neighbor_end <= start and neighbor_end > margin_start:
-                margin_start = neighbor_end
-            if neighbor_start >= end and neighbor_start < margin_end:
-                margin_end = neighbor_start
+        for phone in context_phones:
+            phone_start = seconds_to_sample(
+                float(phone["start_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            phone_end = seconds_to_sample(
+                float(phone["end_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            if phone_end <= start and phone_end > margin_start:
+                margin_start = phone_end
+            if phone_start >= end and phone_start < margin_end:
+                margin_end = phone_start
         protected.append(
             {
                 "role": role,
                 "word_id": word_id,
-                "text": span["text"],
+                "text": aligned["source_text"],
                 "start_sample": start,
                 "end_sample": end,
                 "start_seconds": start / sample_rate,
                 "end_seconds": end / sample_rate,
+                "boundary_start_sample": boundary_start,
+                "boundary_end_sample": boundary_end,
+                "boundary_start_seconds": boundary_start / sample_rate,
+                "boundary_end_seconds": boundary_end / sample_rate,
                 "margin_start_sample": margin_start,
                 "margin_end_sample": margin_end,
                 "protected_margin_ms": PROTECTED_SPEECH_MARGIN_MS,
-                "alignment_granularity": span["granularity"],
+                "alignment_backend": "mfa",
+                "mfa_word_interval": {
+                    "start_seconds": aligned["start_seconds"],
+                    "end_seconds": aligned["end_seconds"],
+                    "start_sample": aligned["start_sample"],
+                    "end_sample": aligned["end_sample"],
+                    "mfa_tokens": list(aligned["mfa_tokens"]),
+                },
+                "mfa_phone_intervals": [dict(phone) for phone in aligned["phones"]],
+                "first_non_silence_phone": first_phone,
+                "last_non_silence_phone": last_phone,
             }
         )
     return protected
@@ -1025,28 +1239,97 @@ def _protected_by_role(
     return {str(item["role"]): item for item in protected}
 
 
-def _quiet_payload(evidence: VerifiedQuietEvidence | None) -> dict[str, Any] | None:
-    if evidence is None:
+def _mfa_non_speech_interval(
+    *,
+    context: dict[str, Any],
+    start_sample: int,
+    end_sample: int,
+    sample_rate: int,
+) -> dict[str, Any] | None:
+    if end_sample <= start_sample:
         return None
+    for phone in context.get("phones", []):
+        if not isinstance(phone, dict) or bool(phone.get("is_silence")):
+            continue
+        phone_start = seconds_to_sample(
+            float(phone["start_seconds"]),
+            sample_rate,
+            boundary="ceil",
+        )
+        phone_end = seconds_to_sample(
+            float(phone["end_seconds"]),
+            sample_rate,
+            boundary="ceil",
+        )
+        if _intervals_overlap(
+            start_sample,
+            end_sample,
+            phone_start,
+            phone_end,
+        ):
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                "candidate non-speech interval overlaps an MFA speech phone",
+            )
+    silence_phones = [
+        dict(phone)
+        for phone in context.get("phones", [])
+        if isinstance(phone, dict)
+        and bool(phone.get("is_silence"))
+        and _intervals_overlap(
+            start_sample,
+            end_sample,
+            int(phone["start_sample"]),
+            int(phone["end_sample"]),
+        )
+    ]
     return {
-        "start_sample": evidence.quiet_start_sample,
-        "end_sample": evidence.quiet_end_sample,
-        "local_noise_floor_db": evidence.local_noise_floor_db,
-        "silence_threshold_db": evidence.silence_threshold_db,
-        "minimum_quiet_ms": evidence.minimum_quiet_ms,
-        "rms_frame_ms": evidence.frame_ms,
-        "rms_hop_ms": evidence.hop_ms,
-        "verification": "forced_alignment_gap_plus_stable_rms_quiet",
+        "start_sample": start_sample,
+        "end_sample": end_sample,
+        "start_seconds": start_sample / sample_rate,
+        "end_seconds": end_sample / sample_rate,
+        "duration_ms": (end_sample - start_sample) * 1000.0 / sample_rate,
+        "silence_phone_intervals": silence_phones,
+        "verification": "mfa_phone_free_interval",
     }
 
 
-def _resolve_aligned_cut(
+def _snap_zero_crossing_in_mfa_gap(
+    mono: np.ndarray,
+    *,
+    candidate: int,
+    interval_start: int,
+    interval_end: int,
+    sample_rate: int,
+) -> int:
+    """Snap at most 2 ms, strictly inside an MFA-confirmed non-speech gap."""
+
+    candidate = max(interval_start, min(interval_end, candidate))
+    radius = round(MFA_ZERO_CROSSING_SNAP_MS * sample_rate / 1000.0)
+    search_start = max(interval_start, candidate - radius, 1)
+    search_end = min(interval_end, candidate + radius, len(mono) - 1)
+    crossings = [
+        index
+        for index in range(search_start, search_end + 1)
+        if (mono[index - 1] <= 0.0 < mono[index])
+        or (mono[index - 1] >= 0.0 > mono[index])
+    ]
+    return (
+        min(crossings, key=lambda index: (abs(index - candidate), index))
+        if crossings
+        else candidate
+    )
+
+
+def _resolve_mfa_cut(
     *,
     boundary_id: str,
     boundary_kind: str,
     spec: dict[str, Any],
-    spans: dict[int, dict[str, Any]] | None,
-    alignment_error: str | None,
+    mfa_context: dict[str, Any] | None,
+    mfa_error: str | None,
+    retained_support: dict[str, Any] | None,
+    completeness_error: str | None,
     words: Sequence[PlanWord],
     mono: np.ndarray,
     sample_rate: int,
@@ -1059,6 +1342,7 @@ def _resolve_aligned_cut(
     retained_id = role_ids[retained_role]
     omitted_id = role_ids[omitted_role]
     whisper = {
+        "approximate": True,
         "retained_start_seconds": words[retained_id].start,
         "retained_end_seconds": words[retained_id].end,
         "omitted_start_seconds": words[omitted_id].start,
@@ -1068,156 +1352,353 @@ def _resolve_aligned_cut(
         "boundary_id": boundary_id,
         "boundary_kind": boundary_kind,
         "alignment_context_id": spec["event_key"],
+        "mfa_context_id": spec["event_key"],
         "source_word_ids": role_ids,
+        "whisper_anchors": whisper,
         "whisper_timestamps": whisper,
         "protected_speech_intervals": [],
+        "mfa_word_interval": None,
+        "mfa_phone_intervals": [],
+        "final_retained_phone": None,
         "aligned_timestamps": None,
+        "verified_silence_interval": None,
         "verified_quiet_interval": None,
         "selected_source_sample": None,
         "selected_source_seconds": None,
         "fade_intervals": [],
-        "retained_word_support": None,
+        "retained_word_support": retained_support,
         "forbidden_word_ids": [],
         "forbidden_source_edges": [],
         "failure_reason": None,
     }
-    if spans is None:
+    if completeness_error is not None or retained_support is None:
         return {
             **common,
-            "boundary_method": "forced_alignment_failed",
-            "safety_status": "alignment_failed",
-            "failure_reason": "alignment_failed",
-            "error": alignment_error or "alignment evidence is missing",
+            "boundary_method": "retained_word_completeness_failed",
+            "safety_status": "completeness_alignment_failed",
+            "failure_reason": "completeness_alignment_failed",
+            "error": completeness_error or "retained-word support is missing",
+        }
+    if retained_support["status"] != "supported_complete_word":
+        return {
+            **common,
+            "forbidden_word_ids": [retained_id],
+            "boundary_method": "retained_word_acoustic_support_failed",
+            "safety_status": "weak_retained_word_alignment",
+            "failure_reason": retained_support["status"],
+            "character_scores": [
+                character.get("score")
+                for character in retained_support["character_records"]
+            ],
+            "edge_score": retained_support["minimum_edge_score"],
+            "local_context_score": retained_support["local_context_median_score"],
+            "score_ratio": retained_support["edge_to_context_score_ratio"],
+            "error": (
+                f"retained word {retained_id} {words[retained_id].text!r} "
+                f"failed acoustic support: {retained_support['status']}"
+            ),
+        }
+    if mfa_context is None:
+        status = (
+            "mfa_not_run_due_to_weak_retained_word"
+            if mfa_error == "mfa_not_run_due_to_weak_retained_word"
+            else "mfa_alignment_failed"
+        )
+        return {
+            **common,
+            "boundary_method": status,
+            "safety_status": status,
+            "failure_reason": status,
+            "error": mfa_error or "MFA evidence is missing",
         }
     try:
-        protected = _protected_intervals(
+        protected = _mfa_protected_intervals(
             spec=spec,
-            spans=spans,
+            context=mfa_context,
             sample_rate=sample_rate,
             total_samples=total_samples,
         )
-        protected_roles = _protected_by_role(protected)
-        retained = protected_roles[retained_role]
-        omitted = protected_roles[omitted_role]
-        retained_span = spans[retained_id]
-        omitted_span = spans[omitted_id]
-        support_edge = "terminal" if direction == "trailing" else "initial"
-        retained_support = evaluate_retained_word_support(
-            retained_span,
-            list(spans.values()),
-            edge=support_edge,
-        )
-        aligned_timestamps = {
-            "retained_start_seconds": retained_span["start_seconds"],
-            "retained_end_seconds": retained_span["end_seconds"],
-            "omitted_start_seconds": omitted_span["start_seconds"],
-            "omitted_end_seconds": omitted_span["end_seconds"],
-        }
-        if retained_support["status"] != "supported_complete_word":
-            return {
-                **common,
-                "protected_speech_intervals": protected,
-                "aligned_timestamps": aligned_timestamps,
-                "retained_word_support": retained_support,
-                "forbidden_word_ids": [retained_id],
-                "boundary_method": "retained_word_acoustic_support_failed",
-                "safety_status": "weak_retained_word_alignment",
-                "failure_reason": retained_support["status"],
-                "character_scores": [
-                    character.get("score")
-                    for character in retained_support["character_records"]
-                ],
-                "edge_score": retained_support["minimum_edge_score"],
-                "local_context_score": retained_support["local_context_median_score"],
-                "score_ratio": retained_support["edge_to_context_score_ratio"],
-                "error": (
-                    f"retained word {retained_id} "
-                    f"{words[retained_id].text!r} failed acoustic support: "
-                    f"{retained_support['status']}"
-                ),
-            }
+        roles = _protected_by_role(protected)
+        retained = roles[retained_role]
+        omitted = roles[omitted_role]
         if direction == "trailing":
-            search_start = int(retained["margin_end_sample"])
-            search_end = int(omitted["start_sample"])
-            preference = "left"
+            speech_boundary = int(retained["boundary_end_sample"])
+            gap_start = int(retained["end_sample"])
+            gap_end = int(omitted["start_sample"])
+            candidate = min(
+                gap_end,
+                int(retained["margin_end_sample"]),
+            )
+            curve = "fade_out"
         elif direction == "leading":
-            search_start = int(omitted["end_sample"])
-            search_end = int(retained["margin_start_sample"])
-            preference = "right"
+            speech_boundary = int(retained["boundary_start_sample"])
+            gap_start = int(omitted["end_sample"])
+            gap_end = int(retained["start_sample"])
+            candidate = max(
+                gap_start,
+                int(retained["margin_start_sample"]),
+            )
+            curve = "fade_in"
         else:
             raise ValueError("boundary direction must be leading or trailing")
-        evidence = find_verified_quiet_evidence(
-            mono,
-            search_start_sample=search_start,
-            search_end_sample=search_end,
+        silence = _mfa_non_speech_interval(
+            context=mfa_context,
+            start_sample=gap_start,
+            end_sample=gap_end,
             sample_rate=sample_rate,
-            alignment_interval_verified=True,
-            minimum_quiet_ms=MINIMUM_VERIFIED_QUIET_MS,
-            preference=preference,
         )
-        if evidence is None:
-            return {
-                **common,
-                "protected_speech_intervals": protected,
-                "aligned_timestamps": aligned_timestamps,
-                "retained_word_support": retained_support,
-                "forbidden_source_edges": [
-                    {
-                        "boundary_kind": boundary_kind,
-                        "retained_word_id": retained_id,
-                        "omitted_word_id": omitted_id,
-                    }
-                ],
-                "boundary_method": "unsafe_dense_boundary",
-                "safety_status": "unsafe_dense_boundary",
-                "failure_reason": "no_verified_non_speech_interval",
-                "error": (
-                    "forced alignment exposes no verified non-speech interval "
-                    "outside the retained-word protection margin"
-                ),
-            }
-        fade_samples = round(QUIET_FADE_MS * sample_rate / 1000.0)
-        if direction == "trailing":
-            selected = evidence.quiet_end_sample
-            fade_start = max(evidence.quiet_start_sample, selected - fade_samples)
-            fade_end = selected
-            curve = "fade_out"
+        if silence is None:
+            selected = speech_boundary
+            method = "mfa_dense_phone_boundary"
+            fades: list[dict[str, Any]] = []
         else:
-            selected = evidence.quiet_start_sample
-            fade_start = selected
-            fade_end = min(evidence.quiet_end_sample, selected + fade_samples)
-            curve = "fade_in"
-        fades = (
-            [
-                {
-                    "source_start_sample": fade_start,
-                    "source_end_sample": fade_end,
-                    "curve": curve,
-                    "verified_quiet": True,
-                }
-            ]
-            if fade_end > fade_start
-            else []
+            selected = _snap_zero_crossing_in_mfa_gap(
+                mono,
+                candidate=candidate,
+                interval_start=gap_start,
+                interval_end=gap_end,
+                sample_rate=sample_rate,
+            )
+            method = "mfa_verified_silence"
+            fade_samples = round(QUIET_FADE_MS * sample_rate / 1000.0)
+            if direction == "trailing":
+                fade_start = max(gap_start, selected - fade_samples)
+                fade_end = selected
+            else:
+                fade_start = selected
+                fade_end = min(gap_end, selected + fade_samples)
+            fades = (
+                [
+                    {
+                        "source_start_sample": fade_start,
+                        "source_end_sample": fade_end,
+                        "curve": curve,
+                        "verified_quiet": True,
+                        "verification": "mfa_phone_free_interval",
+                    }
+                ]
+                if fade_end > fade_start
+                else []
+            )
+        retained_word = retained["mfa_word_interval"]
+        retained_phones = retained["mfa_phone_intervals"]
+        retained_final_phone = (
+            retained["last_non_silence_phone"]
+            if direction == "trailing"
+            else retained["first_non_silence_phone"]
         )
         return {
             **common,
             "protected_speech_intervals": protected,
-            "aligned_timestamps": aligned_timestamps,
-            "verified_quiet_interval": _quiet_payload(evidence),
+            "mfa_word_interval": retained_word,
+            "mfa_phone_intervals": retained_phones,
+            "final_retained_phone": retained_final_phone,
+            "aligned_timestamps": {
+                "backend": "mfa",
+                "retained_start_seconds": retained["start_seconds"],
+                "retained_end_seconds": retained["end_seconds"],
+                "omitted_start_seconds": omitted["start_seconds"],
+                "omitted_end_seconds": omitted["end_seconds"],
+            },
+            "verified_silence_interval": silence,
+            "verified_quiet_interval": silence,
             "selected_source_sample": selected,
             "selected_source_seconds": selected / sample_rate,
             "fade_intervals": fades,
-            "boundary_method": "forced_alignment_verified_quiet",
+            "boundary_method": method,
             "safety_status": "safe",
-            "retained_word_support": retained_support,
             "error": None,
         }
-    except Exception as error:
+    except (MFAAlignmentError, KeyError, TypeError, ValueError) as error:
+        status = (
+            error.code
+            if isinstance(error, MFAAlignmentError)
+            else "mfa_word_mapping_failed"
+        )
         return {
             **common,
-            "boundary_method": "forced_alignment_failed",
-            "safety_status": "alignment_failed",
-            "failure_reason": "alignment_failed",
+            "boundary_method": status,
+            "safety_status": status,
+            "failure_reason": status,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _resolve_mfa_eof_boundary(
+    *,
+    spec: dict[str, Any],
+    mfa_context: dict[str, Any] | None,
+    mfa_error: str | None,
+    retained_support: dict[str, Any] | None,
+    completeness_error: str | None,
+    words: Sequence[PlanWord],
+    mono: np.ndarray,
+    sample_rate: int,
+    total_samples: int,
+) -> dict[str, Any]:
+    word_id = int(spec["role_word_ids"]["final_retained"])
+    whisper = {
+        "approximate": True,
+        "retained_start_seconds": words[word_id].start,
+        "retained_end_seconds": words[word_id].end,
+    }
+    common = {
+        "boundary_id": "end_of_file",
+        "boundary_kind": "end_of_file",
+        "alignment_context_id": spec["event_key"],
+        "mfa_context_id": spec["event_key"],
+        "source_word_ids": {"final_retained": word_id},
+        "whisper_anchors": whisper,
+        "whisper_timestamps": whisper,
+        "protected_speech_intervals": [],
+        "mfa_word_interval": None,
+        "mfa_phone_intervals": [],
+        "final_retained_phone": None,
+        "aligned_timestamps": None,
+        "verified_silence_interval": None,
+        "verified_quiet_interval": None,
+        "selected_source_sample": None,
+        "selected_source_seconds": None,
+        "fade_intervals": [],
+        "retained_word_support": retained_support,
+        "forbidden_word_ids": [],
+        "forbidden_source_edges": [],
+        "failure_reason": None,
+    }
+    if completeness_error is not None or retained_support is None:
+        return {
+            **common,
+            "boundary_method": "retained_word_completeness_failed",
+            "safety_status": "completeness_alignment_failed",
+            "failure_reason": "completeness_alignment_failed",
+            "error": completeness_error or "retained-word support is missing",
+        }
+    if retained_support["status"] != "supported_complete_word":
+        return {
+            **common,
+            "forbidden_word_ids": [word_id],
+            "boundary_method": "retained_word_acoustic_support_failed",
+            "safety_status": "weak_retained_word_alignment",
+            "failure_reason": retained_support["status"],
+            "character_scores": [
+                character.get("score")
+                for character in retained_support["character_records"]
+            ],
+            "edge_score": retained_support["minimum_edge_score"],
+            "local_context_score": retained_support["local_context_median_score"],
+            "score_ratio": retained_support["edge_to_context_score_ratio"],
+            "error": (
+                f"retained EOF word {word_id} {words[word_id].text!r} failed "
+                f"acoustic support: {retained_support['status']}"
+            ),
+        }
+    if mfa_context is None:
+        status = (
+            "mfa_not_run_due_to_weak_retained_word"
+            if mfa_error == "mfa_not_run_due_to_weak_retained_word"
+            else "mfa_alignment_failed"
+        )
+        return {
+            **common,
+            "boundary_method": status,
+            "safety_status": status,
+            "failure_reason": status,
+            "error": mfa_error or "MFA EOF evidence is missing",
+        }
+    try:
+        protected = _mfa_protected_intervals(
+            spec=spec,
+            context=mfa_context,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
+        retained = _protected_by_role(protected)["final_retained"]
+        final_phone = dict(retained["last_non_silence_phone"])
+        phone_end = int(final_phone["end_sample"])
+        eof = refine_eof_tail(
+            mono,
+            sample_rate=sample_rate,
+            raw_end_seconds=float(final_phone["end_seconds"]),
+            previous_end_sample=phone_end,
+            fade_ms=QUIET_FADE_MS,
+        )
+        if eof.new_end_sample < phone_end:
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                "EOF tail ends before the retained final MFA phone",
+            )
+        eof_fades: list[dict[str, Any]] = []
+        if eof.fade_out_samples:
+            fade_start = eof.new_end_sample - eof.fade_out_samples
+            if (
+                fade_start < phone_end
+                or eof.stable_silence_start_sample is None
+                or fade_start < eof.stable_silence_start_sample
+            ):
+                raise MFAAlignmentError(
+                    "mfa_word_mapping_failed",
+                    "EOF fade overlaps the retained final MFA phone",
+                )
+            eof_fades.append(
+                {
+                    "source_start_sample": fade_start,
+                    "source_end_sample": eof.new_end_sample,
+                    "curve": "fade_out",
+                    "verified_quiet": True,
+                    "verification": "eof_stable_silence_after_mfa_phone",
+                }
+            )
+        silence = (
+            {
+                "start_sample": eof.stable_silence_start_sample,
+                "end_sample": eof.new_end_sample,
+                "start_seconds": eof.stable_silence_start_sample / sample_rate,
+                "end_seconds": eof.new_end_sample / sample_rate,
+                "local_noise_floor_db": eof.local_noise_floor_db,
+                "silence_threshold_db": eof.silence_threshold_db,
+                "verification": "safe_eof_tail_after_mfa_phone",
+            }
+            if eof.stable_silence_start_sample is not None
+            else None
+        )
+        return {
+            **common,
+            "protected_speech_intervals": protected,
+            "mfa_word_interval": retained["mfa_word_interval"],
+            "mfa_phone_intervals": retained["mfa_phone_intervals"],
+            "final_retained_phone": final_phone,
+            "aligned_timestamps": {
+                "backend": "mfa",
+                "retained_start_seconds": retained["start_seconds"],
+                "retained_end_seconds": retained["end_seconds"],
+            },
+            "verified_silence_interval": silence,
+            "verified_quiet_interval": silence,
+            "selected_source_sample": eof.new_end_sample,
+            "selected_source_seconds": eof.new_end_sample / sample_rate,
+            "fade_intervals": eof_fades,
+            "boundary_method": "eof_safe_tail",
+            "safety_status": "safe",
+            "last_word": words[word_id].text,
+            "final_word_id": word_id,
+            "final_word_text": words[word_id].text,
+            "final_phone": final_phone["phone"],
+            "mfa_phone_end": final_phone["end_seconds"],
+            "retained_tail_end": eof.new_end_sample / sample_rate,
+            "fade_interval": eof_fades[0] if eof_fades else None,
+            "error": None,
+        }
+    except (MFAAlignmentError, KeyError, TypeError, ValueError) as error:
+        status = (
+            error.code
+            if isinstance(error, MFAAlignmentError)
+            else "mfa_word_mapping_failed"
+        )
+        return {
+            **common,
+            "boundary_method": status,
+            "safety_status": status,
+            "failure_reason": status,
             "error": f"{type(error).__name__}: {error}",
         }
 
@@ -1233,10 +1714,16 @@ def _source_edge_boundary(
         "boundary_id": boundary_id,
         "boundary_kind": boundary_kind,
         "alignment_context_id": None,
+        "mfa_context_id": None,
         "source_word_ids": {},
+        "whisper_anchors": None,
         "whisper_timestamps": None,
+        "mfa_word_interval": None,
+        "mfa_phone_intervals": [],
+        "final_retained_phone": None,
         "aligned_timestamps": None,
         "protected_speech_intervals": [],
+        "verified_silence_interval": None,
         "verified_quiet_interval": None,
         "selected_source_sample": selected_sample,
         "selected_source_seconds": selected_sample / sample_rate,
@@ -1276,7 +1763,7 @@ def _ranges_from_selection(
     return merge_adjacent_ranges(flatten_selected_ranges(plan, word_count=word_count))
 
 
-def _collect_alignment_evidence(
+def _collect_completeness_evidence(
     *,
     jobs: Sequence[dict[str, Any]],
     worker_result: dict[str, Any],
@@ -1285,7 +1772,7 @@ def _collect_alignment_evidence(
 ) -> list[dict[str, Any]]:
     raw_worker_jobs = worker_result.get("jobs")
     if not isinstance(raw_worker_jobs, list):
-        raise FinalRenderError("alignment worker returned no jobs list")
+        raise FinalRenderError("completeness worker returned no jobs list")
     worker_by_index = {
         int(item["clip_index"]): item
         for item in raw_worker_jobs
@@ -1320,6 +1807,8 @@ def _collect_alignment_evidence(
                 "context_index": context_index,
                 "context_id": job["event_key"],
                 "context_kind": job["event_kind"],
+                "purpose": "retained_word_completeness_veto",
+                "coordinate_authority": False,
                 "crop_wav": job["crop_wav"],
                 "crop_start_sample": job["crop_start_sample"],
                 "crop_end_sample": job["crop_end_sample"],
@@ -1346,6 +1835,164 @@ def _public_alignment_context(context: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value for key, value in context.items() if key not in {"_spans", "_spec"}
     }
+
+
+def _completeness_support_by_context(
+    contexts: Sequence[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    support: dict[str, dict[str, Any]] = {}
+    for context in contexts:
+        kind = str(context["context_kind"])
+        if kind in {"leading_source_cut", "source_gap_right"}:
+            retained_role = "first_retained_right"
+            edge = "initial"
+        elif kind in {"source_gap_left", "trailing_source_cut"}:
+            retained_role = "last_retained_left"
+            edge = "terminal"
+        elif kind == "eof_tail":
+            retained_role = "final_retained"
+            edge = "terminal"
+        else:
+            continue
+        spans = context.get("_spans")
+        spec = context["_spec"]
+        retained_id = int(spec["role_word_ids"][retained_role])
+        if not isinstance(spans, dict):
+            support[str(context["context_id"])] = {
+                "support": None,
+                "error": context.get("error") or "completeness evidence is missing",
+            }
+            continue
+        retained_span = spans.get(retained_id)
+        if not isinstance(retained_span, dict):
+            support[str(context["context_id"])] = {
+                "support": None,
+                "error": f"retained word {retained_id} was not completeness-aligned",
+            }
+            continue
+        support[str(context["context_id"])] = {
+            "support": evaluate_retained_word_support(
+                retained_span,
+                list(spans.values()),
+                edge=edge,
+            ),
+            "error": None,
+        }
+    return support
+
+
+def _mfa_context_requests(jobs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "context_id": str(job["event_key"]),
+            "crop_source_start_seconds": float(job["crop_start_seconds"]),
+            "crop_source_end_seconds": float(job["crop_end_seconds"]),
+            "words": [
+                {
+                    "word_id": int(word["id"]),
+                    "text": str(word["text"]),
+                    "start_seconds": float(word["start"]),
+                    "end_seconds": float(word["end"]),
+                    "selected": bool(word["selected"]),
+                }
+                for word in job["local_words"]
+            ],
+            "boundary_ids": list(job["boundary_ids"]),
+        }
+        for job in jobs
+    ]
+
+
+def _validated_mfa_contexts(
+    *,
+    payload: dict[str, Any],
+    jobs: Sequence[dict[str, Any]],
+    source_audio_sha256: str,
+    sample_rate: int,
+) -> dict[str, dict[str, Any]]:
+    if (
+        payload.get("backend") != "mfa"
+        or payload.get("mfa_version") != MFA_VERSION
+        or payload.get("model_id") != MFA_MODEL_ID
+        or payload.get("fine_tune") is not True
+    ):
+        raise FinalRenderError("MFA payload has incompatible runtime provenance")
+    if payload.get("source_audio_sha256") != source_audio_sha256:
+        raise FinalRenderError("MFA payload belongs to a different canonical source")
+    if payload.get("sample_rate") != sample_rate:
+        raise FinalRenderError("MFA payload has the wrong canonical sample rate")
+    raw_contexts = payload.get("contexts")
+    if not isinstance(raw_contexts, list):
+        raise FinalRenderError("MFA payload has no contexts")
+    context_by_id: dict[str, dict[str, Any]] = {}
+    for raw in raw_contexts:
+        if not isinstance(raw, dict):
+            raise FinalRenderError("MFA payload contains a malformed context")
+        context_id = str(raw.get("context_id", ""))
+        if not context_id or context_id in context_by_id:
+            raise FinalRenderError("MFA context IDs are empty or duplicated")
+        context_by_id[context_id] = raw
+    expected = {str(job["event_key"]) for job in jobs}
+    if set(context_by_id) != expected:
+        raise FinalRenderError(
+            "MFA payload contexts do not exactly match this boundary attempt"
+        )
+    for job in jobs:
+        context_id = str(job["event_key"])
+        context = context_by_id[context_id]
+        if (
+            context.get("crop_source_start_sample") != job["crop_start_sample"]
+            or context.get("crop_source_end_sample") != job["crop_end_sample"]
+        ):
+            raise FinalRenderError(
+                f"MFA context {context_id} has stale crop sample coordinates"
+            )
+        expected_ids = [int(word["id"]) for word in job["local_words"]]
+        if context.get("ordered_source_word_ids") != expected_ids:
+            raise FinalRenderError(
+                f"MFA context {context_id} has stale source-word ordering"
+            )
+        if context.get("boundary_ids") != job["boundary_ids"]:
+            raise FinalRenderError(
+                f"MFA context {context_id} has stale boundary ownership"
+            )
+        originals = context.get("original_source_words")
+        if not isinstance(originals, list) or len(originals) != len(job["local_words"]):
+            raise FinalRenderError(
+                f"MFA context {context_id} has stale source-word metadata"
+            )
+        for expected_word, actual_word in zip(
+            job["local_words"], originals, strict=True
+        ):
+            if not isinstance(actual_word, dict) or (
+                actual_word.get("word_id", actual_word.get("id")) != expected_word["id"]
+                or actual_word.get("text") != expected_word["text"]
+                or actual_word.get("selected") is not expected_word["selected"]
+                or abs(
+                    float(
+                        actual_word.get(
+                            "start_seconds",
+                            actual_word.get("start"),
+                        )
+                    )
+                    - float(expected_word["start"])
+                )
+                > ALIGNMENT_GEOMETRY_EPSILON_SECONDS
+                or abs(
+                    float(
+                        actual_word.get(
+                            "end_seconds",
+                            actual_word.get("end"),
+                        )
+                    )
+                    - float(expected_word["end"])
+                )
+                > ALIGNMENT_GEOMETRY_EPSILON_SECONDS
+            ):
+                raise FinalRenderError(
+                    f"MFA context {context_id} has stale source-word metadata"
+                )
+    return context_by_id
 
 
 def _room_tone_ranges(
@@ -1542,10 +2189,18 @@ def build_final_boundary_plan(
     pause_plan_path: Path,
     output_dir: Path,
     alignment_python: Path,
+    alignment_backend: str = "mfa",
+    mfa_prefix: Path = DEFAULT_MFA_PREFIX,
+    mfa_cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
+    mfa_micromamba: str | Path = "micromamba",
+    mfa_num_jobs: int = 1,
     alignment_payload: dict[str, Any] | None = None,
+    mfa_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve every source boundary before rendering any output waveform."""
 
+    if alignment_backend != "mfa":
+        raise FinalRenderError("production cut coordinates require MFA")
     source_audio, sample_rate = sf.read(
         audio_path,
         dtype="float32",
@@ -1572,11 +2227,12 @@ def build_final_boundary_plan(
     jobs = _prepare_alignment_jobs(
         specs=specs,
         words=words,
+        ranges=ranges,
         source_audio=source_audio,
         sample_rate=sample_rate,
         output_dir=output_dir,
     )
-    jobs_path = output_dir / "alignment_jobs.json"
+    jobs_path = output_dir / "completeness_jobs.json"
     write_json(
         jobs_path,
         {
@@ -1585,19 +2241,21 @@ def build_final_boundary_plan(
             "source_audio_sha256": sha256_file(audio_path),
             "language": ALIGNMENT_LANGUAGE,
             "device": "cpu",
+            "purpose": "retained_word_completeness_veto",
+            "coordinate_authority": False,
             "jobs": jobs,
         },
     )
-    worker_path = output_dir / "alignment_worker_result.json"
+    worker_path = output_dir / "completeness_worker_result.json"
     if alignment_payload is not None:
         worker_result = alignment_payload
         write_json(worker_path, worker_result)
     elif jobs:
-        worker_result = _run_alignment_worker(
+        worker_result = _run_completeness_worker(
             jobs_path=jobs_path,
             result_path=worker_path,
             alignment_python=alignment_python,
-            log_path=output_dir / "alignment_worker.log",
+            log_path=output_dir / "completeness_worker.log",
         )
     else:
         worker_result = {
@@ -1605,17 +2263,67 @@ def build_final_boundary_plan(
             "backend": "whisperx_alignment",
             "language": ALIGNMENT_LANGUAGE,
             "device": "cpu",
+            "purpose": "retained_word_completeness_veto",
+            "coordinate_authority": False,
             "jobs": [],
-            "model_load_skipped": "no source cuts or internal pauses need alignment",
+            "model_load_skipped": "no boundary contexts need completeness evidence",
         }
         write_json(worker_path, worker_result)
-    contexts = _collect_alignment_evidence(
+    completeness_contexts = _collect_completeness_evidence(
         jobs=jobs,
         worker_result=worker_result,
         sample_rate=sample_rate,
         total_samples=total_samples,
     )
-    context_by_key = {str(context["context_id"]): context for context in contexts}
+    completeness_by_key = {
+        str(context["context_id"]): context for context in completeness_contexts
+    }
+    completeness_support = _completeness_support_by_context(completeness_contexts)
+    completeness_blocks_mfa = any(
+        item["error"] is not None
+        or item["support"] is None
+        or item["support"]["status"] != "supported_complete_word"
+        for item in completeness_support.values()
+    )
+
+    mfa_alignment_path = (
+        output_dir / "mfa_alignment" / "metadata" / "mfa_alignment.json"
+    )
+    mfa_result: dict[str, Any] | None = None
+    mfa_context_by_key: dict[str, dict[str, Any]] = {}
+    mfa_global_error: str | None = None
+    if completeness_blocks_mfa:
+        mfa_global_error = "mfa_not_run_due_to_weak_retained_word"
+    else:
+        try:
+            if mfa_payload is not None:
+                mfa_result = mfa_payload
+                mfa_alignment_path.parent.mkdir(parents=True, exist_ok=True)
+                write_json(mfa_alignment_path, mfa_result)
+            else:
+                mfa_result = align_mfa_contexts(
+                    audio_path=audio_path,
+                    contexts=_mfa_context_requests(jobs),
+                    work_dir=output_dir,
+                    prefix=mfa_prefix,
+                    cache_root=mfa_cache_root,
+                    micromamba=mfa_micromamba,
+                    num_jobs=mfa_num_jobs,
+                )
+            mfa_context_by_key = _validated_mfa_contexts(
+                payload=mfa_result,
+                jobs=jobs,
+                source_audio_sha256=sha256_file(audio_path),
+                sample_rate=sample_rate,
+            )
+        except (
+            FinalRenderError,
+            MFAAlignmentError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
+            mfa_global_error = f"{type(error).__name__}: {error}"
 
     boundaries: list[dict[str, Any]] = []
     source_intervals: list[dict[str, Any]] = []
@@ -1633,16 +2341,21 @@ def build_final_boundary_plan(
                 retained_role = "first_retained_right"
                 omitted_role = "previous_omitted"
             else:
-                context_key = f"source_gap_{range_index - 1:04d}"
+                context_key = f"source_gap_{range_index - 1:04d}_right"
                 retained_role = "first_retained_right"
                 omitted_role = "last_omitted"
-            context = context_by_key[context_key]
-            start_boundary = _resolve_aligned_cut(
+            completeness = completeness_support.get(
+                context_key,
+                {"support": None, "error": "completeness context is missing"},
+            )
+            start_boundary = _resolve_mfa_cut(
                 boundary_id=f"range_{range_index:04d}_start",
                 boundary_kind="omitted_to_selected",
-                spec=context["_spec"],
-                spans=context["_spans"],
-                alignment_error=context["error"],
+                spec=completeness_by_key[context_key]["_spec"],
+                mfa_context=mfa_context_by_key.get(context_key),
+                mfa_error=mfa_global_error,
+                retained_support=completeness["support"],
+                completeness_error=completeness["error"],
                 words=words,
                 mono=mono,
                 sample_rate=sample_rate,
@@ -1654,71 +2367,39 @@ def build_final_boundary_plan(
         boundaries.append(start_boundary)
 
         if range_index == len(ranges) - 1 and source_range.end_word_id == len(words):
-            raw_end = words[source_range.end_word_id - 1].end
-            raw_end_sample = timestamp_to_sample(
-                raw_end,
+            context_key = "eof_tail"
+            completeness = completeness_support.get(
+                context_key,
+                {"support": None, "error": "completeness context is missing"},
+            )
+            end_boundary = _resolve_mfa_eof_boundary(
+                spec=completeness_by_key[context_key]["_spec"],
+                mfa_context=mfa_context_by_key.get(context_key),
+                mfa_error=mfa_global_error,
+                retained_support=completeness["support"],
+                completeness_error=completeness["error"],
+                words=words,
+                mono=mono,
                 sample_rate=sample_rate,
                 total_samples=total_samples,
-                rounding="ceil",
             )
-            eof = refine_eof_tail(
-                mono,
-                sample_rate=sample_rate,
-                raw_end_seconds=raw_end,
-                previous_end_sample=raw_end_sample,
-                fade_ms=QUIET_FADE_MS,
-            )
-            eof_fades: list[dict[str, Any]] = []
-            if eof.fade_out_samples:
-                fade_start = eof.new_end_sample - eof.fade_out_samples
-                if (
-                    eof.stable_silence_start_sample is None
-                    or fade_start < eof.stable_silence_start_sample
-                ):
-                    raise FinalRenderError("EOF fade is not inside verified silence")
-                eof_fades.append(
-                    {
-                        "source_start_sample": fade_start,
-                        "source_end_sample": eof.new_end_sample,
-                        "curve": "fade_out",
-                        "verified_quiet": True,
-                    }
-                )
-            end_boundary = {
-                **_source_edge_boundary(
-                    boundary_id="end_of_file",
-                    boundary_kind="end_of_file",
-                    selected_sample=eof.new_end_sample,
-                    sample_rate=sample_rate,
-                ),
-                "source_word_ids": {"last_retained_left": source_range.end_word_id - 1},
-                "whisper_timestamps": {"retained_end_seconds": raw_end},
-                "verified_quiet_interval": (
-                    {
-                        "start_sample": eof.stable_silence_start_sample,
-                        "end_sample": eof.new_end_sample,
-                        "local_noise_floor_db": eof.local_noise_floor_db,
-                        "silence_threshold_db": eof.silence_threshold_db,
-                        "verification": "safe_eof_tail",
-                    }
-                    if eof.stable_silence_start_sample is not None
-                    else None
-                ),
-                "fade_intervals": eof_fades,
-                "boundary_method": "eof_safe_tail",
-            }
         else:
             if range_index < len(ranges) - 1:
-                context_key = f"source_gap_{range_index:04d}"
+                context_key = f"source_gap_{range_index:04d}_left"
             else:
                 context_key = "trailing_source_cut"
-            context = context_by_key[context_key]
-            end_boundary = _resolve_aligned_cut(
+            completeness = completeness_support.get(
+                context_key,
+                {"support": None, "error": "completeness context is missing"},
+            )
+            end_boundary = _resolve_mfa_cut(
                 boundary_id=f"range_{range_index:04d}_end",
                 boundary_kind="selected_to_omitted",
-                spec=context["_spec"],
-                spans=context["_spans"],
-                alignment_error=context["error"],
+                spec=completeness_by_key[context_key]["_spec"],
+                mfa_context=mfa_context_by_key.get(context_key),
+                mfa_error=mfa_global_error,
+                retained_support=completeness["support"],
+                completeness_error=completeness["error"],
                 words=words,
                 mono=mono,
                 sample_rate=sample_rate,
@@ -1834,7 +2515,7 @@ def build_final_boundary_plan(
         else:
             existing_samples = 0
             inserted_samples = 0
-            safety_status = "unsafe_dense_boundary"
+            safety_status = "unsafe_source_boundary"
         joins.append(
             {
                 "join_id": f"source_join_{left_index:04d}",
@@ -1874,11 +2555,11 @@ def build_final_boundary_plan(
 
     for transition_index, transition in enumerate(transitions):
         context_key = f"internal_thought_gap_{transition_index:04d}"
-        context = context_by_key.get(context_key)
-        if context is None:
+        completeness_context = completeness_by_key.get(context_key)
+        if completeness_context is None:
             continue
-        spec = context["_spec"]
-        spans = context["_spans"]
+        spec = completeness_context["_spec"]
+        mfa_context = mfa_context_by_key.get(context_key)
         pause_type = str(transition["pause_type"])
         target_samples = round(PAUSE_TARGETS_MS[pause_type] * sample_rate / 1000.0)
         common = {
@@ -1898,7 +2579,7 @@ def build_final_boundary_plan(
             "room_tone_source_ranges": [],
             "room_tone_fade_samples": 0,
         }
-        if spans is None:
+        if mfa_context is None:
             joins.append(
                 {
                     **common,
@@ -1908,36 +2589,31 @@ def build_final_boundary_plan(
                     "inserted_pause_ms": 0.0,
                     "safety_status": "pause_not_inserted_no_safe_point",
                     "insertion_method": "none",
-                    "error": context["error"],
+                    "error": mfa_global_error or "MFA pause context is missing",
                 }
             )
             continue
         try:
-            protected = _protected_intervals(
+            protected = _mfa_protected_intervals(
                 spec=spec,
-                spans=spans,
+                context=mfa_context,
                 sample_rate=sample_rate,
                 total_samples=total_samples,
             )
             roles = _protected_by_role(protected)
-            previous_span = spans[int(spec["role_word_ids"]["previous_retained"])]
-            next_span = spans[int(spec["role_word_ids"]["next_retained"])]
-            evidence = find_verified_quiet_evidence(
-                mono,
-                search_start_sample=int(
-                    roles["previous_retained"]["margin_end_sample"]
-                ),
-                search_end_sample=int(roles["next_retained"]["margin_start_sample"]),
+            gap_start = int(roles["previous_retained"]["end_sample"])
+            gap_end = int(roles["next_retained"]["start_sample"])
+            evidence = _mfa_non_speech_interval(
+                context=mfa_context,
+                start_sample=gap_start,
+                end_sample=gap_end,
                 sample_rate=sample_rate,
-                alignment_interval_verified=True,
-                minimum_quiet_ms=MINIMUM_VERIFIED_QUIET_MS,
-                preference="longest",
             )
-            existing_samples = max(
-                0,
-                int(next_span["start_sample"]) - int(previous_span["end_sample"]),
+            existing_samples = max(0, gap_end - gap_start)
+            minimum_gap_samples = round(
+                MINIMUM_VERIFIED_QUIET_MS * sample_rate / 1000.0
             )
-            if evidence is None:
+            if evidence is None or existing_samples < minimum_gap_samples:
                 joins.append(
                     {
                         **common,
@@ -1950,21 +2626,25 @@ def build_final_boundary_plan(
                         "inserted_pause_ms": 0.0,
                         "safety_status": "pause_not_inserted_no_safe_point",
                         "insertion_method": "none",
-                        "error": "no aligned and verified natural inter-word gap",
+                        "error": "no MFA-confirmed natural inter-word gap",
                     }
                 )
                 continue
             inserted_samples = max(0, target_samples - existing_samples)
-            insertion_sample = (
-                evidence.quiet_start_sample + evidence.quiet_end_sample
-            ) // 2
+            insertion_sample = _snap_zero_crossing_in_mfa_gap(
+                mono,
+                candidate=(gap_start + gap_end) // 2,
+                interval_start=gap_start,
+                interval_end=gap_end,
+                sample_rate=sample_rate,
+            )
             fade_samples = round(QUIET_FADE_MS * sample_rate / 1000.0)
             fade_intervals = []
             if inserted_samples:
                 fade_intervals = [
                     {
                         "source_start_sample": max(
-                            evidence.quiet_start_sample,
+                            gap_start,
                             insertion_sample - fade_samples,
                         ),
                         "source_end_sample": insertion_sample,
@@ -1974,7 +2654,7 @@ def build_final_boundary_plan(
                     {
                         "source_start_sample": insertion_sample,
                         "source_end_sample": min(
-                            evidence.quiet_end_sample,
+                            gap_end,
                             insertion_sample + fade_samples,
                         ),
                         "curve": "fade_in",
@@ -1990,7 +2670,7 @@ def build_final_boundary_plan(
                 {
                     **common,
                     "source_insertion_sample": insertion_sample,
-                    "verified_quiet_interval": _quiet_payload(evidence),
+                    "verified_quiet_interval": evidence,
                     "protected_speech_intervals": protected,
                     "fade_intervals": fade_intervals,
                     "estimated_existing_pause_samples": existing_samples,
@@ -2001,7 +2681,7 @@ def build_final_boundary_plan(
                     "inserted_pause_ms": inserted_samples * 1000.0 / sample_rate,
                     "safety_status": "safe",
                     "insertion_method": (
-                        "aligned_verified_interword_gap"
+                        "mfa_confirmed_interword_gap"
                         if inserted_samples
                         else "none_existing_pause"
                     ),
@@ -2062,9 +2742,13 @@ def build_final_boundary_plan(
     )
     final_boundary = boundaries[-1]
     return {
-        "schema_version": 1,
-        "planner": "authoritative_single_pass_boundary_plan_v1",
+        "schema_version": 2,
+        "planner": "authoritative_single_pass_boundary_plan_v2",
         "status": plan_status,
+        "alignment_backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL_ID,
+        "mfa_fine_tune": True,
         "source_audio": str(audio_path),
         "source_audio_sha256": sha256_file(audio_path),
         "source_sample_rate": sample_rate,
@@ -2075,12 +2759,19 @@ def build_final_boundary_plan(
         "pause_plan": str(pause_plan_path),
         "pause_plan_sha256": sha256_file(pause_plan_path),
         "configuration": {
-            "alignment_backend": "whisperx_alignment",
-            "alignment_language": ALIGNMENT_LANGUAGE,
-            "alignment_device": "cpu",
+            "alignment_backend": "mfa",
+            "mfa_version": MFA_VERSION,
+            "mfa_model": MFA_MODEL_ID,
+            "mfa_fine_tune": True,
+            "mfa_prefix": str(mfa_prefix.resolve()),
+            "mfa_cache_root": str(mfa_cache_root.resolve()),
+            "mfa_num_jobs": mfa_num_jobs,
+            "whisperx_purpose": "retained_word_completeness_veto",
+            "whisperx_coordinate_authority": False,
             "protected_speech_margin_ms": PROTECTED_SPEECH_MARGIN_MS,
             "minimum_verified_quiet_ms": MINIMUM_VERIFIED_QUIET_MS,
             "quiet_fade_ms": QUIET_FADE_MS,
+            "mfa_zero_crossing_snap_ms": MFA_ZERO_CROSSING_SNAP_MS,
             "room_tone_fade_ms": ROOM_TONE_FADE_MS,
             "pause_targets_ms": PAUSE_TARGETS_MS,
             "retained_word_support": {
@@ -2093,17 +2784,24 @@ def build_final_boundary_plan(
                 "minimum_edge_to_context_ratio": (MIN_RETAINED_EDGE_TO_CONTEXT_RATIO),
             },
         },
-        "alignment_jobs": str(jobs_path.resolve()),
-        "alignment_worker_result": str(worker_path.resolve()),
-        "alignment_contexts": [
-            _public_alignment_context(context) for context in contexts
+        "completeness_jobs": str(jobs_path.resolve()),
+        "completeness_worker_result": str(worker_path.resolve()),
+        "completeness_contexts": [
+            _public_alignment_context(context) for context in completeness_contexts
         ],
+        "mfa_alignment": (
+            str(mfa_alignment_path.resolve()) if mfa_alignment_path.is_file() else None
+        ),
+        "alignment_contexts": (
+            list(mfa_result.get("contexts", [])) if mfa_result is not None else []
+        ),
+        "mfa_error": mfa_global_error,
         "source_intervals": source_intervals,
         "boundaries": boundaries,
         "joins": joins,
         "output_segments": output_segments,
         "expected_output_frame_count": expected_frames,
-        "alignment_context_count": len(contexts),
+        "alignment_context_count": len(jobs),
         "alignment_resolved_boundaries": sum(
             boundary["safety_status"] == "safe"
             and boundary["alignment_context_id"] is not None
@@ -2113,12 +2811,23 @@ def build_final_boundary_plan(
             boundary["safety_status"] == "unsafe_dense_boundary"
             for boundary in boundaries
         ),
+        "mfa_dense_phone_boundaries": sum(
+            boundary["boundary_method"] == "mfa_dense_phone_boundary"
+            for boundary in boundaries
+        ),
         "weak_retained_word_alignments": sum(
             boundary["safety_status"] == "weak_retained_word_alignment"
             for boundary in boundaries
         ),
         "alignment_failures": sum(
-            boundary["safety_status"] == "alignment_failed" for boundary in boundaries
+            boundary["safety_status"]
+            in {
+                "completeness_alignment_failed",
+                "mfa_alignment_failed",
+                "mfa_runtime_failed",
+                "mfa_word_mapping_failed",
+            }
+            for boundary in boundaries
         ),
         "final_boundary": final_boundary,
     }
@@ -2134,6 +2843,13 @@ def _intervals_overlap(
 
 
 def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
+    if (
+        boundary_plan.get("alignment_backend") != "mfa"
+        or boundary_plan.get("mfa_version") != MFA_VERSION
+        or boundary_plan.get("mfa_model") != MFA_MODEL_ID
+        or boundary_plan.get("mfa_fine_tune") is not True
+    ):
+        raise FinalRenderError("boundary plan has no authoritative MFA provenance")
     boundaries = boundary_plan.get("boundaries")
     joins = boundary_plan.get("joins")
     segments = boundary_plan.get("output_segments")
@@ -2249,7 +2965,7 @@ def render_boundary_plan(
     boundary_plan = read_json(boundary_plan_path)
     if not isinstance(boundary_plan, dict):
         raise FinalRenderError("final boundary plan root must be an object")
-    if boundary_plan.get("planner") != "authoritative_single_pass_boundary_plan_v1":
+    if boundary_plan.get("planner") != "authoritative_single_pass_boundary_plan_v2":
         raise FinalRenderError("unsupported final boundary plan")
     if boundary_plan.get("status") != "safe":
         unsafe = boundary_plan.get("unsafe_dense_boundaries", 0)
@@ -2364,6 +3080,11 @@ def render_final_cut(
     output_dir: Path,
     pause_plan_path: Path | None = None,
     alignment_python: Path = DEFAULT_ALIGNMENT_PYTHON,
+    alignment_backend: str = "mfa",
+    mfa_prefix: Path = DEFAULT_MFA_PREFIX,
+    mfa_cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
+    mfa_micromamba: str | Path = "micromamba",
+    mfa_num_jobs: int = 1,
     env_file: Path = Path(".env"),
     planner_backend: str = "gemini",
     planner_model: str | None = None,
@@ -2376,6 +3097,8 @@ def render_final_cut(
     repair_backend: PausePlannerBackend | None = None,
     alignment_payload: dict[str, Any] | None = None,
     alignment_payloads: Sequence[dict[str, Any]] | None = None,
+    mfa_payload: dict[str, Any] | None = None,
+    mfa_payloads: Sequence[dict[str, Any]] | None = None,
     max_acoustic_retries: int = DEFAULT_MAX_ACOUSTIC_RETRIES,
     write_debug_artifacts: bool = False,
 ) -> dict[str, Any]:
@@ -2394,6 +3117,10 @@ def render_final_cut(
         )
     if max_acoustic_retries < 0:
         raise ValueError("max_acoustic_retries must be non-negative")
+    if alignment_backend != "mfa":
+        raise ValueError("MFA is the only production alignment backend")
+    if mfa_num_jobs <= 0:
+        raise ValueError("mfa_num_jobs must be positive")
     original_plan_path = plan_path
     plan, grounding_path, selected_range_count = _validate_grounded_plan(
         audio_path=audio_path,
@@ -2446,6 +3173,13 @@ def render_final_cut(
                 if acoustic_attempt == 0
                 else None
             )
+            attempt_mfa_payload = (
+                mfa_payloads[acoustic_attempt]
+                if mfa_payloads is not None and acoustic_attempt < len(mfa_payloads)
+                else mfa_payload
+                if acoustic_attempt == 0
+                else None
+            )
             boundary_plan = build_final_boundary_plan(
                 audio_path=audio_path,
                 semantic_plan=effective_plan,
@@ -2454,7 +3188,13 @@ def render_final_cut(
                 pause_plan_path=effective_pause_path,
                 output_dir=evidence_dir,
                 alignment_python=alignment_python,
+                alignment_backend=alignment_backend,
+                mfa_prefix=mfa_prefix,
+                mfa_cache_root=mfa_cache_root,
+                mfa_micromamba=mfa_micromamba,
+                mfa_num_jobs=mfa_num_jobs,
                 alignment_payload=attempt_payload,
+                mfa_payload=attempt_mfa_payload,
             )
             if boundary_plan["status"] == "safe":
                 break
@@ -2556,7 +3296,15 @@ def render_final_cut(
         elif unsafe:
             reason = "unsafe_dense_boundary"
         else:
-            reason = "forced_alignment_failed"
+            reason = next(
+                (
+                    str(boundary["safety_status"])
+                    for boundary in boundary_plan["boundaries"]
+                    if boundary["safety_status"]
+                    not in {"safe", "mfa_not_run_due_to_weak_retained_word"}
+                ),
+                "mfa_alignment_failed",
+            )
         raise FinalRenderError(
             f"{reason}: boundary plan has {unsafe} dense boundaries and "
             f"{weak} weak retained-word alignments and {failures} alignment "
@@ -2576,9 +3324,13 @@ def render_final_cut(
         raise FinalRenderError("final boundary plan changed during rendering")
 
     manifest = {
-        "schema_version": 2,
-        "renderer": "authoritative_single_pass_final_render_v2",
+        "schema_version": 3,
+        "renderer": "authoritative_single_pass_final_render_v3",
         "status": "complete",
+        "alignment_backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL_ID,
+        "mfa_fine_tune": True,
         "source_audio": str(audio_path),
         "source_audio_sha256": sha256_file(audio_path),
         "streaming_plan": str(original_plan_path),
@@ -2609,6 +3361,7 @@ def render_final_cut(
         "alignment_contexts": boundary_plan["alignment_context_count"],
         "alignment_resolved_boundaries": boundary_plan["alignment_resolved_boundaries"],
         "unsafe_dense_boundaries": boundary_plan["unsafe_dense_boundaries"],
+        "mfa_dense_phone_boundaries": boundary_plan["mfa_dense_phone_boundaries"],
         "weak_retained_word_alignments": boundary_plan.get(
             "weak_retained_word_alignments", 0
         ),
@@ -2641,7 +3394,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--alignment-python",
         type=Path,
         default=DEFAULT_ALIGNMENT_PYTHON,
+        help=(
+            "Python containing WhisperX, used only for the retained-word "
+            "completeness veto; it never supplies cut coordinates."
+        ),
     )
+    parser.add_argument(
+        "--alignment-backend",
+        choices=("mfa",),
+        default="mfa",
+        help="Production coordinate backend (MFA is fail-closed and mandatory).",
+    )
+    parser.add_argument("--mfa-prefix", type=Path, default=DEFAULT_MFA_PREFIX)
+    parser.add_argument(
+        "--mfa-cache-root",
+        type=Path,
+        default=DEFAULT_MFA_CACHE_ROOT,
+    )
+    parser.add_argument("--mfa-micromamba", default="micromamba")
+    parser.add_argument("--mfa-num-jobs", type=int, default=1)
     add_planner_backend_arguments(parser)
     parser.add_argument(
         "--max-output-tokens",
@@ -2675,12 +3446,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("final plan rendering requires --render-plan")
     if args.max_acoustic_retries < 0:
         raise SystemExit("--max-acoustic-retries must be non-negative")
+    if args.mfa_num_jobs <= 0:
+        raise SystemExit("--mfa-num-jobs must be positive")
     manifest = render_final_cut(
         audio_path=args.audio,
         plan_path=args.plan,
         output_dir=args.output_dir,
         pause_plan_path=args.pause_plan,
         alignment_python=args.alignment_python,
+        alignment_backend=args.alignment_backend,
+        mfa_prefix=args.mfa_prefix,
+        mfa_cache_root=args.mfa_cache_root,
+        mfa_micromamba=args.mfa_micromamba,
+        mfa_num_jobs=args.mfa_num_jobs,
         env_file=args.env_file,
         planner_backend=args.planner_backend,
         planner_model=args.planner_model,

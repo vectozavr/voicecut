@@ -12,6 +12,7 @@ dist/
 
 .venv/
 .venv-*/
+.mfa-env/
 venv/
 
 *.partial

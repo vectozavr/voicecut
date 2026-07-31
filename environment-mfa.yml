@@ -1,0 +1,6 @@
+name: voicecut-mfa
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - montreal-forced-aligner=3.4.1

@@ -5,10 +5,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VENV_DIR="${PROJECT_DIR}/.venv"
 MLX_VENV_DIR="${PROJECT_DIR}/.venv-mlx"
+MFA_ENV_DIR="${PROJECT_DIR}/.mfa-env"
+MFA_CACHE_ROOT="${VOICECUT_MFA_CACHE_ROOT:-${PROJECT_DIR}/.voicecut-cache/runtime/mfa}"
+MFA_HF_CACHE="${MFA_CACHE_ROOT}/huggingface"
 
 if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   echo "VoiceCut currently supports Apple Silicon macOS (arm64)." >&2
   exit 1
+fi
+
+if ! command -v micromamba >/dev/null 2>&1; then
+  if command -v brew >/dev/null 2>&1; then
+    echo "Installing micromamba with Homebrew..."
+    brew install micromamba
+  else
+    echo "micromamba is required for the pinned MFA runtime." >&2
+    echo "Install Homebrew, then run: brew install micromamba" >&2
+    exit 1
+  fi
 fi
 
 select_python() {
@@ -55,6 +69,31 @@ if ! command -v ffmpeg >/dev/null 2>&1 \
 fi
 
 cd "${PROJECT_DIR}"
+
+if [[ ! -x "${MFA_ENV_DIR}/bin/mfa" ]]; then
+  echo "Creating the pinned MFA 3.4.1 environment..."
+  micromamba create -y \
+    -p "${MFA_ENV_DIR}" \
+    -f "${PROJECT_DIR}/environment-mfa.yml"
+fi
+
+mkdir -p "${MFA_CACHE_ROOT}" "${MFA_HF_CACHE}"
+MFA_VERSION_OUTPUT="$(
+  MFA_ROOT_DIR="${MFA_CACHE_ROOT}" \
+    HF_HOME="${MFA_HF_CACHE}" \
+    micromamba run -p "${MFA_ENV_DIR}" mfa version
+)"
+MFA_VERSION="$(
+  printf '%s\n' "${MFA_VERSION_OUTPUT}" \
+    | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' \
+    | head -n 1
+)"
+if [[ "${MFA_VERSION}" != "3.4.1" ]]; then
+  echo "Expected MFA 3.4.1, got: ${MFA_VERSION_OUTPUT}" >&2
+  echo "Remove ${MFA_ENV_DIR} and rerun the installer." >&2
+  exit 1
+fi
+echo "Verified Montreal Forced Aligner ${MFA_VERSION}."
 
 if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
   echo "Creating ${VENV_DIR} with Python ${PYTHON_VERSION}..."

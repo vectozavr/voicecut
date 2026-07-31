@@ -4,7 +4,8 @@ VoiceCut turns a retake-heavy spoken recording into coherent narration. It
 transcribes the recording once, asks a selected language model which source
 word occurrences belong in the intended take, validates that decision against
 the source transcript, aligns retained boundaries to phones with Montreal
-Forced Aligner (MFA), and renders the accepted edit once from the source.
+Forced Aligner (MFA), optionally replaces breaths only inside MFA-confirmed
+non-speech, and renders the accepted edit once from the source.
 
 It accepts audio or video. Video is edited from its speech track: selected
 audio intervals select the corresponding picture intervals, and an inserted
@@ -12,7 +13,9 @@ semantic pause holds the last selected frame. VoiceCut does not interpret the
 visual content.
 
 VoiceCut never synthesizes speech, replaces words, denoises the recording, or
-adds generated background noise. The final voice samples come from the input.
+adds generated background noise. Retained voice samples come directly from the
+input. Optional breath cleanup uses verified quiet material copied from the
+same recording and preserves the duration of the edited pause.
 
 ## Supported system
 
@@ -25,8 +28,11 @@ adds generated background noise. The final voice samples come from the input.
 
 The first transcription downloads the selected Whisper model. The first
 alignment run downloads the `english_us_arpa` MFA model into VoiceCut's
-persistent cache at `.voicecut-cache/runtime/mfa`. A local language model is
-downloaded only when a local planner backend is selected. Model files can
+persistent cache at `.voicecut-cache/runtime/mfa`. The installer downloads the
+pinned Respiro-en implementation and checkpoint into
+`.voicecut-cache/runtime/respiro-en`, verifies their SHA-256 hashes, and never
+downloads from a moving branch during normal execution. A local language model
+is downloaded only when a local planner backend is selected. Model files can
 require several gigabytes of disk space.
 
 ## Install
@@ -51,10 +57,12 @@ The installer:
 3. creates the repository-local `.mfa-env` from `environment-mfa.yml` and
    verifies that it contains exactly MFA 3.4.1;
 4. creates the primary `.venv` and an internal `.venv-mlx` helper environment;
-5. installs VoiceCut, audio dependencies, the WhisperX completeness-veto
+5. downloads and hash-verifies the pinned Respiro-en implementation, checkpoint,
+   and MIT license into VoiceCut's runtime cache;
+6. installs VoiceCut, audio dependencies, the WhisperX completeness-veto
    runtime, and cloud SDKs in `.venv`;
-6. installs MLX Whisper and local-planner dependencies in `.venv-mlx`;
-7. creates an empty `.env` from `.env.example` without overwriting an existing
+7. installs MLX Whisper and local-planner dependencies in `.venv-mlx`;
+8. creates an empty `.env` from `.env.example` without overwriting an existing
    file and restricts it to the current user (`0600`).
 
 You invoke only the `voicecut` command from `.venv`; VoiceCut launches both
@@ -110,6 +118,12 @@ Cloud SDKs are optional when only local planning is needed:
 The `.mfa-env` runtime is required for production cuts regardless of which
 semantic planner backend is selected.
 
+The verified Respiro-en files are required only for optional breath cleanup.
+If they are unavailable or inference fails, VoiceCut keeps the valid MFA edit,
+preserves the original pause content, records the detector failure in the final
+manifest, and prints a warning. It never substitutes an RMS or VAD breath
+heuristic.
+
 ## Quick start
 
 Edit a WAV with Gemini:
@@ -118,6 +132,15 @@ Edit a WAV with Gemini:
 voicecut recording.wav \
   -o recording_edited.wav \
   --planner-backend gemini
+```
+
+Breath replacement is enabled by default. Disable it for a direct comparison:
+
+```bash
+voicecut recording.wav \
+  -o recording_without_breath_cleanup.wav \
+  --planner-backend gemini \
+  --breath-cleanup off
 ```
 
 The local-backend transport is also available for later evaluation:
@@ -295,9 +318,11 @@ The work directory contains the canonical input WAV, analysis, word transcript,
 acoustic retry evidence, streaming semantic plan, grounding report, local
 WhisperX completeness-veto crops, the batched MFA corpus and word/phone
 alignment JSON, the semantic pause plan, one authoritative
-`final_boundary_plan.json`, and one final internal WAV. MFA context WAVs are
-crops from the canonical source used only as alignment input; they are not
-rendered narration. No rendered preview WAV feeds another production step.
+`final_boundary_plan.json`, Respiro-en frame probabilities for relevant source
+regions, breath-replacement provenance, and one final internal WAV. MFA context
+WAVs are crops from the canonical source used only as alignment input; they are
+not rendered narration. No rendered preview or breath-cleaned WAV feeds another
+production step.
 Completed stages are reused only when their input hashes, relevant model
 settings, and VoiceCut implementation fingerprint match. A software update
 therefore cannot silently reuse a plan or render produced by older code.
@@ -442,13 +467,28 @@ A separate semantic pause classification still assigns `continuation`, `short`,
 gap. Any deficit is filled with verified room tone only at an MFA-resolved
 join, or inside an MFA-confirmed inter-word non-speech interval within a
 contiguous take. If there is no confirmed internal gap, the extra pause is
-skipped. At EOF, the complete final MFA phone is protected before the existing
-safe tail is retained and any fade can begin.
+skipped.
 
-Only after all boundaries, pauses, room-tone source ranges, and fade intervals
-have been frozen in `final_boundary_plan.json` does `final_render.py` slice the
-canonical source WAV. It performs one render and writes one internal
-`final_cut.wav`; no later stage may move or fade a boundary.
+After pause planning, the pinned official Respiro-en model analyzes only source
+regions that can appear in the output or supply room tone. It produces one
+breath probability every 10 ms from a mono 16 kHz inference copy; the canonical
+source is never resampled for rendering. Detected events may be replaced only
+inside retained, MFA-confirmed non-speech. A 30 ms event guard and transitions
+are clamped to that editable region. A detection overlapping a retained MFA
+phone is left unchanged, including possible false positives over quiet final
+`/s/`, `/z/`, `/f/`, `/th/`, `/sh/`, and `/tion/` phones. Breath-positive
+source is also excluded from room-tone candidates. Replacement uses clean,
+traceable room tone from the source and preserves the exact pause duration;
+the semantic pause target and every MFA endpoint remain unchanged.
+
+At EOF, the complete final MFA phone is protected before the existing safe
+tail is retained and any fade can begin.
+
+Only after all boundaries, pauses, breath decisions, room-tone source ranges,
+and fade intervals have been frozen in `final_boundary_plan.json` does
+`final_render.py` slice the canonical source WAV. It performs one render and
+writes one internal `final_cut.wav`; no later stage may move or fade a boundary.
+Every replaced sample is traceable to a verified source room-tone sample.
 
 ### 7. Publication
 
@@ -483,6 +523,10 @@ Important options:
 | `--mfa-cache-root PATH` | Persistent MFA model/cache directory passed as `MFA_ROOT_DIR`; defaults to `.voicecut-cache/runtime/mfa` |
 | `--mfa-micromamba PATH` | micromamba executable used to run the pinned MFA prefix |
 | `--mfa-num-jobs N` | Parallel jobs inside the one batched `mfa align_hf` invocation |
+| `--breath-cleanup off\|replace` | Optional Respiro-en cleanup; defaults to `replace` |
+| `--breath-threshold FLOAT` | Frame probability threshold; conservative default `0.5` |
+| `--breath-min-duration-ms N` | Minimum consecutive positive duration; default `80` ms |
+| `--respiro-cache-root PATH` | Verified pinned Respiro-en implementation/model cache |
 | `--window-seconds N` | New transcript look-ahead added per planner iteration |
 | `--max-output-tokens N` | Maximum structured planner response size |
 | `--max-acoustic-retries N` | Bounded planner reselections after an acoustic failure or weak retained-word occurrence; defaults to 3 |
@@ -492,6 +536,33 @@ Important options:
 | `--planner-python PATH` | Advanced: Python executable for local MLX LLMs |
 
 Run `voicecut --help` for the authoritative option list.
+
+## Breath-cleanup behavior
+
+VoiceCut pins the official [Respiro-en](https://github.com/ydqmkkx/Respiro-en)
+implementation at commit
+`70e01c60c2f582c41092730680f2894ab24d6467`. Exact file hashes, licensing, and
+the paper citation are recorded in
+[`docs/upstream/respiro-en.md`](docs/upstream/respiro-en.md). Runtime code
+rechecks all three hashes before importing the model definition or loading the
+checkpoint.
+
+The production defaults are `--breath-threshold 0.5` and
+`--breath-min-duration-ms 80`. They were selected conservatively after running
+the combinations `0.064`, `0.2`, `0.5`, and `0.9` with minimum durations of
+40, 80, and 120 ms on real VoiceCut recordings. They are detector settings,
+not speech-safety thresholds: MFA phone protection is the non-negotiable safety
+authority at every setting. Raising the threshold can split one physical event
+into smaller detections, so a numerically stricter threshold does not
+necessarily mean fewer replacements.
+
+For inspection, run with `--debug-artifacts`. VoiceCut saves a probability plot
+and short source/cleaned/room-tone excerpts for each detected event beneath the
+run's `05_final/breath_debug/` directory. These are diagnostics created after
+the frozen one-pass render; they are never inputs to production output. Human
+listening remains required. Respiro-en was trained for frame-wise breath
+detection, and its paper notes that exhalations are comparatively rare and does
+not classify inhalation versus exhalation, so long sighs may be missed.
 
 ## MFA troubleshooting
 
@@ -540,6 +611,9 @@ run manifests.
   speakers, or severe recording damage.
 - VoiceCut is intended for one primary narrator. Crosstalk and interviews with
   competing speakers are not yet diarized.
+- Optional breath cleanup is conservative and may leave a detected event when
+  MFA cannot separate it safely from retained speech or when clean source room
+  tone is unavailable. Long sighs and exhalations may be missed.
 - Video editing follows speech only and does not understand shots, gestures,
   slides, captions, or visual continuity.
 - Audio/video output is re-encoded in common delivery codecs; VoiceCut is not a
@@ -573,9 +647,12 @@ MFA phone-protected `/s/` and leading-word regressions, dense phone-to-phone
 boundaries, overlapping Whisper anchors, confidence-aware weak-word rejection,
 fail-closed MFA mapping and geometry errors, semantic pauses, EOF tails,
 sample-trace invariants, media conversion, video timeline construction,
-caching, and one-command orchestration. The real MFA integration test is opt-in
-with `VOICECUT_RUN_MFA_INTEGRATION=1`; ordinary CI uses recorded JSON fixtures
-and does not download the alignment model.
+caching, one-command orchestration, frame-wise breath geometry, MFA-protected
+breath replacement, exact-duration room-tone substitution, detector failure,
+and the single-render invariant. The real MFA and Respiro-en integration tests
+are opt-in with `VOICECUT_RUN_MFA_INTEGRATION=1` and
+`VOICECUT_RUN_BREATH_INTEGRATION=1`; ordinary CI uses recorded or mocked
+evidence and does not download model weights.
 
 ## License
 

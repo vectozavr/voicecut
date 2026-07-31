@@ -134,15 +134,21 @@ class StreamingNarrationTests(unittest.TestCase):
                 response(
                     finalized=[
                         thought(
-                            "And it might begin with the familiar words once upon "
-                            "a time.",
-                            (0, 3, "And", "begin", "And it might begin"),
+                            "And it might begin with familiar words once upon a "
+                            "time.",
                             (
-                                6,
+                                0,
+                                5,
+                                "And",
+                                "familiar",
+                                "And it might begin with familiar",
+                            ),
+                            (
+                                9,
                                 13,
-                                "with",
+                                "words",
                                 "time.",
-                                "with the familiar words once upon a time.",
+                                "words once upon a time.",
                             ),
                         )
                     ],
@@ -155,15 +161,21 @@ class StreamingNarrationTests(unittest.TestCase):
                 response(
                     finalized=[
                         thought(
-                            "And it might begin with the familiar words once "
-                            "upon a time.",
-                            (0, 3, "And", "begin", "And it might begin"),
+                            "And it might begin with familiar words once upon a "
+                            "time.",
                             (
-                                6,
+                                0,
+                                5,
+                                "And",
+                                "familiar",
+                                "And it might begin with familiar",
+                            ),
+                            (
+                                9,
                                 13,
-                                "with",
+                                "words",
                                 "time.",
-                                "with the familiar words once upon a time.",
+                                "words once upon a time.",
                             ),
                         )
                     ],
@@ -172,20 +184,21 @@ class StreamingNarrationTests(unittest.TestCase):
                 response(
                     finalized=[
                         thought(
-                            "It might begin with familiar words once upon a time.",
+                            "And it might begin with the familiar words once upon "
+                            "a time.",
                             (
-                                1,
-                                5,
-                                "it",
-                                "familiar",
-                                "It might begin with familiar",
+                                0,
+                                3,
+                                "And",
+                                "begin",
+                                "And it might begin",
                             ),
                             (
-                                9,
+                                6,
                                 13,
-                                "words",
+                                "with",
                                 "time.",
-                                "words once upon a time.",
+                                "with the familiar words once upon a time.",
                             ),
                         )
                     ],
@@ -213,15 +226,33 @@ class StreamingNarrationTests(unittest.TestCase):
                         {
                             "boundary_id": "range_0000_end",
                             "boundary_kind": "selected_to_omitted",
-                            "safety_status": "unsafe_dense_boundary",
+                            "safety_status": "weak_retained_word_alignment",
                             "source_word_ids": {
-                                "last_retained_left": 3,
-                                "first_omitted": 4,
-                                "last_omitted": 5,
-                                "first_retained_right": 6,
+                                "last_retained_left": 5,
+                                "first_omitted": 6,
+                                "last_omitted": 8,
+                                "first_retained_right": 9,
                             },
                             "aligned_timestamps": {},
-                            "error": "no verified quiet interval",
+                            "forbidden_word_ids": [5],
+                            "forbidden_source_edges": [
+                                {
+                                    "boundary_kind": "selected_to_omitted",
+                                    "retained_word_id": 5,
+                                    "omitted_word_id": 6,
+                                }
+                            ],
+                            "failure_reason": "weak_terminal_word_support",
+                            "retained_word_support": {
+                                "word_id": 5,
+                                "source_text": "familiar",
+                                "status": "weak_terminal_word_support",
+                                "edge_character_scores": [0.85, 0.41, 0.49],
+                                "minimum_edge_score": 0.41,
+                                "local_context_median_score": 0.91,
+                                "edge_to_context_score_ratio": 0.45,
+                            },
+                            "error": "weak terminal character support",
                         }
                     ],
                 },
@@ -238,11 +269,19 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertEqual(repaired["status"], "complete")
             self.assertEqual(
                 repaired["reconstructed_narration"],
-                "It might begin with familiar words once upon a time.",
+                "And it might begin with the familiar words once upon a time.",
             )
             self.assertFalse(
                 any(
-                    source_range["end_word_id"] == 4
+                    source_range["start_word_id"] <= 5
+                    < source_range["end_word_id"]
+                    for source_range in repaired["selected_source_ranges"]
+                )
+            )
+            self.assertTrue(
+                any(
+                    source_range["start_word_id"] <= 8
+                    < source_range["end_word_id"]
                     for source_range in repaired["selected_source_ranges"]
                 )
             )
@@ -251,8 +290,16 @@ class StreamingNarrationTests(unittest.TestCase):
                 "valid",
             )
             self.assertIn("REJECTED ACOUSTIC BOUNDARIES", repair_backend.prompts[0])
+            self.assertIn("forbidden_word_ids", repair_backend.prompts[0])
             self.assertEqual(len(repair_backend.prompts), 2)
-            self.assertIn("unsafe trailing cut", repair_backend.prompts[1])
+            self.assertIn("forbidden weak source word 5", repair_backend.prompts[1])
+            repair_record = read_json(root / "repair/acoustic_repair.json")[
+                "repairs"
+            ][0]
+            self.assertEqual(repair_record["forbidden_word_ids"], [5])
+            self.assertEqual(
+                repair_record["failure_reasons"], ["weak_terminal_word_support"]
+            )
 
     def test_streaming_delay_replaces_attempt_and_preserves_future_thoughts(
         self,

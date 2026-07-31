@@ -461,6 +461,7 @@ def test_dense_boundary_fails_closed_instead_of_guessing(tmp_path: Path) -> None
                 words,
                 [(0.10, 0.60), (0.60, 0.90), (0.98, 1.30)],
             ),
+            max_acoustic_retries=0,
         )
 
     boundary_plan = read_json(output_dir / "final_boundary_plan.json")

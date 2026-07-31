@@ -13,6 +13,7 @@ from voicecut.streaming_narration import (
     StreamingPlanError,
     TranscriptWord,
     load_transcript_words,
+    repair_plan_for_acoustic_safety,
     run_streaming_planner,
     streaming_response_schema,
     validate_decision,
@@ -107,6 +108,152 @@ def transcript_with_word_groups(
 
 
 class StreamingNarrationTests(unittest.TestCase):
+    def test_acoustic_repair_reselects_thought_without_reusing_unsafe_cut(
+        self,
+    ) -> None:
+        texts = [
+            "And",
+            "it",
+            "might",
+            "begin",
+            "with",
+            "familiar",
+            "with",
+            "the",
+            "familiar",
+            "words",
+            "once",
+            "upon",
+            "a",
+            "time.",
+        ]
+        transcript = transcript_with_word_groups([(0.0, texts)])
+        initial_backend = FakeStreamingBackend(
+            [
+                response(finalized=[], pending_start_word_id=0),
+                response(
+                    finalized=[
+                        thought(
+                            "And it might begin with the familiar words once upon "
+                            "a time.",
+                            (0, 3, "And", "begin", "And it might begin"),
+                            (
+                                6,
+                                13,
+                                "with",
+                                "time.",
+                                "with the familiar words once upon a time.",
+                            ),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+        repair_backend = FakeStreamingBackend(
+            [
+                response(
+                    finalized=[
+                        thought(
+                            "And it might begin with the familiar words once "
+                            "upon a time.",
+                            (0, 3, "And", "begin", "And it might begin"),
+                            (
+                                6,
+                                13,
+                                "with",
+                                "time.",
+                                "with the familiar words once upon a time.",
+                            ),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+                response(
+                    finalized=[
+                        thought(
+                            "It might begin with familiar words once upon a time.",
+                            (
+                                1,
+                                5,
+                                "it",
+                                "familiar",
+                                "It might begin with familiar",
+                            ),
+                            (
+                                9,
+                                13,
+                                "words",
+                                "time.",
+                                "words once upon a time.",
+                            ),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            initial_dir = root / "initial"
+            run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=initial_dir,
+                backend=initial_backend,
+            )
+            boundary_path = root / "rejected_boundary_plan.json"
+            write_json(
+                boundary_path,
+                {
+                    "status": "unsafe",
+                    "boundaries": [
+                        {
+                            "boundary_id": "range_0000_end",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "unsafe_dense_boundary",
+                            "source_word_ids": {
+                                "last_retained_left": 3,
+                                "first_omitted": 4,
+                                "last_omitted": 5,
+                                "first_retained_right": 6,
+                            },
+                            "aligned_timestamps": {},
+                            "error": "no verified quiet interval",
+                        }
+                    ],
+                },
+            )
+
+            repaired = repair_plan_for_acoustic_safety(
+                plan_path=initial_dir / "streaming_plan.json",
+                boundary_plan_path=boundary_path,
+                output_dir=root / "repair",
+                backend=repair_backend,
+                retry_index=1,
+            )
+
+            self.assertEqual(repaired["status"], "complete")
+            self.assertEqual(
+                repaired["reconstructed_narration"],
+                "It might begin with familiar words once upon a time.",
+            )
+            self.assertFalse(
+                any(
+                    source_range["end_word_id"] == 4
+                    for source_range in repaired["selected_source_ranges"]
+                )
+            )
+            self.assertEqual(
+                read_json(root / "repair/grounding_validation.json")["status"],
+                "valid",
+            )
+            self.assertIn("REJECTED ACOUSTIC BOUNDARIES", repair_backend.prompts[0])
+            self.assertEqual(len(repair_backend.prompts), 2)
+            self.assertIn("unsafe trailing cut", repair_backend.prompts[1])
+
     def test_streaming_delay_replaces_attempt_and_preserves_future_thoughts(
         self,
     ) -> None:

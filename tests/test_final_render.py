@@ -291,6 +291,8 @@ def test_final_render_builds_one_boundary_plan_and_renders_source_once(
     assert manifest["status"] == "complete"
     assert manifest["semantic_thoughts"] == 2
     assert manifest["selected_source_ranges"] == 2
+    assert manifest["acoustic_repair_attempts"] == 0
+    assert manifest["effective_streaming_plan"] == str(plan_path.resolve())
     assert manifest["rendered_clips"] == 2
     assert manifest["alignment_contexts"] == 1
     assert manifest["alignment_resolved_boundaries"] == 2
@@ -434,6 +436,7 @@ def test_final_render_fails_closed_on_dense_leading_boundary(
             pause_plan_path=pause_plan_path,
             alignment_python=tmp_path / "model-must-not-run",
             alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
+            max_acoustic_retries=0,
         )
 
     assert not (output_dir / "final_cut.wav").exists()

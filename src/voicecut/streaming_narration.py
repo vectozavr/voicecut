@@ -16,7 +16,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 import unicodedata
 
 from .common import read_json, sha256_file, tokenize, write_json
@@ -1076,6 +1076,7 @@ def _request_validated_decision(
     committed_source_end: int,
     iteration: int,
     output_dir: Path,
+    decision_validator: Callable[[PlannerDecision], None] | None = None,
 ) -> tuple[PlannerDecision, list[dict[str, Any]]]:
     schema = streaming_response_schema()
     attempts: list[dict[str, Any]] = []
@@ -1096,6 +1097,8 @@ def _request_validated_decision(
                 final_pass=final_pass,
                 committed_source_end=committed_source_end,
             )
+            if decision_validator is not None:
+                decision_validator(decision)
             attempts.append(
                 {
                     "attempt": attempt,
@@ -1160,6 +1163,346 @@ def _request_validated_decision(
         f"streaming planner failed iteration {iteration} after one retry: "
         f"{prior_error}; raw responses were saved in {output_dir}"
     )
+
+
+def _words_from_complete_plan(plan: dict[str, Any]) -> list[TranscriptWord]:
+    raw_words = plan.get("words")
+    if not isinstance(raw_words, list) or not raw_words:
+        raise StreamingPlanError("complete plan contains no source words")
+    words: list[TranscriptWord] = []
+    for expected_id, raw_word in enumerate(raw_words):
+        if not isinstance(raw_word, dict) or raw_word.get("id") != expected_id:
+            raise StreamingPlanError("complete plan word IDs are not contiguous")
+        words.append(
+            TranscriptWord(
+                id=expected_id,
+                text=str(raw_word["text"]),
+                start=float(raw_word["start"]),
+                end=float(raw_word["end"]),
+            )
+        )
+    return words
+
+
+def _thought_source_bounds(thought: dict[str, Any]) -> tuple[int, int]:
+    ranges = thought.get("source_ranges")
+    if not isinstance(ranges, list) or not ranges:
+        raise StreamingPlanError("committed thought contains no source ranges")
+    return int(ranges[0]["start_word_id"]), int(ranges[-1]["end_word_id"])
+
+
+def _acoustic_repair_prompt(
+    *,
+    thought_index: int,
+    original_thought: dict[str, Any],
+    local_words: Sequence[TranscriptWord],
+    unsafe_boundaries: Sequence[dict[str, Any]],
+    previous_context: str | None,
+    next_context: str | None,
+) -> str:
+    boundary_summary = []
+    for boundary in unsafe_boundaries:
+        boundary_summary.append(
+            {
+                "boundary_id": boundary.get("boundary_id"),
+                "boundary_kind": boundary.get("boundary_kind"),
+                "source_word_ids": boundary.get("source_word_ids"),
+                "aligned_timestamps": boundary.get("aligned_timestamps"),
+                "reason": boundary.get("error"),
+            }
+        )
+    return f"""Repair one source-grounded narration thought after acoustic validation.
+
+The original semantic decision was meaningful, but its exact occurrence layout
+requires a cut where retained and omitted speech touch. The renderer correctly
+refused that cut. Choose a different, acoustically separable occurrence layout
+from LOCAL SOURCE WORDS.
+
+STRICT PRIORITIES:
+1. Preserve the original intended meaning and every unique content phrase.
+2. Remove retries, repetitions, abandoned words, and recording directions.
+3. Prefer one contiguous successful take. If no exact take exists, make only a
+   minimal wording change needed to use source-grounded, longer spans.
+4. Do not reproduce any rejected boundary shown below. Move the discontinuity
+   to a different source location or remove it by selecting a contiguous take.
+5. Do not solve the problem by retaining the unwanted words at the rejected
+   boundary. The revised narration must still read naturally without a retry.
+6. Return exactly ONE finalized thought and pending_start_word_id=null.
+7. Every source range uses inclusive first_word_id and last_word_id, exact
+   boundary words, and range-level canonical_text supported by every selected
+   source word.
+
+Read-only preceding thought:
+{json.dumps(previous_context, ensure_ascii=False)}
+
+ORIGINAL THOUGHT {thought_index}:
+{json.dumps(original_thought, ensure_ascii=False)}
+
+REJECTED ACOUSTIC BOUNDARIES:
+{json.dumps(boundary_summary, ensure_ascii=False)}
+
+Read-only following thought:
+{json.dumps(next_context, ensure_ascii=False)}
+
+LOCAL SOURCE WORDS:
+{json.dumps(_word_payload(local_words), ensure_ascii=False)}
+"""
+
+
+def _validate_acoustic_repair_decision(
+    decision: PlannerDecision,
+    *,
+    original_thought: dict[str, Any],
+    unsafe_boundaries: Sequence[dict[str, Any]],
+) -> None:
+    if len(decision.finalized) != 1:
+        raise DecisionValidationError(
+            "acoustic repair must return exactly one replacement thought"
+        )
+    replacement = decision.finalized[0]
+    original_tokens = tokenize(str(original_thought["canonical_text"]))
+    replacement_tokens = tokenize(replacement.canonical_text)
+    if not original_tokens or not replacement_tokens:
+        raise DecisionValidationError("acoustic repair returned empty narration")
+    matcher = SequenceMatcher(
+        None,
+        original_tokens,
+        replacement_tokens,
+        autojunk=False,
+    )
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    if (
+        matched / len(original_tokens) < 0.70
+        or matcher.ratio() < 0.75
+        or len(replacement_tokens) < math.ceil(0.70 * len(original_tokens))
+        or len(replacement_tokens) > len(original_tokens) + 1
+    ):
+        raise DecisionValidationError(
+            "acoustic repair changed the intended narration too substantially"
+        )
+    ranges = replacement.source_ranges
+    for boundary in unsafe_boundaries:
+        role_ids = boundary.get("source_word_ids")
+        if not isinstance(role_ids, dict):
+            continue
+        kind = boundary.get("boundary_kind")
+        if kind == "selected_to_omitted":
+            forbidden_end = role_ids.get("first_omitted")
+            if type(forbidden_end) is int and any(
+                source_range.end_word_id == forbidden_end for source_range in ranges
+            ):
+                raise DecisionValidationError(
+                    f"acoustic repair reproduced unsafe trailing cut before word "
+                    f"{forbidden_end}"
+                )
+        elif kind == "omitted_to_selected":
+            forbidden_start = role_ids.get("first_retained_right")
+            if type(forbidden_start) is int and any(
+                source_range.start_word_id == forbidden_start for source_range in ranges
+            ):
+                raise DecisionValidationError(
+                    f"acoustic repair reproduced unsafe leading cut at word "
+                    f"{forbidden_start}"
+                )
+
+
+def repair_plan_for_acoustic_safety(
+    *,
+    plan_path: Path,
+    boundary_plan_path: Path,
+    output_dir: Path,
+    backend: NarrationPlannerBackend,
+    retry_index: int,
+    context_words: int = 80,
+) -> dict[str, Any]:
+    """Replace only thoughts implicated by fail-closed acoustic boundaries."""
+
+    plan_path = plan_path.resolve()
+    boundary_plan_path = boundary_plan_path.resolve()
+    output_dir = output_dir.resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise RuntimeError(f"acoustic repair output must be empty: {output_dir}")
+    if context_words <= 0:
+        raise ValueError("acoustic repair context_words must be positive")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plan = read_json(plan_path)
+    boundary_plan = read_json(boundary_plan_path)
+    if not isinstance(plan, dict) or plan.get("status") != "complete":
+        raise StreamingPlanError("acoustic repair requires a complete semantic plan")
+    if not isinstance(boundary_plan, dict) or boundary_plan.get("status") != "unsafe":
+        raise StreamingPlanError("acoustic repair requires an unsafe boundary plan")
+    if boundary_plan.get("streaming_plan_sha256") not in {
+        None,
+        sha256_file(plan_path),
+    }:
+        raise StreamingPlanError(
+            "unsafe boundary report belongs to a different semantic plan"
+        )
+    if backend.backend_name != plan.get("backend") or backend.model != plan.get(
+        "model"
+    ):
+        raise StreamingPlanError(
+            "acoustic repair backend must match the original semantic planner"
+        )
+    words = _words_from_complete_plan(plan)
+    raw_thoughts = plan.get("committed")
+    if not isinstance(raw_thoughts, list) or not raw_thoughts:
+        raise StreamingPlanError("semantic plan contains no committed thoughts")
+    committed = json.loads(json.dumps(raw_thoughts))
+    owners: dict[int, int] = {}
+    for thought_index, thought in enumerate(committed):
+        for source_range in thought["source_ranges"]:
+            for word_id in range(
+                int(source_range["start_word_id"]),
+                int(source_range["end_word_id"]),
+            ):
+                owners[word_id] = thought_index
+    unsafe = [
+        boundary
+        for boundary in boundary_plan.get("boundaries", [])
+        if isinstance(boundary, dict)
+        and boundary.get("safety_status") == "unsafe_dense_boundary"
+    ]
+    if not unsafe:
+        raise StreamingPlanError("boundary plan has no dense boundary to repair")
+    by_thought: dict[int, list[dict[str, Any]]] = {}
+    for boundary in unsafe:
+        role_ids = boundary.get("source_word_ids")
+        if not isinstance(role_ids, dict):
+            continue
+        affected = {
+            owners[word_id]
+            for role, word_id in role_ids.items()
+            if "retained" in str(role) and type(word_id) is int and word_id in owners
+        }
+        for thought_index in affected:
+            by_thought.setdefault(thought_index, []).append(boundary)
+    if not by_thought:
+        raise StreamingPlanError("unsafe boundaries map to no committed thought")
+
+    repair_records: list[dict[str, Any]] = []
+    for thought_index in sorted(by_thought):
+        original_thought = json.loads(json.dumps(committed[thought_index]))
+        original_start, original_end = _thought_source_bounds(original_thought)
+        lower_bound = (
+            _thought_source_bounds(committed[thought_index - 1])[1]
+            if thought_index > 0
+            else 0
+        )
+        upper_bound = (
+            _thought_source_bounds(committed[thought_index + 1])[0]
+            if thought_index + 1 < len(committed)
+            else len(words)
+        )
+        context_start = max(lower_bound, original_start - context_words)
+        context_end = min(upper_bound, original_end + context_words)
+        local_words = words[context_start:context_end]
+        prompt = _acoustic_repair_prompt(
+            thought_index=thought_index,
+            original_thought=original_thought,
+            local_words=local_words,
+            unsafe_boundaries=by_thought[thought_index],
+            previous_context=(
+                str(committed[thought_index - 1]["canonical_text"])
+                if thought_index > 0
+                else None
+            ),
+            next_context=(
+                str(committed[thought_index + 1]["canonical_text"])
+                if thought_index + 1 < len(committed)
+                else None
+            ),
+        )
+        request_iteration = 10_000 + retry_index * 100 + thought_index
+        decision, attempts = _request_validated_decision(
+            backend=backend,
+            prompt=prompt,
+            pending_words=local_words,
+            final_pass=True,
+            committed_source_end=context_start,
+            iteration=request_iteration,
+            output_dir=output_dir,
+            decision_validator=lambda value, original=original_thought, boundaries=(tuple(by_thought[thought_index])): (
+                _validate_acoustic_repair_decision(
+                    value,
+                    original_thought=original,
+                    unsafe_boundaries=boundaries,
+                )
+            ),
+        )
+        replacement = _serialize_decision(decision)["finalized"][0]
+        replacement["committed_iteration"] = original_thought.get("committed_iteration")
+        replacement["grounding_validation"]["thought_index"] = thought_index
+        committed[thought_index] = replacement
+        repair_records.append(
+            {
+                "retry_index": retry_index,
+                "thought_index": thought_index,
+                "original_canonical_text": original_thought["canonical_text"],
+                "revised_canonical_text": replacement["canonical_text"],
+                "original_source_ranges": original_thought["source_ranges"],
+                "revised_source_ranges": replacement["source_ranges"],
+                "unsafe_boundary_ids": [
+                    boundary["boundary_id"] for boundary in by_thought[thought_index]
+                ],
+                "attempts": attempts,
+            }
+        )
+
+    selected_ranges = _flatten_ranges(committed)
+    committed_word_ids = [
+        word_id
+        for source_range in selected_ranges
+        for word_id in range(
+            int(source_range["start_word_id"]),
+            int(source_range["end_word_id"]),
+        )
+    ]
+    repaired = json.loads(json.dumps(plan))
+    repaired.update(
+        {
+            "status": "complete",
+            "grounding_validation": str(output_dir / "grounding_validation.json"),
+            "committed": committed,
+            "committed_words": committed_word_ids,
+            "pending_words": [],
+            "next_unread_word": len(words),
+            "selected_source_ranges": selected_ranges,
+            "selected_source_text": _word_text(
+                [words[word_id] for word_id in committed_word_ids]
+            ),
+            "reconstructed_narration": " ".join(
+                str(thought["canonical_text"]) for thought in committed
+            ).strip(),
+            "semantic_parent_plan": str(plan_path),
+            "semantic_parent_plan_sha256": sha256_file(plan_path),
+            "acoustic_repair_index": retry_index,
+            "acoustic_repairs": [
+                *plan.get("acoustic_repairs", []),
+                *repair_records,
+            ],
+        }
+    )
+    grounding = _grounding_validation_document(
+        committed_thoughts=committed,
+        iterations=(
+            plan.get("iterations", [])
+            if isinstance(plan.get("iterations"), list)
+            else []
+        ),
+        status="complete",
+    )
+    grounding["acoustic_repair_index"] = retry_index
+    grounding["acoustic_repairs"] = repair_records
+    write_json(output_dir / "grounding_validation.json", grounding)
+    write_json(output_dir / "acoustic_repair.json", {"repairs": repair_records})
+    write_json(output_dir / "streaming_plan.json", repaired)
+    print("\nACOUSTIC SAFETY REPAIR COMPLETE")
+    print(f"retry index: {retry_index}")
+    print(f"thoughts revised: {len(repair_records)}")
+    for record in repair_records:
+        print(f"thought {record['thought_index']}: {record['revised_canonical_text']}")
+    return repaired
 
 
 def _take_new_words(

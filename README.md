@@ -364,8 +364,12 @@ approximate anchors and are never clamped together or used as hard cut limits.
 
 Waveform energy is secondary evidence: it may choose a splice only inside an
 alignment-established interval that also contains verified quiet audio. If no
-such interval exists, the boundary is recorded as `unsafe_dense_boundary` and
-the run stops before rendering instead of guessing. Fades are confined to those
+such interval exists, the boundary is recorded as `unsafe_dense_boundary`.
+Before giving up, the existing semantic planner receives that acoustic report
+and may reselect a more contiguous, source-grounded take. Every rejected edge
+remains forbidden so retries cannot oscillate between two unsafe cuts. The
+revised plan is grounded and aligned again; after the configured retry limit,
+the run stops before rendering instead of guessing. Fades are confined to
 verified quiet intervals, so retained speech—including quiet final fricatives
 such as `/s/`—remains sample-identical to the canonical WAV.
 
@@ -411,6 +415,7 @@ Important options:
 | `--whisper-model NAME` | Override the MLX Whisper repository |
 | `--window-seconds N` | New transcript look-ahead added per planner iteration |
 | `--max-output-tokens N` | Maximum structured planner response size |
+| `--max-acoustic-retries N` | Planner reselections after a fail-closed dense boundary; defaults to 2 |
 | `--debug-artifacts` | Request optional diagnostics without changing the single-pass render graph |
 | `--asr-python PATH` | Advanced: Python executable for MLX ASR/local CTC stages |
 | `--alignment-python PATH` | Advanced: Python executable for WhisperX alignment |

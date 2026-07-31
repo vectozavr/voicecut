@@ -45,6 +45,7 @@ from .trailing_refine import (
     VerifiedQuietEvidence,
     find_verified_quiet_evidence,
 )
+from .streaming_narration import repair_plan_for_acoustic_safety
 
 
 DEFAULT_ALIGNMENT_PYTHON = Path(sys.executable)
@@ -54,6 +55,7 @@ PROTECTED_SPEECH_MARGIN_MS = 20.0
 MINIMUM_VERIFIED_QUIET_MS = 20.0
 QUIET_FADE_MS = 5.0
 ALIGNMENT_LANGUAGE = "en"
+DEFAULT_MAX_ACOUSTIC_RETRIES = 2
 
 
 class FinalRenderError(RuntimeError):
@@ -228,6 +230,36 @@ def _cache_pause_plan(
     finally:
         if owns_backend:
             active_backend.close()
+    return destination
+
+
+def _retarget_pause_plan(
+    *,
+    source_pause_plan_path: Path,
+    repaired_plan_path: Path,
+    destination: Path,
+) -> Path:
+    """Reuse classifications when acoustic repair preserves thought structure."""
+
+    pause_plan = read_json(source_pause_plan_path)
+    repaired_plan = read_json(repaired_plan_path)
+    if not isinstance(pause_plan, dict) or not isinstance(repaired_plan, dict):
+        raise FinalRenderError("cannot retarget malformed pause/semantic plans")
+    committed = repaired_plan.get("committed")
+    if not isinstance(committed, list):
+        raise FinalRenderError("repaired semantic plan contains no thoughts")
+    if pause_plan.get("thought_count") != len(committed):
+        raise FinalRenderError(
+            "acoustic repair changed thought count; pause classification cannot "
+            "be reused"
+        )
+    retargeted = json.loads(json.dumps(pause_plan))
+    retargeted["streaming_plan"] = str(repaired_plan_path.resolve())
+    retargeted["streaming_plan_sha256"] = sha256_file(repaired_plan_path)
+    retargeted["acoustic_repair_retargeted"] = True
+    retargeted["parent_pause_plan"] = str(source_pause_plan_path.resolve())
+    retargeted["parent_pause_plan_sha256"] = sha256_file(source_pause_plan_path)
+    write_json(destination, retargeted)
     return destination
 
 
@@ -1949,7 +1981,10 @@ def render_final_cut(
     local_files_only: bool = False,
     max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     pause_backend: PausePlannerBackend | None = None,
+    repair_backend: PausePlannerBackend | None = None,
     alignment_payload: dict[str, Any] | None = None,
+    alignment_payloads: Sequence[dict[str, Any]] | None = None,
+    max_acoustic_retries: int = DEFAULT_MAX_ACOUSTIC_RETRIES,
     write_debug_artifacts: bool = False,
 ) -> dict[str, Any]:
     """Build one immutable boundary plan, then render canonical samples once."""
@@ -1965,6 +2000,9 @@ def render_final_cut(
         raise RuntimeError(
             f"output directory must be empty for final rendering: {output_dir}"
         )
+    if max_acoustic_retries < 0:
+        raise ValueError("max_acoustic_retries must be non-negative")
+    original_plan_path = plan_path
     plan, grounding_path, selected_range_count = _validate_grounded_plan(
         audio_path=audio_path,
         plan_path=plan_path,
@@ -1984,19 +2022,134 @@ def render_final_cut(
         local_files_only=local_files_only,
         max_output_tokens=max_output_tokens,
     )
-    pause_plan = read_json(cached_pause_plan)
-    if not isinstance(pause_plan, dict):
-        raise FinalRenderError("pause plan root must be an object")
-    boundary_plan = build_final_boundary_plan(
-        audio_path=audio_path,
-        semantic_plan=plan,
-        semantic_plan_path=plan_path,
-        pause_plan=pause_plan,
-        pause_plan_path=cached_pause_plan,
-        output_dir=output_dir,
-        alignment_python=alignment_python,
-        alignment_payload=alignment_payload,
-    )
+    effective_plan = plan
+    effective_plan_path = plan_path
+    effective_grounding_path = grounding_path
+    effective_selected_range_count = selected_range_count
+    effective_pause_path = cached_pause_plan
+    acoustic_repair_records: list[dict[str, Any]] = []
+    rejected_boundary_history: list[dict[str, Any]] = []
+    active_repair_backend = repair_backend
+    owns_repair_backend = False
+    boundary_plan: dict[str, Any]
+    try:
+        for acoustic_attempt in range(max_acoustic_retries + 1):
+            pause_plan = read_json(effective_pause_path)
+            if not isinstance(pause_plan, dict):
+                raise FinalRenderError("pause plan root must be an object")
+            evidence_dir = (
+                output_dir
+                if acoustic_attempt == 0
+                else output_dir
+                / "acoustic_retries"
+                / f"retry_{acoustic_attempt:02d}"
+                / "boundary_evidence"
+            )
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            attempt_payload = (
+                alignment_payloads[acoustic_attempt]
+                if alignment_payloads is not None
+                and acoustic_attempt < len(alignment_payloads)
+                else alignment_payload
+                if acoustic_attempt == 0
+                else None
+            )
+            boundary_plan = build_final_boundary_plan(
+                audio_path=audio_path,
+                semantic_plan=effective_plan,
+                semantic_plan_path=effective_plan_path,
+                pause_plan=pause_plan,
+                pause_plan_path=effective_pause_path,
+                output_dir=evidence_dir,
+                alignment_python=alignment_python,
+                alignment_payload=attempt_payload,
+            )
+            if boundary_plan["status"] == "safe":
+                break
+            dense_count = int(boundary_plan["unsafe_dense_boundaries"])
+            alignment_failures = int(boundary_plan["alignment_failures"])
+            if (
+                dense_count == 0
+                or alignment_failures > 0
+                or acoustic_attempt >= max_acoustic_retries
+            ):
+                break
+            retry_index = acoustic_attempt + 1
+            retry_dir = output_dir / "acoustic_retries" / f"retry_{retry_index:02d}"
+            retry_dir.mkdir(parents=True, exist_ok=True)
+            rejected_path = retry_dir / "rejected_boundary_plan.json"
+            current_rejections = [
+                json.loads(json.dumps(boundary))
+                for boundary in boundary_plan["boundaries"]
+                if boundary.get("safety_status") == "unsafe_dense_boundary"
+            ]
+            repair_constraints = json.loads(json.dumps(boundary_plan))
+            repair_constraints["boundaries"] = [
+                *current_rejections,
+                *rejected_boundary_history,
+            ]
+            repair_constraints["acoustic_rejection_history"] = [
+                boundary.get("boundary_id") for boundary in rejected_boundary_history
+            ]
+            write_json(rejected_path, repair_constraints)
+            for rejection in current_rejections:
+                historical = json.loads(json.dumps(rejection))
+                historical["boundary_id"] = (
+                    f"retry_{retry_index:02d}:"
+                    f"{historical.get('boundary_id', 'unsafe_boundary')}"
+                )
+                rejected_boundary_history.append(historical)
+            if active_repair_backend is None:
+                active_repair_backend = create_planner_backend(
+                    provider=planner_backend,
+                    model=planner_model,
+                    env_file=env_file.resolve(),
+                    max_output_tokens=max_output_tokens,
+                    base_url=planner_base_url,
+                    api_key_env=planner_api_key_env,
+                    local_python=planner_python.absolute(),
+                    local_files_only=local_files_only,
+                )
+                owns_repair_backend = True
+            semantic_retry_dir = retry_dir / "semantic_plan"
+            repaired = repair_plan_for_acoustic_safety(
+                plan_path=effective_plan_path,
+                boundary_plan_path=rejected_path,
+                output_dir=semantic_retry_dir,
+                backend=active_repair_backend,
+                retry_index=retry_index,
+            )
+            repaired_path = semantic_retry_dir / "streaming_plan.json"
+            (
+                effective_plan,
+                effective_grounding_path,
+                effective_selected_range_count,
+            ) = _validate_grounded_plan(
+                audio_path=audio_path,
+                plan_path=repaired_path,
+            )
+            if effective_plan != repaired:
+                raise FinalRenderError(
+                    "saved acoustic repair differs from its in-memory plan"
+                )
+            effective_plan_path = repaired_path
+            effective_pause_path = _retarget_pause_plan(
+                source_pause_plan_path=effective_pause_path,
+                repaired_plan_path=effective_plan_path,
+                destination=retry_dir / "pause_plan.json",
+            )
+            acoustic_repair_records.append(
+                {
+                    "retry_index": retry_index,
+                    "rejected_boundary_plan": str(rejected_path.resolve()),
+                    "rejected_boundary_plan_sha256": sha256_file(rejected_path),
+                    "repaired_streaming_plan": str(effective_plan_path.resolve()),
+                    "repaired_streaming_plan_sha256": sha256_file(effective_plan_path),
+                }
+            )
+    finally:
+        if owns_repair_backend and active_repair_backend is not None:
+            active_repair_backend.close()
     boundary_plan_path = output_dir / "final_boundary_plan.json"
     write_json(boundary_plan_path, boundary_plan)
     boundary_plan_sha = sha256_file(boundary_plan_path)
@@ -2006,7 +2159,9 @@ def render_final_cut(
         reason = "unsafe_dense_boundary" if unsafe else "forced_alignment_failed"
         raise FinalRenderError(
             f"{reason}: boundary plan has {unsafe} dense boundaries and "
-            f"{failures} alignment failures; no audio was rendered"
+            f"{failures} alignment failures after "
+            f"{len(acoustic_repair_records)} acoustic repair attempts; "
+            "no audio was rendered"
         )
 
     final_path = output_dir / "final_cut.wav"
@@ -2025,12 +2180,14 @@ def render_final_cut(
         "status": "complete",
         "source_audio": str(audio_path),
         "source_audio_sha256": sha256_file(audio_path),
-        "streaming_plan": str(plan_path),
-        "streaming_plan_sha256": sha256_file(plan_path),
-        "grounding_validation": str(grounding_path),
-        "grounding_validation_sha256": sha256_file(grounding_path),
-        "pause_plan": str(cached_pause_plan),
-        "pause_plan_sha256": sha256_file(cached_pause_plan),
+        "streaming_plan": str(original_plan_path),
+        "streaming_plan_sha256": sha256_file(original_plan_path),
+        "effective_streaming_plan": str(effective_plan_path),
+        "effective_streaming_plan_sha256": sha256_file(effective_plan_path),
+        "grounding_validation": str(effective_grounding_path),
+        "grounding_validation_sha256": sha256_file(effective_grounding_path),
+        "pause_plan": str(effective_pause_path),
+        "pause_plan_sha256": sha256_file(effective_pause_path),
         "pause_planner_backend": pause_plan.get("backend"),
         "pause_planner_model": pause_plan.get("model"),
         "final_boundary_plan": str(boundary_plan_path.resolve()),
@@ -2041,8 +2198,10 @@ def render_final_cut(
         "channel_count": render_result["channel_count"],
         "frame_count": render_result["frame_count"],
         "duration_seconds": render_result["duration_seconds"],
-        "semantic_thoughts": len(plan["committed"]),
-        "selected_source_ranges": selected_range_count,
+        "semantic_thoughts": len(effective_plan["committed"]),
+        "selected_source_ranges": effective_selected_range_count,
+        "acoustic_repair_attempts": len(acoustic_repair_records),
+        "acoustic_repairs": acoustic_repair_records,
         "rendered_clips": len(boundary_plan["source_intervals"]),
         "debug_artifacts_requested": write_debug_artifacts,
         "debug_artifacts_written": False,
@@ -2094,6 +2253,15 @@ def build_parser() -> argparse.ArgumentParser:
             "production render graph."
         ),
     )
+    parser.add_argument(
+        "--max-acoustic-retries",
+        type=int,
+        default=DEFAULT_MAX_ACOUSTIC_RETRIES,
+        help=(
+            "Maximum source-grounded semantic retries after a fail-closed "
+            "dense boundary."
+        ),
+    )
     return parser
 
 
@@ -2101,6 +2269,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if not args.render_plan:
         raise SystemExit("final plan rendering requires --render-plan")
+    if args.max_acoustic_retries < 0:
+        raise SystemExit("--max-acoustic-retries must be non-negative")
     manifest = render_final_cut(
         audio_path=args.audio,
         plan_path=args.plan,
@@ -2115,12 +2285,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         planner_python=args.planner_python,
         local_files_only=args.local_files_only,
         max_output_tokens=args.max_output_tokens,
+        max_acoustic_retries=args.max_acoustic_retries,
         write_debug_artifacts=args.debug_artifacts,
     )
     print("\nFINAL CUT CREATED")
     print(f"semantic thoughts: {manifest['semantic_thoughts']}")
     print(f"rendered clips: {manifest['rendered_clips']}")
     print(f"alignment contexts: {manifest['alignment_contexts']}")
+    print(f"acoustic repair attempts: {manifest['acoustic_repair_attempts']}")
     print(f"alignment-resolved boundaries: {manifest['alignment_resolved_boundaries']}")
     print(f"unsafe dense boundaries: {manifest['unsafe_dense_boundaries']}")
     print(f"unresolved boundaries: {manifest['unresolved_boundaries']}")

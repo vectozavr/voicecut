@@ -194,6 +194,8 @@ def _render_is_current(
     final_cut_sha = value.get("final_cut_wav_sha256")
     boundary_plan = value.get("final_boundary_plan")
     boundary_plan_sha = value.get("final_boundary_plan_sha256")
+    effective_plan = value.get("effective_streaming_plan")
+    effective_plan_sha = value.get("effective_streaming_plan_sha256")
     return (
         value.get("status") == "complete"
         and value.get("renderer") == "authoritative_single_pass_final_render_v2"
@@ -210,6 +212,10 @@ def _render_is_current(
         and Path(boundary_plan).is_file()
         and isinstance(boundary_plan_sha, str)
         and sha256_file(Path(boundary_plan)) == boundary_plan_sha
+        and isinstance(effective_plan, str)
+        and Path(effective_plan).is_file()
+        and isinstance(effective_plan_sha, str)
+        and sha256_file(Path(effective_plan)) == effective_plan_sha
     )
 
 
@@ -407,6 +413,7 @@ def _configuration(
         "planner_local_files_only": bool(args.local_files_only),
         "window_seconds": float(args.window_seconds),
         "max_output_tokens": int(args.max_output_tokens),
+        "max_acoustic_retries": int(args.max_acoustic_retries),
         "debug_artifacts": bool(args.debug_artifacts),
         "asr_python": str(asr_python),
         "alignment_python": str(alignment_python),
@@ -813,6 +820,8 @@ def run_full_pipeline(
             str(final_dir),
             "--alignment-python",
             str(alignment_python),
+            "--max-acoustic-retries",
+            str(args.max_acoustic_retries),
             *planner_arguments,
         ]
         if args.debug_artifacts:
@@ -983,6 +992,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MAX_OUTPUT_TOKENS,
     )
     parser.add_argument(
+        "--max-acoustic-retries",
+        type=int,
+        default=2,
+        help=(
+            "Maximum planner reselections after alignment finds an "
+            "uncuttable dense boundary."
+        ),
+    )
+    parser.add_argument(
         "--debug-artifacts",
         action="store_true",
         help=(
@@ -996,6 +1014,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.max_acoustic_retries < 0:
+        parser.error("--max-acoustic-retries must be non-negative")
     try:
         result = run_full_pipeline(args)
     except (FullPipelineError, FileExistsError, FileNotFoundError) as error:

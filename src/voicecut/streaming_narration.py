@@ -1206,8 +1206,13 @@ def _acoustic_repair_prompt(
             {
                 "boundary_id": boundary.get("boundary_id"),
                 "boundary_kind": boundary.get("boundary_kind"),
+                "safety_status": boundary.get("safety_status"),
                 "source_word_ids": boundary.get("source_word_ids"),
                 "aligned_timestamps": boundary.get("aligned_timestamps"),
+                "forbidden_word_ids": boundary.get("forbidden_word_ids", []),
+                "forbidden_source_edges": boundary.get("forbidden_source_edges", []),
+                "failure_reason": boundary.get("failure_reason"),
+                "retained_word_support": boundary.get("retained_word_support"),
                 "reason": boundary.get("error"),
             }
         )
@@ -1219,18 +1224,35 @@ refused that cut. Choose a different, acoustically separable occurrence layout
 from LOCAL SOURCE WORDS.
 
 STRICT PRIORITIES:
-1. Preserve the original intended meaning and every unique content phrase.
-2. Remove retries, repetitions, abandoned words, and recording directions.
-3. Prefer one contiguous successful take. If no exact take exists, make only a
-   minimal wording change needed to use source-grounded, longer spans.
-4. Do not reproduce any rejected boundary shown below. Move the discontinuity
-   to a different source location or remove it by selecting a contiguous take.
-5. Do not solve the problem by retaining the unwanted words at the rejected
-   boundary. The revised narration must still read naturally without a retry.
-6. Return exactly ONE finalized thought and pending_start_word_id=null.
-7. Every source range uses inclusive first_word_id and last_word_id, exact
+1. Preserve the complete intended narration and every unique content phrase.
+2. Never select a source occurrence listed in forbidden_word_ids. Its acoustic
+   alignment shows that this exact occurrence is incomplete or weak.
+3. Do not reuse a source edge listed in forbidden_source_edges. Move the
+   discontinuity or remove it by selecting a larger contiguous take.
+4. Prefer one complete contiguous successful take.
+5. When the speaker keeps a valid prefix and then repeats the ending, keep the
+   smallest coherent prefix and the complete later retry.
+6. Prefer the later complete corrected phrase over an earlier partial phrase.
+7. Minimize discontinuities only after semantic correctness and acoustic
+   completeness are satisfied.
+8. Remove retries, repetitions, abandoned words, and recording directions.
+9. Do not retain unwanted words merely to avoid a rejected source edge.
+10. Return exactly ONE finalized thought and pending_start_word_id=null.
+11. Every source range uses inclusive first_word_id and last_word_id, exact
    boundary words, and range-level canonical_text supported by every selected
    source word.
+
+ACOUSTIC RETRY EXAMPLE (the IDs are illustrative; use LOCAL SOURCE WORDS):
+Earlier source:
+    And it might begin with familiar ...
+Later correction:
+    with the familiar words once upon a time.
+Incorrect repair:
+    And it might begin with familiar / words once upon a time.
+Correct repair:
+    Keep the stable prefix ending before the abandoned phrase, then use the
+    complete later correction:
+    And it might begin / with the familiar words once upon a time.
 
 Read-only preceding thought:
 {json.dumps(previous_context, ensure_ascii=False)}
@@ -1281,7 +1303,57 @@ def _validate_acoustic_repair_decision(
             "acoustic repair changed the intended narration too substantially"
         )
     ranges = replacement.source_ranges
+    forbidden_word_ids = sorted(
+        {
+            word_id
+            for boundary in unsafe_boundaries
+            for word_id in boundary.get("forbidden_word_ids", [])
+            if type(word_id) is int
+        }
+    )
+    for forbidden_word_id in forbidden_word_ids:
+        if any(
+            source_range.start_word_id <= forbidden_word_id < source_range.end_word_id
+            for source_range in ranges
+        ):
+            raise DecisionValidationError(
+                f"acoustic repair reused forbidden weak source word {forbidden_word_id}"
+            )
     for boundary in unsafe_boundaries:
+        explicit_edges = boundary.get("forbidden_source_edges")
+        if isinstance(explicit_edges, list):
+            for edge in explicit_edges:
+                if not isinstance(edge, dict):
+                    continue
+                kind = edge.get("boundary_kind")
+                retained_word_id = edge.get("retained_word_id")
+                omitted_word_id = edge.get("omitted_word_id")
+                if (
+                    kind == "selected_to_omitted"
+                    and type(omitted_word_id) is int
+                    and any(
+                        source_range.end_word_id == omitted_word_id
+                        for source_range in ranges
+                    )
+                ):
+                    raise DecisionValidationError(
+                        "acoustic repair reproduced forbidden trailing source "
+                        f"edge after word {retained_word_id} before word "
+                        f"{omitted_word_id}"
+                    )
+                if (
+                    kind == "omitted_to_selected"
+                    and type(retained_word_id) is int
+                    and any(
+                        source_range.start_word_id == retained_word_id
+                        for source_range in ranges
+                    )
+                ):
+                    raise DecisionValidationError(
+                        "acoustic repair reproduced forbidden leading source "
+                        f"edge before word {retained_word_id} after word "
+                        f"{omitted_word_id}"
+                    )
         role_ids = boundary.get("source_word_ids")
         if not isinstance(role_ids, dict):
             continue
@@ -1357,24 +1429,51 @@ def repair_plan_for_acoustic_safety(
                 int(source_range["end_word_id"]),
             ):
                 owners[word_id] = thought_index
+    repairable_statuses = {
+        "unsafe_dense_boundary",
+        "weak_retained_word_alignment",
+    }
     unsafe = [
         boundary
         for boundary in boundary_plan.get("boundaries", [])
         if isinstance(boundary, dict)
-        and boundary.get("safety_status") == "unsafe_dense_boundary"
+        and boundary.get("safety_status") in repairable_statuses
     ]
     if not unsafe:
-        raise StreamingPlanError("boundary plan has no dense boundary to repair")
+        raise StreamingPlanError("boundary plan has no repairable acoustic boundary")
     by_thought: dict[int, list[dict[str, Any]]] = {}
     for boundary in unsafe:
         role_ids = boundary.get("source_word_ids")
-        if not isinstance(role_ids, dict):
-            continue
         affected = {
-            owners[word_id]
-            for role, word_id in role_ids.items()
-            if "retained" in str(role) and type(word_id) is int and word_id in owners
+            thought_index
+            for thought_index in boundary.get("retained_thought_indices", [])
+            if type(thought_index) is int and 0 <= thought_index < len(committed)
         }
+        if isinstance(role_ids, dict):
+            affected.update(
+                owners[word_id]
+                for role, word_id in role_ids.items()
+                if "retained" in str(role)
+                and type(word_id) is int
+                and word_id in owners
+            )
+        if not affected:
+            relevant_word_ids = {
+                word_id
+                for word_id in boundary.get("forbidden_word_ids", [])
+                if type(word_id) is int
+            }
+            if isinstance(role_ids, dict):
+                relevant_word_ids.update(
+                    word_id for word_id in role_ids.values() if type(word_id) is int
+                )
+            for thought_index, thought in enumerate(committed):
+                thought_start, thought_end = _thought_source_bounds(thought)
+                if any(
+                    thought_start <= word_id < thought_end
+                    for word_id in relevant_word_ids
+                ):
+                    affected.add(thought_index)
         for thought_index in affected:
             by_thought.setdefault(thought_index, []).append(boundary)
     if not by_thought:
@@ -1434,6 +1533,28 @@ def repair_plan_for_acoustic_safety(
         replacement["committed_iteration"] = original_thought.get("committed_iteration")
         replacement["grounding_validation"]["thought_index"] = thought_index
         committed[thought_index] = replacement
+        thought_boundaries = by_thought[thought_index]
+        forbidden_word_ids = sorted(
+            {
+                word_id
+                for boundary in thought_boundaries
+                for word_id in boundary.get("forbidden_word_ids", [])
+                if type(word_id) is int
+            }
+        )
+        forbidden_source_edges = [
+            json.loads(json.dumps(edge))
+            for boundary in thought_boundaries
+            for edge in boundary.get("forbidden_source_edges", [])
+            if isinstance(edge, dict)
+        ]
+        failure_reasons = sorted(
+            {
+                str(reason)
+                for boundary in thought_boundaries
+                if (reason := boundary.get("failure_reason"))
+            }
+        )
         repair_records.append(
             {
                 "retry_index": retry_index,
@@ -1444,6 +1565,18 @@ def repair_plan_for_acoustic_safety(
                 "revised_source_ranges": replacement["source_ranges"],
                 "unsafe_boundary_ids": [
                     boundary["boundary_id"] for boundary in by_thought[thought_index]
+                ],
+                "forbidden_word_ids": forbidden_word_ids,
+                "forbidden_source_edges": forbidden_source_edges,
+                "failure_reasons": failure_reasons,
+                "acoustic_failures": [
+                    {
+                        "boundary_id": boundary.get("boundary_id"),
+                        "safety_status": boundary.get("safety_status"),
+                        "failure_reason": boundary.get("failure_reason"),
+                        "retained_word_support": boundary.get("retained_word_support"),
+                    }
+                    for boundary in thought_boundaries
                 ],
                 "attempts": attempts,
             }

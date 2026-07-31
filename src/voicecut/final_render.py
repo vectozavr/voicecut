@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from statistics import median
 from typing import Any, Sequence
 
 import numpy as np
@@ -55,7 +56,13 @@ PROTECTED_SPEECH_MARGIN_MS = 20.0
 MINIMUM_VERIFIED_QUIET_MS = 20.0
 QUIET_FADE_MS = 5.0
 ALIGNMENT_LANGUAGE = "en"
-DEFAULT_MAX_ACOUSTIC_RETRIES = 2
+DEFAULT_MAX_ACOUSTIC_RETRIES = 3
+RETAINED_WORD_EDGE_CHARACTER_COUNT = 3
+RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT = 8
+MIN_RETAINED_WORD_SCORE = 0.45
+MIN_RETAINED_EDGE_CHARACTER_SCORE = 0.48
+MIN_RETAINED_EDGE_TO_CONTEXT_RATIO = 0.55
+ALIGNMENT_GEOMETRY_EPSILON_SECONDS = 1e-6
 
 
 class FinalRenderError(RuntimeError):
@@ -316,19 +323,257 @@ def _flatten_character_word_groups(
     return groups
 
 
-def _positive_timed_characters(
+def _alignment_character_records(
     group: Sequence[dict[str, Any]],
-) -> tuple[float, float] | None:
-    timed = []
+    *,
+    crop_start: float,
+    sample_rate: int,
+    total_samples: int,
+) -> tuple[list[dict[str, Any]], tuple[float, float] | None]:
+    records: list[dict[str, Any]] = []
+    positive_timed: list[tuple[float, float]] = []
     for character in group:
-        start = _finite_number(character.get("start"))
-        end = _finite_number(character.get("end"))
+        raw_character = str(character.get("char", ""))
+        relative_start = _finite_number(character.get("start"))
+        relative_end = _finite_number(character.get("end"))
         score = _finite_number(character.get("score"))
-        if start is not None and end is not None and score is not None and score > 0.0:
-            timed.append((start, end))
-    if not timed:
+        absolute_start = (
+            crop_start + relative_start if relative_start is not None else None
+        )
+        absolute_end = crop_start + relative_end if relative_end is not None else None
+        start_sample = (
+            timestamp_to_sample(
+                absolute_start,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+                rounding="floor",
+            )
+            if absolute_start is not None
+            else None
+        )
+        end_sample = (
+            timestamp_to_sample(
+                absolute_end,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+                rounding="ceil",
+            )
+            if absolute_end is not None
+            else None
+        )
+        records.append(
+            {
+                "character": raw_character,
+                "start": absolute_start,
+                "end": absolute_end,
+                "score": score,
+                "start_sample": start_sample,
+                "end_sample": end_sample,
+                "is_alphabetic": raw_character.isalpha(),
+            }
+        )
+        if (
+            relative_start is not None
+            and relative_end is not None
+            and relative_end > relative_start
+            and score is not None
+            and score > 0.0
+        ):
+            positive_timed.append((relative_start, relative_end))
+    positive_span = (
+        (positive_timed[0][0], positive_timed[-1][1]) if positive_timed else None
+    )
+    return records, positive_span
+
+
+def _alphabetic_records(span: dict[str, Any]) -> list[dict[str, Any]]:
+    characters = span.get("characters")
+    if not isinstance(characters, list):
+        return []
+    return [
+        character
+        for character in characters
+        if isinstance(character, dict) and str(character.get("character", "")).isalpha()
+    ]
+
+
+def _minimum_edge_score(
+    characters: Sequence[dict[str, Any]],
+    *,
+    edge: str,
+) -> float | None:
+    if edge not in {"initial", "terminal"}:
+        raise ValueError("alignment edge must be initial or terminal")
+    selected = (
+        list(characters[:RETAINED_WORD_EDGE_CHARACTER_COUNT])
+        if edge == "initial"
+        else list(characters[-RETAINED_WORD_EDGE_CHARACTER_COUNT:])
+    )
+    scores = [_finite_number(character.get("score")) for character in selected]
+    if not scores or any(score is None for score in scores):
         return None
-    return timed[0][0], timed[-1][1]
+    return min(float(score) for score in scores if score is not None)
+
+
+def _nearby_context_scores(
+    *,
+    span: dict[str, Any],
+    context_spans: Sequence[dict[str, Any]],
+    excluded_characters: Sequence[dict[str, Any]] = (),
+) -> list[float]:
+    excluded_ids = {id(character) for character in excluded_characters}
+    target_word_id = int(span["word_id"])
+    target_characters = [
+        character
+        for character in _alphabetic_records(span)
+        if id(character) not in excluded_ids
+        and _finite_number(character.get("score")) is not None
+    ]
+    scores = [float(character["score"]) for character in target_characters]
+    if len(scores) >= RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT:
+        return scores[:RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT]
+
+    neighbors = sorted(
+        (
+            candidate
+            for candidate in context_spans
+            if int(candidate.get("word_id", -1)) != target_word_id
+        ),
+        key=lambda candidate: (
+            abs(int(candidate.get("word_id", -1)) - target_word_id),
+            int(candidate.get("word_id", -1)),
+        ),
+    )
+    for neighbor in neighbors:
+        for character in _alphabetic_records(neighbor):
+            score = _finite_number(character.get("score"))
+            if score is not None:
+                scores.append(score)
+                if len(scores) >= RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT:
+                    return scores
+    return scores
+
+
+def evaluate_retained_word_support(
+    span: dict[str, Any],
+    context_spans: Sequence[dict[str, Any]],
+    *,
+    edge: str,
+) -> dict[str, Any]:
+    """Evaluate alignment support for one retained word without changing audio."""
+
+    if edge not in {"initial", "terminal"}:
+        raise ValueError("retained-word edge must be initial or terminal")
+    expected = [
+        character.lower()
+        for character in str(span.get("text", ""))
+        if character.isalpha()
+    ]
+    alphabetic = _alphabetic_records(span)
+    aligned_text = [
+        str(character.get("character", "")).lower() for character in alphabetic
+    ]
+    timed = [
+        character
+        for character in alphabetic
+        if _finite_number(character.get("start")) is not None
+        and _finite_number(character.get("end")) is not None
+        and _finite_number(character.get("score")) is not None
+    ]
+    complete_coverage = (
+        bool(expected) and aligned_text == expected and len(timed) == len(expected)
+    )
+    character_coverage = len(timed) / len(expected) if expected else 0.0
+
+    monotonic = complete_coverage
+    previous_end: float | None = None
+    if monotonic:
+        for character in timed:
+            start = float(character["start"])
+            end = float(character["end"])
+            if end <= start or (
+                previous_end is not None
+                and start < previous_end - ALIGNMENT_GEOMETRY_EPSILON_SECONDS
+            ):
+                monotonic = False
+                break
+            previous_end = end
+
+    edge_characters = (
+        alphabetic[:RETAINED_WORD_EDGE_CHARACTER_COUNT]
+        if edge == "initial"
+        else alphabetic[-RETAINED_WORD_EDGE_CHARACTER_COUNT:]
+    )
+    edge_scores = [
+        _finite_number(character.get("score")) for character in edge_characters
+    ]
+    valid_edge_scores = [float(score) for score in edge_scores if score is not None]
+    median_edge_score = median(valid_edge_scores) if valid_edge_scores else None
+    minimum_edge_score = min(valid_edge_scores) if valid_edge_scores else None
+    context_scores = _nearby_context_scores(
+        span=span,
+        context_spans=context_spans,
+        excluded_characters=edge_characters,
+    )
+    word_score = _finite_number(span.get("word_score"))
+    local_context_score = median(context_scores) if context_scores else word_score
+    score_ratio = (
+        minimum_edge_score / local_context_score
+        if minimum_edge_score is not None
+        and local_context_score is not None
+        and local_context_score > 0.0
+        else None
+    )
+
+    if not complete_coverage:
+        status = "incomplete_character_coverage"
+    elif not monotonic:
+        status = "invalid_alignment_geometry"
+    elif (
+        word_score is None
+        or median_edge_score is None
+        or minimum_edge_score is None
+        or local_context_score is None
+        or score_ratio is None
+    ):
+        status = "incomplete_character_coverage"
+    elif word_score < MIN_RETAINED_WORD_SCORE or (
+        minimum_edge_score < MIN_RETAINED_EDGE_CHARACTER_SCORE
+        and score_ratio < MIN_RETAINED_EDGE_TO_CONTEXT_RATIO
+    ):
+        status = (
+            "weak_initial_word_support"
+            if edge == "initial"
+            else "weak_terminal_word_support"
+        )
+    else:
+        status = "supported_complete_word"
+
+    return {
+        "word_id": int(span["word_id"]),
+        "source_text": str(span.get("text", "")),
+        "edge": edge,
+        "status": status,
+        "complete_character_coverage": complete_coverage,
+        "monotonic_character_timestamps": monotonic,
+        "word_score": word_score,
+        "expected_alignable_character_count": len(expected),
+        "aligned_character_count": len(timed),
+        "character_coverage": character_coverage,
+        "edge_character_scores": valid_edge_scores,
+        "median_edge_score": median_edge_score,
+        "minimum_edge_score": minimum_edge_score,
+        "local_context_median_score": local_context_score,
+        "edge_to_context_score_ratio": score_ratio,
+        "character_records": [dict(character) for character in alphabetic],
+        "thresholds": {
+            "edge_character_count": RETAINED_WORD_EDGE_CHARACTER_COUNT,
+            "local_context_character_count": RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT,
+            "minimum_word_score": MIN_RETAINED_WORD_SCORE,
+            "minimum_edge_character_score": MIN_RETAINED_EDGE_CHARACTER_SCORE,
+            "minimum_edge_to_context_ratio": MIN_RETAINED_EDGE_TO_CONTEXT_RATIO,
+        },
+    }
 
 
 def _alignment_spans(
@@ -362,27 +607,76 @@ def _alignment_spans(
     ):
         relative: tuple[float, float] | None = None
         granularity = "words"
+        character_records: list[dict[str, Any]] = []
         if use_characters:
-            relative = _positive_timed_characters(character_groups[index])
+            character_records, relative = _alignment_character_records(
+                character_groups[index],
+                crop_start=crop_start,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
             if relative is not None:
                 granularity = "characters"
+        aligned_word_start = _finite_number(aligned_word.get("start"))
+        aligned_word_end = _finite_number(aligned_word.get("end"))
+        word_score = _finite_number(aligned_word.get("score"))
         if relative is None:
-            start = _finite_number(aligned_word.get("start"))
-            end = _finite_number(aligned_word.get("end"))
-            score = _finite_number(aligned_word.get("score"))
-            if start is None or end is None or score is None or score <= 0.0:
+            if (
+                aligned_word_start is None
+                or aligned_word_end is None
+                or word_score is None
+                or word_score <= 0.0
+            ):
                 raise ValueError(f"local word {index} has no positive alignment")
-            relative = (start, end)
+            relative = (aligned_word_start, aligned_word_end)
         absolute_start = crop_start + relative[0]
         absolute_end = crop_start + relative[1]
         if not crop_start <= absolute_start < absolute_end <= crop_end + 1e-6:
             raise ValueError(f"local word {index} alignment falls outside its crop")
         word_id = int(local_word["id"])
+        expected_characters = [
+            character.lower()
+            for character in str(local_word["text"])
+            if character.isalpha()
+        ]
+        alphabetic_records = [
+            character
+            for character in character_records
+            if bool(character["is_alphabetic"])
+        ]
+        aligned_character_count = sum(
+            _finite_number(character.get("start")) is not None
+            and _finite_number(character.get("end")) is not None
+            and _finite_number(character.get("score")) is not None
+            for character in alphabetic_records
+        )
+        matching_character_count = sum(
+            str(character.get("character", "")).lower() == expected
+            and _finite_number(character.get("start")) is not None
+            and _finite_number(character.get("end")) is not None
+            and _finite_number(character.get("score")) is not None
+            for character, expected in zip(
+                alphabetic_records,
+                expected_characters,
+                strict=False,
+            )
+        )
         spans[word_id] = {
             "word_id": word_id,
             "text": str(local_word["text"]),
+            "source_text": str(local_word["text"]),
             "start_seconds": absolute_start,
             "end_seconds": absolute_end,
+            "aligned_start": (
+                crop_start + aligned_word_start
+                if aligned_word_start is not None
+                else absolute_start
+            ),
+            "aligned_end": (
+                crop_start + aligned_word_end
+                if aligned_word_end is not None
+                else absolute_end
+            ),
             "start_sample": timestamp_to_sample(
                 absolute_start,
                 sample_rate=sample_rate,
@@ -396,7 +690,36 @@ def _alignment_spans(
                 rounding="ceil",
             ),
             "granularity": granularity,
+            "word_score": word_score,
+            "expected_alignable_character_count": len(expected_characters),
+            "aligned_character_count": aligned_character_count,
+            "character_coverage": (
+                matching_character_count / len(expected_characters)
+                if expected_characters
+                else 0.0
+            ),
+            "characters": character_records,
+            "initial_edge_score": _minimum_edge_score(
+                alphabetic_records,
+                edge="initial",
+            ),
+            "terminal_edge_score": _minimum_edge_score(
+                alphabetic_records,
+                edge="terminal",
+            ),
+            "local_context_score": None,
         }
+    context_spans = list(spans.values())
+    for span in context_spans:
+        context_scores = _nearby_context_scores(
+            span=span,
+            context_spans=context_spans,
+        )
+        span["local_context_score"] = (
+            median(context_scores)
+            if context_scores
+            else _finite_number(span.get("word_score"))
+        )
     return spans
 
 
@@ -753,12 +1076,17 @@ def _resolve_aligned_cut(
         "selected_source_sample": None,
         "selected_source_seconds": None,
         "fade_intervals": [],
+        "retained_word_support": None,
+        "forbidden_word_ids": [],
+        "forbidden_source_edges": [],
+        "failure_reason": None,
     }
     if spans is None:
         return {
             **common,
             "boundary_method": "forced_alignment_failed",
             "safety_status": "alignment_failed",
+            "failure_reason": "alignment_failed",
             "error": alignment_error or "alignment evidence is missing",
         }
     try:
@@ -773,6 +1101,41 @@ def _resolve_aligned_cut(
         omitted = protected_roles[omitted_role]
         retained_span = spans[retained_id]
         omitted_span = spans[omitted_id]
+        support_edge = "terminal" if direction == "trailing" else "initial"
+        retained_support = evaluate_retained_word_support(
+            retained_span,
+            list(spans.values()),
+            edge=support_edge,
+        )
+        aligned_timestamps = {
+            "retained_start_seconds": retained_span["start_seconds"],
+            "retained_end_seconds": retained_span["end_seconds"],
+            "omitted_start_seconds": omitted_span["start_seconds"],
+            "omitted_end_seconds": omitted_span["end_seconds"],
+        }
+        if retained_support["status"] != "supported_complete_word":
+            return {
+                **common,
+                "protected_speech_intervals": protected,
+                "aligned_timestamps": aligned_timestamps,
+                "retained_word_support": retained_support,
+                "forbidden_word_ids": [retained_id],
+                "boundary_method": "retained_word_acoustic_support_failed",
+                "safety_status": "weak_retained_word_alignment",
+                "failure_reason": retained_support["status"],
+                "character_scores": [
+                    character.get("score")
+                    for character in retained_support["character_records"]
+                ],
+                "edge_score": retained_support["minimum_edge_score"],
+                "local_context_score": retained_support["local_context_median_score"],
+                "score_ratio": retained_support["edge_to_context_score_ratio"],
+                "error": (
+                    f"retained word {retained_id} "
+                    f"{words[retained_id].text!r} failed acoustic support: "
+                    f"{retained_support['status']}"
+                ),
+            }
         if direction == "trailing":
             search_start = int(retained["margin_end_sample"])
             search_end = int(omitted["start_sample"])
@@ -796,14 +1159,18 @@ def _resolve_aligned_cut(
             return {
                 **common,
                 "protected_speech_intervals": protected,
-                "aligned_timestamps": {
-                    "retained_start_seconds": retained_span["start_seconds"],
-                    "retained_end_seconds": retained_span["end_seconds"],
-                    "omitted_start_seconds": omitted_span["start_seconds"],
-                    "omitted_end_seconds": omitted_span["end_seconds"],
-                },
+                "aligned_timestamps": aligned_timestamps,
+                "retained_word_support": retained_support,
+                "forbidden_source_edges": [
+                    {
+                        "boundary_kind": boundary_kind,
+                        "retained_word_id": retained_id,
+                        "omitted_word_id": omitted_id,
+                    }
+                ],
                 "boundary_method": "unsafe_dense_boundary",
                 "safety_status": "unsafe_dense_boundary",
+                "failure_reason": "no_verified_non_speech_interval",
                 "error": (
                     "forced alignment exposes no verified non-speech interval "
                     "outside the retained-word protection margin"
@@ -835,18 +1202,14 @@ def _resolve_aligned_cut(
         return {
             **common,
             "protected_speech_intervals": protected,
-            "aligned_timestamps": {
-                "retained_start_seconds": retained_span["start_seconds"],
-                "retained_end_seconds": retained_span["end_seconds"],
-                "omitted_start_seconds": omitted_span["start_seconds"],
-                "omitted_end_seconds": omitted_span["end_seconds"],
-            },
+            "aligned_timestamps": aligned_timestamps,
             "verified_quiet_interval": _quiet_payload(evidence),
             "selected_source_sample": selected,
             "selected_source_seconds": selected / sample_rate,
             "fade_intervals": fades,
             "boundary_method": "forced_alignment_verified_quiet",
             "safety_status": "safe",
+            "retained_word_support": retained_support,
             "error": None,
         }
     except Exception as error:
@@ -854,6 +1217,7 @@ def _resolve_aligned_cut(
             **common,
             "boundary_method": "forced_alignment_failed",
             "safety_status": "alignment_failed",
+            "failure_reason": "alignment_failed",
             "error": f"{type(error).__name__}: {error}",
         }
 
@@ -877,6 +1241,10 @@ def _source_edge_boundary(
         "selected_source_sample": selected_sample,
         "selected_source_seconds": selected_sample / sample_rate,
         "fade_intervals": [],
+        "retained_word_support": None,
+        "forbidden_word_ids": [],
+        "forbidden_source_edges": [],
+        "failure_reason": None,
         "boundary_method": boundary_kind,
         "safety_status": "safe",
         "error": None,
@@ -1399,6 +1767,17 @@ def build_final_boundary_plan(
             )
 
     owners = _word_owners(semantic_plan)
+    for boundary in boundaries:
+        role_ids = boundary.get("source_word_ids")
+        retained_thought_indices: set[int] = set()
+        if isinstance(role_ids, dict):
+            for role, raw_word_id in role_ids.items():
+                if "retained" not in str(role) or type(raw_word_id) is not int:
+                    continue
+                thought_index = owners.get(raw_word_id)
+                if thought_index is not None:
+                    retained_thought_indices.add(thought_index)
+        boundary["retained_thought_indices"] = sorted(retained_thought_indices)
     transition_by_pair = {
         (
             int(transition["after_thought_index"]),
@@ -1704,6 +2083,15 @@ def build_final_boundary_plan(
             "quiet_fade_ms": QUIET_FADE_MS,
             "room_tone_fade_ms": ROOM_TONE_FADE_MS,
             "pause_targets_ms": PAUSE_TARGETS_MS,
+            "retained_word_support": {
+                "edge_character_count": RETAINED_WORD_EDGE_CHARACTER_COUNT,
+                "local_context_character_count": (
+                    RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT
+                ),
+                "minimum_word_score": MIN_RETAINED_WORD_SCORE,
+                "minimum_edge_character_score": (MIN_RETAINED_EDGE_CHARACTER_SCORE),
+                "minimum_edge_to_context_ratio": (MIN_RETAINED_EDGE_TO_CONTEXT_RATIO),
+            },
         },
         "alignment_jobs": str(jobs_path.resolve()),
         "alignment_worker_result": str(worker_path.resolve()),
@@ -1723,6 +2111,10 @@ def build_final_boundary_plan(
         ),
         "unsafe_dense_boundaries": sum(
             boundary["safety_status"] == "unsafe_dense_boundary"
+            for boundary in boundaries
+        ),
+        "weak_retained_word_alignments": sum(
+            boundary["safety_status"] == "weak_retained_word_alignment"
             for boundary in boundaries
         ),
         "alignment_failures": sum(
@@ -2067,9 +2459,10 @@ def render_final_cut(
             if boundary_plan["status"] == "safe":
                 break
             dense_count = int(boundary_plan["unsafe_dense_boundaries"])
+            weak_word_count = int(boundary_plan.get("weak_retained_word_alignments", 0))
             alignment_failures = int(boundary_plan["alignment_failures"])
             if (
-                dense_count == 0
+                dense_count + weak_word_count == 0
                 or alignment_failures > 0
                 or acoustic_attempt >= max_acoustic_retries
             ):
@@ -2081,7 +2474,8 @@ def render_final_cut(
             current_rejections = [
                 json.loads(json.dumps(boundary))
                 for boundary in boundary_plan["boundaries"]
-                if boundary.get("safety_status") == "unsafe_dense_boundary"
+                if boundary.get("safety_status")
+                in {"unsafe_dense_boundary", "weak_retained_word_alignment"}
             ]
             repair_constraints = json.loads(json.dumps(boundary_plan))
             repair_constraints["boundaries"] = [
@@ -2155,11 +2549,18 @@ def render_final_cut(
     boundary_plan_sha = sha256_file(boundary_plan_path)
     if boundary_plan["status"] != "safe":
         unsafe = int(boundary_plan["unsafe_dense_boundaries"])
+        weak = int(boundary_plan.get("weak_retained_word_alignments", 0))
         failures = int(boundary_plan["alignment_failures"])
-        reason = "unsafe_dense_boundary" if unsafe else "forced_alignment_failed"
+        if weak:
+            reason = "weak_retained_word_alignment"
+        elif unsafe:
+            reason = "unsafe_dense_boundary"
+        else:
+            reason = "forced_alignment_failed"
         raise FinalRenderError(
             f"{reason}: boundary plan has {unsafe} dense boundaries and "
-            f"{failures} alignment failures after "
+            f"{weak} weak retained-word alignments and {failures} alignment "
+            "failures after "
             f"{len(acoustic_repair_records)} acoustic repair attempts; "
             "no audio was rendered"
         )
@@ -2208,6 +2609,9 @@ def render_final_cut(
         "alignment_contexts": boundary_plan["alignment_context_count"],
         "alignment_resolved_boundaries": boundary_plan["alignment_resolved_boundaries"],
         "unsafe_dense_boundaries": boundary_plan["unsafe_dense_boundaries"],
+        "weak_retained_word_alignments": boundary_plan.get(
+            "weak_retained_word_alignments", 0
+        ),
         "unresolved_boundaries": 0,
         "clip_joins": [
             join

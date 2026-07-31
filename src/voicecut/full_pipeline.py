@@ -994,10 +994,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-acoustic-retries",
         type=int,
-        default=2,
+        default=3,
         help=(
             "Maximum planner reselections after alignment finds an "
-            "uncuttable dense boundary."
+            "uncuttable dense boundary or a weak retained-word occurrence."
         ),
     )
     parser.add_argument(

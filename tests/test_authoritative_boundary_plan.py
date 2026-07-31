@@ -198,14 +198,21 @@ def _aligned_payload(
     ]
     characters: list[dict[str, Any]] = []
     for index, (word, (start, end)) in enumerate(zip(words, spans, strict=True)):
-        characters.append(
-            {
-                "char": str(word["text"])[0],
-                "start": start,
-                "end": end,
-                "score": 0.99,
-            }
-        )
+        alphabetic = [
+            character for character in str(word["text"]) if character.isalpha()
+        ]
+        duration = (end - start) / len(alphabetic)
+        for character_index, character in enumerate(alphabetic):
+            character_start = start + character_index * duration
+            character_end = start + (character_index + 1) * duration
+            characters.append(
+                {
+                    "char": character,
+                    "start": character_start,
+                    "end": character_end,
+                    "score": 0.99,
+                }
+            )
         if index < len(words) - 1:
             characters.append({"char": " "})
     return {

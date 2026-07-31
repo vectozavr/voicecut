@@ -134,8 +134,7 @@ class StreamingNarrationTests(unittest.TestCase):
                 response(
                     finalized=[
                         thought(
-                            "And it might begin with familiar words once upon a "
-                            "time.",
+                            "And it might begin with familiar words once upon a time.",
                             (
                                 0,
                                 5,
@@ -161,8 +160,7 @@ class StreamingNarrationTests(unittest.TestCase):
                 response(
                     finalized=[
                         thought(
-                            "And it might begin with familiar words once upon a "
-                            "time.",
+                            "And it might begin with familiar words once upon a time.",
                             (
                                 0,
                                 5,
@@ -273,15 +271,13 @@ class StreamingNarrationTests(unittest.TestCase):
             )
             self.assertFalse(
                 any(
-                    source_range["start_word_id"] <= 5
-                    < source_range["end_word_id"]
+                    source_range["start_word_id"] <= 5 < source_range["end_word_id"]
                     for source_range in repaired["selected_source_ranges"]
                 )
             )
             self.assertTrue(
                 any(
-                    source_range["start_word_id"] <= 8
-                    < source_range["end_word_id"]
+                    source_range["start_word_id"] <= 8 < source_range["end_word_id"]
                     for source_range in repaired["selected_source_ranges"]
                 )
             )
@@ -293,9 +289,9 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertIn("forbidden_word_ids", repair_backend.prompts[0])
             self.assertEqual(len(repair_backend.prompts), 2)
             self.assertIn("forbidden weak source word 5", repair_backend.prompts[1])
-            repair_record = read_json(root / "repair/acoustic_repair.json")[
-                "repairs"
-            ][0]
+            repair_record = read_json(root / "repair/acoustic_repair.json")["repairs"][
+                0
+            ]
             self.assertEqual(repair_record["forbidden_word_ids"], [5])
             self.assertEqual(
                 repair_record["failure_reasons"], ["weak_terminal_word_support"]

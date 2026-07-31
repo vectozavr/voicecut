@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Refine rough-cut clip endings using only the local source waveform."""
+"""Pure waveform evidence helpers plus a debug-only trailing preview.
+
+RMS evidence is not authoritative in production. The single-pass renderer may
+use it only inside a non-speech interval already established by alignment.
+"""
 
 from __future__ import annotations
 
@@ -54,6 +58,25 @@ class BoundaryRefinement:
     local_noise_floor_db: float
     silence_threshold_db: float
     stable_silence_start_sample: int | None
+
+
+@dataclass(frozen=True)
+class VerifiedQuietEvidence:
+    """Waveform evidence inside an aligner-established non-speech interval.
+
+    This object is deliberately not a cut decision.  Callers must first prove
+    that ``search_start_sample:search_end_sample`` contains no protected
+    retained speech using forced alignment.  RMS is then used only to locate a
+    stable quiet run inside that already-safe interval.
+    """
+
+    quiet_start_sample: int
+    quiet_end_sample: int
+    local_noise_floor_db: float
+    silence_threshold_db: float
+    frame_ms: float
+    hop_ms: float
+    minimum_quiet_ms: float
 
 
 def rms_envelope_db(
@@ -128,6 +151,95 @@ def _local_threshold(
         )
     )
     return noise_floor_db, threshold
+
+
+def find_verified_quiet_evidence(
+    mono: np.ndarray,
+    *,
+    search_start_sample: int,
+    search_end_sample: int,
+    sample_rate: int,
+    alignment_interval_verified: bool,
+    minimum_quiet_ms: float = 20.0,
+    preference: str = "longest",
+) -> VerifiedQuietEvidence | None:
+    """Return stable quiet evidence, never an authoritative boundary.
+
+    ``alignment_interval_verified`` is intentionally mandatory.  It prevents
+    production callers from treating a low-RMS frame as proof that speech is
+    absent.  ``preference`` only breaks ties between already verified quiet
+    runs and may be ``left``, ``right``, or ``longest``.
+    """
+
+    if not alignment_interval_verified:
+        raise ValueError("quiet evidence requires a forced-aligned interval")
+    if mono.ndim != 1 or not len(mono):
+        raise ValueError("analysis waveform must be non-empty mono audio")
+    if sample_rate <= 0 or minimum_quiet_ms <= 0.0:
+        raise ValueError("sample rate and minimum quiet duration must be positive")
+    if preference not in {"left", "right", "longest"}:
+        raise ValueError("quiet-run preference must be left, right, or longest")
+    start = max(0, min(len(mono), int(search_start_sample)))
+    end = max(start, min(len(mono), int(search_end_sample)))
+    frame_samples = max(1, round(RMS_FRAME_MS * sample_rate / 1000.0))
+    required_samples = max(
+        frame_samples,
+        round(minimum_quiet_ms * sample_rate / 1000.0),
+    )
+    if end - start < required_samples:
+        return None
+
+    reference = (start + end) // 2
+    noise_floor_db, threshold_db = _local_threshold(
+        mono,
+        raw_end_sample=reference,
+        sample_rate=sample_rate,
+    )
+    starts, levels = rms_envelope_db(
+        mono,
+        start_sample=start,
+        end_sample=end,
+        sample_rate=sample_rate,
+    )
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    run_end: int | None = None
+    for frame_start, level in zip(starts, levels, strict=True):
+        frame_start = int(frame_start)
+        frame_end = min(end, frame_start + frame_samples)
+        if level < threshold_db:
+            if run_start is None:
+                run_start = frame_start
+            run_end = frame_end
+        elif run_start is not None and run_end is not None:
+            if run_end - run_start >= required_samples:
+                runs.append((run_start, run_end))
+            run_start = None
+            run_end = None
+    if run_start is not None and run_end is not None:
+        if run_end - run_start >= required_samples:
+            runs.append((run_start, run_end))
+    if not runs:
+        return None
+
+    if preference == "left":
+        quiet_start, quiet_end = min(runs, key=lambda run: (run[0], -run[1]))
+    elif preference == "right":
+        quiet_start, quiet_end = max(runs, key=lambda run: (run[1], -run[0]))
+    else:
+        quiet_start, quiet_end = max(
+            runs,
+            key=lambda run: (run[1] - run[0], -abs(sum(run) // 2 - reference)),
+        )
+    return VerifiedQuietEvidence(
+        quiet_start_sample=quiet_start,
+        quiet_end_sample=quiet_end,
+        local_noise_floor_db=noise_floor_db,
+        silence_threshold_db=threshold_db,
+        frame_ms=RMS_FRAME_MS,
+        hop_ms=RMS_HOP_MS,
+        minimum_quiet_ms=minimum_quiet_ms,
+    )
 
 
 def _first_stable_silence(

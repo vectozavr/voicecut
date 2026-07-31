@@ -147,11 +147,14 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
             final_cut.write_bytes(b"rendered audio")
+            boundary_plan = output_dir / "final_boundary_plan.json"
+            write_json(boundary_plan, {"status": "safe"})
             plan = Path(command[command.index("--plan") + 1])
             write_json(
                 output_dir / "final_render_manifest.json",
                 {
                     "status": "complete",
+                    "renderer": "authoritative_single_pass_final_render_v2",
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),
@@ -159,6 +162,8 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                     "pause_planner_model": "gemini-3.6-flash",
                     "final_cut_wav": str(final_cut.resolve()),
                     "final_cut_wav_sha256": sha256_file(final_cut),
+                    "final_boundary_plan": str(boundary_plan.resolve()),
+                    "final_boundary_plan_sha256": sha256_file(boundary_plan),
                     "duration_seconds": 1.25,
                 },
             )
@@ -414,11 +419,14 @@ def test_full_pipeline_routes_video_input_to_video_publication(
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
             final_cut.write_bytes(b"rendered audio")
+            boundary_plan = output_dir / "final_boundary_plan.json"
+            write_json(boundary_plan, {"status": "safe"})
             plan = Path(command[command.index("--plan") + 1])
             write_json(
                 output_dir / "final_render_manifest.json",
                 {
                     "status": "complete",
+                    "renderer": "authoritative_single_pass_final_render_v2",
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),
@@ -426,6 +434,8 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                     "pause_planner_model": "gemini-3.6-flash",
                     "final_cut_wav": str(final_cut.resolve()),
                     "final_cut_wav_sha256": sha256_file(final_cut),
+                    "final_boundary_plan": str(boundary_plan.resolve()),
+                    "final_boundary_plan_sha256": sha256_file(boundary_plan),
                     "duration_seconds": 1.25,
                 },
             )

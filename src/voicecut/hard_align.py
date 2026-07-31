@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Resolve only rough-preview hard boundaries with local forced alignment."""
+"""Debug-only compatibility preview for trailing hard-boundary alignment.
+
+Production uses the symmetric resolver in :mod:`voicecut.final_render`; this
+module must never feed a production render.
+"""
 
 from __future__ import annotations
 

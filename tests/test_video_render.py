@@ -20,53 +20,66 @@ from voicecut.video_render import (
 )
 
 
-def _semantic_manifest() -> dict[str, object]:
+def _boundary_plan() -> dict[str, object]:
     return {
+        "planner": "authoritative_single_pass_boundary_plan_v1",
+        "status": "safe",
         "source_sample_rate": 1000,
-        "semantic_pause_output_frame_count": 2000,
-        "clips": [
+        "expected_output_frame_count": 2000,
+        "output_segments": [
             {
-                "clip_index": 0,
-                "final_source_start_sample": 1000,
-                "semantic_source_end_sample": 2000,
-                "semantic_output_start_sample": 0,
-                "semantic_output_end_sample": 1200,
+                "segment_index": 0,
+                "kind": "source",
+                "source_interval_index": 0,
+                "source_start_sample": 1000,
+                "source_end_sample": 1500,
+                "output_start_sample": 0,
+                "output_end_sample": 500,
             },
             {
-                "clip_index": 1,
-                "final_source_start_sample": 3000,
-                "semantic_source_end_sample": 3500,
-                "semantic_output_start_sample": 1500,
-                "semantic_output_end_sample": 2000,
+                "segment_index": 1,
+                "kind": "room_tone",
+                "join_id": "internal_thought_pause",
+                "source_start_sample": 4000,
+                "source_end_sample": 4200,
+                "output_start_sample": 500,
+                "output_end_sample": 700,
+            },
+            {
+                "segment_index": 2,
+                "kind": "source",
+                "source_interval_index": 0,
+                "source_start_sample": 1500,
+                "source_end_sample": 2000,
+                "output_start_sample": 700,
+                "output_end_sample": 1200,
+            },
+            {
+                "segment_index": 3,
+                "kind": "room_tone",
+                "join_id": "source_join_0000",
+                "source_start_sample": 4200,
+                "source_end_sample": 4500,
+                "output_start_sample": 1200,
+                "output_end_sample": 1500,
+            },
+            {
+                "segment_index": 4,
+                "kind": "source",
+                "source_interval_index": 1,
+                "source_start_sample": 3000,
+                "source_end_sample": 3500,
+                "output_start_sample": 1500,
+                "output_end_sample": 2000,
             },
         ],
-        "transitions": [
-            {
-                "boundary_location": "inside_continuous_source_clip",
-                "previous_clip_index": 0,
-                "next_clip_index": 0,
-                "source_insertion_seconds": 1.5,
-                "inserted_pause_ms": 200.0,
-                "status": "pause_inserted",
-                "output_pause_start_seconds": 0.5,
-                "output_pause_end_seconds": 0.7,
-            }
-        ],
-        "clip_joins": [
-            {
-                "join_index": 0,
-                "left_clip_index": 0,
-                "right_clip_index": 1,
-                "inserted_pause_ms": 300.0,
-                "output_pause_start_seconds": 1.2,
-                "output_pause_end_seconds": 1.5,
-            }
-        ],
+        "joins": [],
+        "final_boundary": {},
     }
 
 
 def test_visual_timeline_preserves_motion_and_freezes_only_inserted_time() -> None:
-    timeline, sample_rate, expected_frames = build_visual_timeline(_semantic_manifest())
+    timeline, sample_rate, expected_frames = build_visual_timeline(_boundary_plan())
 
     assert sample_rate == 1000
     assert expected_frames == 2000
@@ -82,8 +95,8 @@ def test_visual_timeline_preserves_motion_and_freezes_only_inserted_time() -> No
         )
         for item in timeline
     ] == [
-        (0, 1000, 1500, 200, "internal_semantic_pause", 0, 700),
-        (0, 1500, 2000, 300, "inter_clip_semantic_pause", 700, 1500),
+        (0, 1000, 1500, 200, "internal_thought_pause", 0, 700),
+        (0, 1500, 2000, 300, "source_join_0000", 700, 1500),
         (1, 3000, 3500, 0, None, 1500, 2000),
     ]
     assert (
@@ -97,45 +110,45 @@ def test_visual_timeline_preserves_motion_and_freezes_only_inserted_time() -> No
     )
 
 
-def test_visual_timeline_rejects_pause_that_disagrees_with_audio_timeline() -> None:
-    manifest = _semantic_manifest()
-    manifest["clip_joins"][0]["output_pause_start_seconds"] = 1.1  # type: ignore[index]
+def test_visual_timeline_rejects_trace_that_disagrees_with_audio_timeline() -> None:
+    manifest = _boundary_plan()
+    manifest["output_segments"][3]["output_start_sample"] = 1100  # type: ignore[index]
 
-    with pytest.raises(VideoRenderError, match="does not begin"):
+    with pytest.raises(VideoRenderError, match="discontinuous"):
         build_visual_timeline(manifest)
 
 
-def test_final_manifest_seals_semantic_timeline_geometry(tmp_path: Path) -> None:
-    semantic_path = tmp_path / "semantic.json"
+def test_final_manifest_seals_boundary_timeline_geometry(tmp_path: Path) -> None:
+    boundary_path = tmp_path / "final_boundary_plan.json"
     final_path = tmp_path / "final.json"
-    write_json(semantic_path, _semantic_manifest())
+    write_json(boundary_path, _boundary_plan())
     write_json(
         final_path,
         {
             "status": "complete",
-            "semantic_pause_manifest": str(semantic_path.resolve()),
-            "semantic_pause_manifest_sha256": sha256_file(semantic_path),
+            "final_boundary_plan": str(boundary_path.resolve()),
+            "final_boundary_plan_sha256": sha256_file(boundary_path),
         },
     )
-    changed = _semantic_manifest()
-    changed["semantic_pause_output_frame_count"] = 2100
-    write_json(semantic_path, changed)
+    changed = _boundary_plan()
+    changed["expected_output_frame_count"] = 2100
+    write_json(boundary_path, changed)
 
-    with pytest.raises(VideoRenderError, match="changed after final rendering"):
+    with pytest.raises(VideoRenderError, match="changed after audio rendering"):
         load_visual_timeline(final_path)
 
 
-def test_video_timeline_rejects_unsealed_semantic_manifest(
+def test_video_timeline_rejects_unsealed_boundary_plan(
     tmp_path: Path,
 ) -> None:
-    semantic_path = tmp_path / "semantic.json"
+    boundary_path = tmp_path / "final_boundary_plan.json"
     final_path = tmp_path / "final.json"
-    write_json(semantic_path, _semantic_manifest())
+    write_json(boundary_path, _boundary_plan())
     write_json(
         final_path,
         {
             "status": "complete",
-            "semantic_pause_manifest": str(semantic_path.resolve()),
+            "final_boundary_plan": str(boundary_path.resolve()),
         },
     )
 
@@ -293,38 +306,49 @@ def test_video_render_muxes_final_audio_and_holds_frame_for_internal_pause(
         sample_rate,
         subtype="FLOAT",
     )
-    semantic_path = tmp_path / "semantic.json"
+    boundary_path = tmp_path / "final_boundary_plan.json"
     source_start = round(0.5 * sample_rate)
     insertion = round(1.0 * sample_rate)
     source_end = round(1.5 * sample_rate)
     expected_frames = round(1.5 * sample_rate)
     write_json(
-        semantic_path,
+        boundary_path,
         {
+            "planner": "authoritative_single_pass_boundary_plan_v1",
+            "status": "safe",
             "source_sample_rate": sample_rate,
-            "semantic_pause_output_frame_count": expected_frames,
-            "clips": [
+            "expected_output_frame_count": expected_frames,
+            "output_segments": [
                 {
-                    "clip_index": 0,
-                    "final_source_start_sample": source_start,
-                    "semantic_source_end_sample": source_end,
-                    "semantic_output_start_sample": 0,
-                    "semantic_output_end_sample": expected_frames,
-                }
-            ],
-            "transitions": [
+                    "segment_index": 0,
+                    "kind": "source",
+                    "source_interval_index": 0,
+                    "source_start_sample": source_start,
+                    "source_end_sample": insertion,
+                    "output_start_sample": 0,
+                    "output_end_sample": insertion - source_start,
+                },
                 {
-                    "boundary_location": "inside_continuous_source_clip",
-                    "previous_clip_index": 0,
-                    "next_clip_index": 0,
-                    "source_insertion_seconds": insertion / sample_rate,
-                    "inserted_pause_ms": 500.0,
-                    "status": "pause_inserted",
-                    "output_pause_start_seconds": 0.5,
-                    "output_pause_end_seconds": 1.0,
-                }
+                    "segment_index": 1,
+                    "kind": "room_tone",
+                    "join_id": "internal_thought_pause",
+                    "source_start_sample": 0,
+                    "source_end_sample": round(0.5 * sample_rate),
+                    "output_start_sample": insertion - source_start,
+                    "output_end_sample": round(1.0 * sample_rate),
+                },
+                {
+                    "segment_index": 2,
+                    "kind": "source",
+                    "source_interval_index": 0,
+                    "source_start_sample": insertion,
+                    "source_end_sample": source_end,
+                    "output_start_sample": round(1.0 * sample_rate),
+                    "output_end_sample": expected_frames,
+                },
             ],
-            "clip_joins": [],
+            "joins": [],
+            "final_boundary": {},
         },
     )
     final_manifest_path = tmp_path / "final_manifest.json"
@@ -334,8 +358,8 @@ def test_video_render_muxes_final_audio_and_holds_frame_for_internal_pause(
             "status": "complete",
             "source_audio": str(canonical.resolve()),
             "source_audio_sha256": media_input["canonical_audio_sha256"],
-            "semantic_pause_manifest": str(semantic_path.resolve()),
-            "semantic_pause_manifest_sha256": sha256_file(semantic_path),
+            "final_boundary_plan": str(boundary_path.resolve()),
+            "final_boundary_plan_sha256": sha256_file(boundary_path),
             "final_cut_wav": str(final_audio.resolve()),
             "final_cut_wav_sha256": sha256_file(final_audio),
         },

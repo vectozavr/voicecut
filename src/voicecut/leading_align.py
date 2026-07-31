@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Resolve selected clip starts with waveform evidence or CPU WhisperX.
+"""Debug-only compatibility preview for selected clip starts.
 
-This stage is deliberately downstream of semantic planning and trailing
-boundary alignment.  It never transcribes audio and never changes selected
-word IDs.  Its only edit is the source start of a rendered clip whose first
-selected word is preceded by one or more omitted words.
+Production resolves both sides of every discontinuity symmetrically in
+:mod:`voicecut.final_render` and slices the canonical source only once. This
+module remains solely for inspecting legacy preview behavior.
 """
 
 from __future__ import annotations

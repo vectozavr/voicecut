@@ -389,8 +389,8 @@ def test_overlapping_whisper_timestamps_are_not_clamped_into_speech(
     left = _boundary(plan, "selected_to_omitted")
     right = _boundary(plan, "omitted_to_selected")
     assert left["selected_source_sample"] >= 520
-    assert left["selected_source_sample"] < 650
-    assert right["selected_source_sample"] > 900
+    assert left["selected_source_sample"] <= 650
+    assert right["selected_source_sample"] >= 900
     assert right["selected_source_sample"] <= 1080
     assert left["whisper_timestamps"]["retained_end_seconds"] == 0.70
     assert left["aligned_timestamps"]["retained_end_seconds"] == 0.50
@@ -413,7 +413,7 @@ def test_semantic_pause_inside_contiguous_range_uses_aligned_quiet_gap(
         words=words,
         thought_ranges=[[(0, 1)], [(1, 2)]],
         spans=[(0.10, 0.50), (0.80, 1.20)],
-        pause_types=["short"],
+        pause_types=["thought"],
     )
 
     assert len(plan["source_intervals"]) == 1

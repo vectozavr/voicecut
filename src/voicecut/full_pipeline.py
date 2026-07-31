@@ -192,8 +192,11 @@ def _render_is_current(
         return False
     final_cut = value.get("final_cut_wav")
     final_cut_sha = value.get("final_cut_wav_sha256")
+    boundary_plan = value.get("final_boundary_plan")
+    boundary_plan_sha = value.get("final_boundary_plan_sha256")
     return (
         value.get("status") == "complete"
+        and value.get("renderer") == "authoritative_single_pass_final_render_v2"
         and value.get("source_audio_sha256") == audio_sha256
         and value.get("streaming_plan") == str(plan_path.resolve())
         and value.get("streaming_plan_sha256") == sha256_file(plan_path)
@@ -203,6 +206,10 @@ def _render_is_current(
         and Path(final_cut).is_file()
         and isinstance(final_cut_sha, str)
         and sha256_file(Path(final_cut)) == final_cut_sha
+        and isinstance(boundary_plan, str)
+        and Path(boundary_plan).is_file()
+        and isinstance(boundary_plan_sha, str)
+        and sha256_file(Path(boundary_plan)) == boundary_plan_sha
     )
 
 
@@ -811,7 +818,7 @@ def run_full_pipeline(
         if args.debug_artifacts:
             render_command.append("--debug-artifacts")
         _run(
-            "05 SAFE ALIGNED RENDER",
+            "05 AUTHORITATIVE SINGLE-PASS RENDER",
             render_command,
             runner=runner,
             planner_backend=planner_runtime.provider,
@@ -978,7 +985,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--debug-artifacts",
         action="store_true",
-        help="Keep per-clip WAVs and diagnostic renderer plots.",
+        help=(
+            "Request optional diagnostics without changing the single-pass "
+            "production render graph."
+        ),
     )
     return parser
 

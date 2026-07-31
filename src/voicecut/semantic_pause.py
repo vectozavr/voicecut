@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Plan semantic thought pauses and render them without changing speech cuts."""
+"""Semantic pause classification plus a debug-only compatibility preview.
+
+Production consumes the classification as evidence in
+:mod:`voicecut.final_render`; this module's WAV renderer is not in the
+production dependency chain.
+"""
 
 from __future__ import annotations
 

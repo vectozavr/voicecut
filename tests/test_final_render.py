@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+import voicecut.final_render as final_render_module
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.final_render import FinalRenderError, render_final_cut
 
@@ -102,7 +103,7 @@ def _aligned_job(
     clip_index: int,
 ) -> dict[str, Any]:
     words = ["selected", "omitted", "last"]
-    times = [(0.10, 0.62), (0.65, 0.95), (1.20, 1.52)]
+    times = [(0.10, 0.62), (0.72, 0.95), (1.20, 1.52)]
     word_segments = [
         {
             "word": word,
@@ -149,7 +150,7 @@ def _grounded_fixture(
     time = np.arange(len(source), dtype=np.float32) / SAMPLE_RATE
     source[:, 0] = 0.001 * np.sin(2.0 * np.pi * 13.0 * time)
     _speech(source, 100, 620, frequency=173.0)
-    _speech(source, 650, 950, frequency=191.0)
+    _speech(source, 720, 950, frequency=191.0)
     if dense_leading_boundary:
         _speech(source, 950, 1200, frequency=191.0)
     _speech(source, 1200, 1520, frequency=211.0)
@@ -271,7 +272,7 @@ def _grounded_fixture(
     return audio_path, plan_path, pause_plan_path, grounding
 
 
-def test_final_render_runs_all_audio_stages_from_cached_semantics(
+def test_final_render_builds_one_boundary_plan_and_renders_source_once(
     tmp_path: Path,
 ) -> None:
     audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
@@ -284,70 +285,56 @@ def test_final_render_runs_all_audio_stages_from_cached_semantics(
         pause_plan_path=pause_plan_path,
         alignment_python=tmp_path / "model-must-not-run",
         pause_backend=ExplodingPauseBackend(),
-        hard_alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
-        leading_alignment_payload={"jobs": [_aligned_job(clip_index=1)]},
+        alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
     )
 
     assert manifest["status"] == "complete"
     assert manifest["semantic_thoughts"] == 2
     assert manifest["selected_source_ranges"] == 2
     assert manifest["rendered_clips"] == 2
-    assert manifest["hard_boundaries"] == 1
-    assert manifest["hard_boundaries_aligned"] == 1
-    assert manifest["leading_boundaries"] == 1
-    assert manifest["leading_boundaries_aligned"] == 1
+    assert manifest["alignment_contexts"] == 1
+    assert manifest["alignment_resolved_boundaries"] == 2
+    assert manifest["unsafe_dense_boundaries"] == 0
     assert manifest["unresolved_boundaries"] == 0
     assert manifest["final_boundary"]["boundary_method"] == "eof_safe_tail"
 
     final_path = output_dir / "final_cut.wav"
     assert Path(manifest["final_cut_wav"]) == final_path
     assert manifest["final_cut_wav_sha256"] == sha256_file(final_path)
-    semantic_manifest = Path(manifest["semantic_pause_manifest"])
-    assert manifest["semantic_pause_manifest_sha256"] == sha256_file(semantic_manifest)
+    boundary_plan_path = Path(manifest["final_boundary_plan"])
+    assert manifest["final_boundary_plan_sha256"] == sha256_file(boundary_plan_path)
     assert sf.info(final_path).samplerate == SAMPLE_RATE
     assert sf.info(final_path).channels == 1
     assert (output_dir / "pause_plan.json").read_bytes() == (
         pause_plan_path.read_bytes()
     )
 
-    hard = read_json(Path(manifest["hard_boundary_manifest"]))
-    leading = read_json(Path(manifest["leading_boundary_manifest"]))
-    assert hard["clips"][0]["final_cut_seconds"] >= 0.62
-    assert hard["clips"][0]["final_cut_seconds"] <= 0.65
-    assert leading["clips"][1]["leading_alignment_status"] == (
-        "leading_waveform_silence"
+    boundary_plan = read_json(boundary_plan_path)
+    assert boundary_plan["planner"] == "authoritative_single_pass_boundary_plan_v1"
+    assert boundary_plan["status"] == "safe"
+    assert len(boundary_plan["source_intervals"]) == 2
+    assert len(boundary_plan["output_segments"]) >= 2
+    assert all(
+        boundary["safety_status"] == "safe" for boundary in boundary_plan["boundaries"]
     )
-    assert leading["clips"][1]["leading_waveform_quiet_duration_ms"] >= 70.0
-    assert leading["clips"][1]["leading_retained_quiet_ms"] >= 25.0
-    assert leading["clips"][1]["leading_final_start_seconds"] <= 1.20
-    assert leading["leading_boundaries_sent_to_whisperx"] == 0
-    alignment_jobs = read_json(Path(leading["leading_alignment_jobs"]))
-    assert alignment_jobs["jobs"] == []
-    worker_result = read_json(Path(leading["leading_alignment_worker_result"]))
-    assert "WhisperX was not loaded" in worker_result["model_call_skipped"]
 
-    work = output_dir / "work"
     assert manifest["debug_artifacts_written"] is False
-    assert not (work / "01_trailing/rough_cut.wav").exists()
-    assert not (work / "01_trailing/clips").exists()
-    assert not (work / "01_trailing/clips_refined").exists()
-    assert not (work / "01_trailing/boundary_debug").exists()
-    hard_context = work / "02_hard_boundaries/forced_alignment_debug/clip_000"
-    assert (hard_context / "context.wav").is_file()
-    assert not (hard_context / "old_clip.wav").exists()
-    assert not (hard_context / "new_clip.wav").exists()
-    assert not (hard_context / "alignment_plot.png").exists()
-    assert not (hard_context / "alignment.json").exists()
-    assert not (work / "03_leading_boundaries/clips").exists()
-    assert not (work / "03_leading_boundaries/leading_alignment_debug").exists()
-    assert not (work / "04_semantic_pauses/final_sentence_old.wav").exists()
-    assert not (work / "04_semantic_pauses/final_sentence_new.wav").exists()
+    assert (output_dir / "alignment_contexts/context_0000.wav").is_file()
+    assert not (output_dir / "work").exists()
+    rendered_stage_wavs = [
+        path
+        for path in output_dir.rglob("*.wav")
+        if path.name != "final_cut.wav" and "alignment_contexts" not in path.parts
+    ]
+    assert rendered_stage_wavs == []
 
     saved = read_json(output_dir / "final_render_manifest.json")
     assert saved == manifest
 
 
-def test_final_render_debug_artifacts_are_explicitly_opt_in(tmp_path: Path) -> None:
+def test_debug_flag_does_not_reintroduce_staged_production_wavs(
+    tmp_path: Path,
+) -> None:
     audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
     output_dir = tmp_path / "final-debug"
 
@@ -358,32 +345,15 @@ def test_final_render_debug_artifacts_are_explicitly_opt_in(tmp_path: Path) -> N
         pause_plan_path=pause_plan_path,
         alignment_python=tmp_path / "model-must-not-run",
         pause_backend=ExplodingPauseBackend(),
-        hard_alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
-        leading_alignment_payload={"jobs": [_aligned_job(clip_index=1)]},
+        alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
         write_debug_artifacts=True,
     )
 
-    work = output_dir / "work"
-    assert manifest["debug_artifacts_written"] is True
-    assert (work / "01_trailing/rough_cut.wav").is_file()
-    assert (work / "01_trailing/clips/clip_000.wav").is_file()
-    assert (work / "01_trailing/clips_refined/clip_000.wav").is_file()
-    assert (work / "01_trailing/boundary_debug/clip_000_end.png").is_file()
-    hard_debug = work / "02_hard_boundaries/forced_alignment_debug/clip_000"
-    assert (hard_debug / "old_clip.wav").is_file()
-    assert (hard_debug / "new_clip.wav").is_file()
-    assert (hard_debug / "alignment_plot.png").is_file()
-    assert (hard_debug / "alignment.json").is_file()
-    leading_debug = (
-        work / "03_leading_boundaries/leading_alignment_debug/clip_001_start"
-    )
-    assert (leading_debug / "context.wav").is_file()
-    assert (leading_debug / "old_clip.wav").is_file()
-    assert (leading_debug / "new_clip.wav").is_file()
-    assert (leading_debug / "alignment_plot.png").is_file()
-    assert (leading_debug / "alignment.json").is_file()
-    assert (work / "04_semantic_pauses/final_sentence_old.wav").is_file()
-    assert (work / "04_semantic_pauses/final_sentence_new.wav").is_file()
+    assert manifest["debug_artifacts_requested"] is True
+    assert manifest["debug_artifacts_written"] is False
+    assert not (output_dir / "work").exists()
+    assert not list(output_dir.rglob("rough_cut*.wav"))
+    assert not list(output_dir.rglob("*aligned.wav"))
 
 
 def test_final_render_rejects_stale_grounding_ledger_before_audio_work(
@@ -404,14 +374,13 @@ def test_final_render_rejects_stale_grounding_ledger_before_audio_work(
             plan_path=plan_path,
             output_dir=output_dir,
             pause_plan_path=pause_plan_path,
-            hard_alignment_payload={"jobs": []},
-            leading_alignment_payload={"jobs": []},
+            alignment_payload={"jobs": []},
         )
 
     assert not output_dir.exists()
 
 
-def test_final_render_fails_closed_on_unresolved_trailing_boundary(
+def test_final_render_fails_closed_on_alignment_failure(
     tmp_path: Path,
 ) -> None:
     audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
@@ -419,7 +388,7 @@ def test_final_render_fails_closed_on_unresolved_trailing_boundary(
 
     with pytest.raises(
         FinalRenderError,
-        match="unresolved trailing forced-alignment boundary",
+        match="forced_alignment_failed",
     ):
         render_final_cut(
             audio_path=audio_path,
@@ -427,7 +396,7 @@ def test_final_render_fails_closed_on_unresolved_trailing_boundary(
             output_dir=output_dir,
             pause_plan_path=pause_plan_path,
             alignment_python=tmp_path / "model-must-not-run",
-            hard_alignment_payload={
+            alignment_payload={
                 "jobs": [
                     {
                         "clip_index": 0,
@@ -436,15 +405,16 @@ def test_final_render_fails_closed_on_unresolved_trailing_boundary(
                     }
                 ]
             },
-            leading_alignment_payload={"jobs": []},
         )
 
     assert not (output_dir / "final_cut.wav").exists()
-    assert not (output_dir / "pause_plan.json").exists()
-    assert not (output_dir / "work" / "04_semantic_pauses").exists()
+    assert (output_dir / "pause_plan.json").is_file()
+    boundary_plan = read_json(output_dir / "final_boundary_plan.json")
+    assert boundary_plan["status"] == "unsafe"
+    assert boundary_plan["alignment_failures"] == 2
 
 
-def test_final_render_fails_closed_on_unresolved_leading_boundary(
+def test_final_render_fails_closed_on_dense_leading_boundary(
     tmp_path: Path,
 ) -> None:
     audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(
@@ -455,7 +425,7 @@ def test_final_render_fails_closed_on_unresolved_leading_boundary(
 
     with pytest.raises(
         FinalRenderError,
-        match="unresolved leading forced-alignment boundary",
+        match="unsafe_dense_boundary",
     ):
         render_final_cut(
             audio_path=audio_path,
@@ -463,18 +433,44 @@ def test_final_render_fails_closed_on_unresolved_leading_boundary(
             output_dir=output_dir,
             pause_plan_path=pause_plan_path,
             alignment_python=tmp_path / "model-must-not-run",
-            hard_alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
-            leading_alignment_payload={
-                "jobs": [
-                    {
-                        "clip_index": 1,
-                        "error": "last word did not align",
-                        "aligned": None,
-                    }
-                ]
-            },
+            alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
         )
 
     assert not (output_dir / "final_cut.wav").exists()
-    assert not (output_dir / "pause_plan.json").exists()
-    assert not (output_dir / "work" / "04_semantic_pauses").exists()
+    boundary_plan = read_json(output_dir / "final_boundary_plan.json")
+    assert boundary_plan["unsafe_dense_boundaries"] == 1
+
+
+def test_final_boundary_plan_cannot_change_during_render(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    output_dir = tmp_path / "mutated"
+    original_render = final_render_module.render_boundary_plan
+
+    def mutate_after_render(**kwargs: Any) -> dict[str, Any]:
+        result = original_render(**kwargs)
+        boundary_path = Path(kwargs["boundary_plan_path"])
+        changed = read_json(boundary_path)
+        changed["boundaries"][1]["selected_source_sample"] += 1
+        write_json(boundary_path, changed)
+        return result
+
+    monkeypatch.setattr(
+        final_render_module,
+        "render_boundary_plan",
+        mutate_after_render,
+    )
+    with pytest.raises(FinalRenderError, match="changed during rendering"):
+        render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_plan_path,
+            alignment_python=tmp_path / "model-must-not-run",
+            alignment_payload={"jobs": [_aligned_job(clip_index=0)]},
+        )
+
+    assert not (output_dir / "final_cut.wav").exists()
+    assert not (output_dir / "final_render_manifest.json").exists()

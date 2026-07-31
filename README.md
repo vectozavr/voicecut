@@ -268,15 +268,18 @@ voicecut interview.mov \
 
 The work directory contains the canonical input WAV, analysis, word transcript,
 acoustic retry evidence, streaming semantic plan, grounding report, alignment
-context required by WhisperX, pause plan, render manifests, and the internal
-stage WAVs consumed by later render steps. Completed stages are reused only when
-their input hashes, relevant model settings, and VoiceCut implementation
-fingerprint match. A software update therefore cannot silently reuse a plan or
-render produced by older code.
+context crops required by WhisperX, the semantic pause plan, one authoritative
+`final_boundary_plan.json`, and one final internal WAV. No rendered preview WAV
+feeds another production step. Completed stages are reused only when their input
+hashes, relevant model settings, and VoiceCut implementation fingerprint match.
+A software update therefore cannot silently reuse a plan or render produced by
+older code.
 
-Per-clip preview WAVs and diagnostic boundary plots are disabled in normal
-production runs. Add `--debug-artifacts` when investigating a renderer decision;
-that mode intentionally uses more disk space.
+Legacy rough, trailing, hard-boundary, leading-boundary, and semantic-pause WAV
+renderers remain available to developers as isolated preview helpers. They are
+not in the one-command production call graph. `--debug-artifacts` may request
+extra diagnostics when a renderer supports them, but it never changes that
+single-pass production graph.
 
 This has two important effects:
 
@@ -351,18 +354,32 @@ selected source range. VoiceCut then verifies:
 
 The LLM selects occurrences; it never selects sample coordinates.
 
-### 6. Waveform-safe rendering
+### 6. One authoritative boundary plan and one render
 
-Selected ranges are mapped back to the original samples. Ordinary phrase
-endings extend to stable waveform decay. Dense kept-to-omitted word boundaries
-use local WhisperX forced alignment instead of trusting approximate Whisper
-timestamps. Leading boundaries receive equivalent waveform or alignment
-protection.
+VoiceCut first resolves every real source discontinuity without rendering any
+output audio. For each omitted region, one local WhisperX context covers the
+retained and omitted words on both sides. Character or word alignments define
+protected speech spans with a small safety margin. Whisper timestamps remain
+approximate anchors and are never clamped together or used as hard cut limits.
 
-A separate semantic pause classification assigns transition types. Existing
-quiet time counts toward each target pause; only the deficit is inserted.
-Inserted ambience is copied from verified quiet material in the same recording.
-The final word keeps a safe source tail.
+Waveform energy is secondary evidence: it may choose a splice only inside an
+alignment-established interval that also contains verified quiet audio. If no
+such interval exists, the boundary is recorded as `unsafe_dense_boundary` and
+the run stops before rendering instead of guessing. Fades are confined to those
+verified quiet intervals, so retained speech—including quiet final fricatives
+such as `/s/`—remains sample-identical to the canonical WAV.
+
+A separate semantic pause classification still assigns `continuation`, `short`,
+`thought`, or `section`. Existing natural quiet counts toward the target total
+gap. Any deficit is filled with verified room tone only at a resolved safe join,
+or inside an aligned natural inter-word gap within a contiguous take. If there
+is no safe internal gap, the extra pause is skipped. The final word uses a safe
+EOF tail because no later unwanted word can be included.
+
+Only after all boundaries, pauses, room-tone source ranges, and fade intervals
+have been frozen in `final_boundary_plan.json` does `final_render.py` slice the
+canonical source WAV. It performs one render and writes one internal
+`final_cut.wav`; no later stage may move or fade a boundary.
 
 ### 7. Publication
 
@@ -394,7 +411,7 @@ Important options:
 | `--whisper-model NAME` | Override the MLX Whisper repository |
 | `--window-seconds N` | New transcript look-ahead added per planner iteration |
 | `--max-output-tokens N` | Maximum structured planner response size |
-| `--debug-artifacts` | Save optional per-clip WAVs and boundary plots |
+| `--debug-artifacts` | Request optional diagnostics without changing the single-pass render graph |
 | `--asr-python PATH` | Advanced: Python executable for MLX ASR/local CTC stages |
 | `--alignment-python PATH` | Advanced: Python executable for WhisperX alignment |
 | `--planner-python PATH` | Advanced: Python executable for local MLX LLMs |
@@ -449,10 +466,11 @@ ruff check src tests
 ruff format --check src tests
 ```
 
-The tests include semantic validation and retry behavior, range merging,
-waveform boundary refinement, forced alignment, semantic pauses, media
-conversion, video timeline construction, caching, and one-command
-orchestration.
+The tests include semantic validation and retry behavior, source grounding,
+alignment-protected `/s/` and leading-word regressions, overlapping Whisper
+timestamps, fail-closed dense boundaries, semantic pauses, EOF tails,
+sample-trace invariants, media conversion, video timeline construction,
+caching, and one-command orchestration.
 
 ## License
 

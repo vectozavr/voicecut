@@ -155,10 +155,88 @@ def _pause_samples(record: dict[str, Any], *, sample_rate: int) -> tuple[int, in
     return start_sample, end_sample
 
 
+def _build_single_pass_visual_timeline(
+    boundary_plan: dict[str, Any],
+) -> tuple[list[VisualTimelineSegment], int, int]:
+    sample_rate = _integer(
+        boundary_plan.get("source_sample_rate"),
+        description="boundary-plan source sample rate",
+        minimum=1,
+    )
+    expected_frames = _integer(
+        boundary_plan.get("expected_output_frame_count"),
+        description="boundary-plan output frame count",
+        minimum=1,
+    )
+    raw_segments = boundary_plan.get("output_segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        raise VideoRenderError("boundary plan contains no output trace")
+
+    timeline: list[VisualTimelineSegment] = []
+    output_cursor = 0
+    for expected_index, segment in enumerate(raw_segments):
+        if (
+            not isinstance(segment, dict)
+            or segment.get("segment_index") != expected_index
+        ):
+            raise VideoRenderError("boundary-plan output segments are not ordered")
+        output_start = _integer(
+            segment.get("output_start_sample"),
+            description=f"output segment {expected_index} start",
+        )
+        output_end = _integer(
+            segment.get("output_end_sample"),
+            description=f"output segment {expected_index} end",
+            minimum=1,
+        )
+        if output_start != output_cursor or output_end <= output_start:
+            raise VideoRenderError("boundary-plan output trace is discontinuous")
+        kind = segment.get("kind")
+        if kind == "source":
+            source_start = _integer(
+                segment.get("source_start_sample"),
+                description=f"output segment {expected_index} source start",
+            )
+            source_end = _integer(
+                segment.get("source_end_sample"),
+                description=f"output segment {expected_index} source end",
+                minimum=1,
+            )
+            if source_end - source_start != output_end - output_start:
+                raise VideoRenderError("source/output segment durations differ")
+            output_cursor = _append_source_segment(
+                timeline,
+                clip_index=_integer(
+                    segment.get("source_interval_index"),
+                    description="source interval index",
+                ),
+                source_start=source_start,
+                source_end=source_end,
+                output_cursor=output_cursor,
+            )
+        elif kind == "room_tone":
+            output_cursor = _append_freeze(
+                timeline,
+                frame_count=output_end - output_start,
+                reason=str(segment.get("join_id") or "semantic_pause"),
+                output_cursor=output_cursor,
+            )
+        else:
+            raise VideoRenderError("boundary plan contains an untraceable segment")
+        if output_cursor != output_end:
+            raise VideoRenderError("visual timeline diverges from audio trace")
+    if output_cursor != expected_frames:
+        raise VideoRenderError("visual timeline does not match final audio duration")
+    return timeline, sample_rate, expected_frames
+
+
 def build_visual_timeline(
     semantic_manifest: dict[str, Any],
 ) -> tuple[list[VisualTimelineSegment], int, int]:
     """Translate the final audio manifest into source-motion/frame-hold spans."""
+
+    if semantic_manifest.get("planner") == "authoritative_single_pass_boundary_plan_v1":
+        return _build_single_pass_visual_timeline(semantic_manifest)
 
     sample_rate = _integer(
         semantic_manifest.get("source_sample_rate"),
@@ -334,36 +412,45 @@ def load_visual_timeline(
     int,
     int,
 ]:
-    """Load final/semantic manifests and build their validated visual timeline."""
+    """Load the sealed single-pass boundary plan and its visual timeline."""
 
     final_render_manifest_path = final_render_manifest_path.resolve()
     final = _object(final_render_manifest_path, description="final render manifest")
     if final.get("status") != "complete":
         raise VideoRenderError("video rendering requires a complete final render")
-    semantic_value = final.get("semantic_pause_manifest")
-    if not isinstance(semantic_value, str) or not semantic_value:
-        raise VideoRenderError("final render has no semantic-pause manifest")
-    semantic_path = Path(semantic_value).resolve()
-    if not semantic_path.is_file():
-        raise FileNotFoundError(semantic_path)
-    semantic = _object(semantic_path, description="semantic-pause manifest")
-    expected_semantic_sha = final.get("semantic_pause_manifest_sha256")
-    if not isinstance(expected_semantic_sha, str):
-        raise VideoRenderError("final render does not seal its semantic-pause manifest")
-    if sha256_file(semantic_path) != expected_semantic_sha:
-        raise VideoRenderError("semantic-pause manifest changed after final rendering")
-    if "clip_joins" in final and final["clip_joins"] != semantic.get("clip_joins"):
-        raise VideoRenderError(
-            "semantic-pause clip joins do not match the published final manifest"
-        )
-    if "final_boundary" in final and final["final_boundary"] != semantic.get(
+    boundary_value = final.get("final_boundary_plan")
+    if not isinstance(boundary_value, str) or not boundary_value:
+        raise VideoRenderError("final render has no authoritative boundary plan")
+    boundary_path = Path(boundary_value).resolve()
+    if not boundary_path.is_file():
+        raise FileNotFoundError(boundary_path)
+    boundary_plan = _object(boundary_path, description="final boundary plan")
+    expected_boundary_sha = final.get("final_boundary_plan_sha256")
+    if not isinstance(expected_boundary_sha, str):
+        raise VideoRenderError("final render does not seal its boundary plan")
+    if sha256_file(boundary_path) != expected_boundary_sha:
+        raise VideoRenderError("final boundary plan changed after audio rendering")
+    if boundary_plan.get("status") != "safe":
+        raise VideoRenderError("video rendering requires a safe boundary plan")
+    if "clip_joins" in final:
+        planned_joins = [
+            join
+            for join in boundary_plan.get("joins", [])
+            if isinstance(join, dict)
+            and join.get("join_kind") == "source_discontinuity"
+        ]
+        if final["clip_joins"] != planned_joins:
+            raise VideoRenderError(
+                "boundary-plan joins do not match the published final manifest"
+            )
+    if "final_boundary" in final and final["final_boundary"] != boundary_plan.get(
         "final_boundary"
     ):
         raise VideoRenderError(
-            "semantic-pause final boundary does not match the published final manifest"
+            "boundary-plan final endpoint does not match the final manifest"
         )
-    timeline, sample_rate, expected_frames = build_visual_timeline(semantic)
-    return final, semantic, timeline, sample_rate, expected_frames
+    timeline, sample_rate, expected_frames = build_visual_timeline(boundary_plan)
+    return final, boundary_plan, timeline, sample_rate, expected_frames
 
 
 def _video_codec_arguments(extension: str) -> list[str]:
@@ -485,7 +572,7 @@ def render_edited_video(
 
     (
         final,
-        semantic,
+        boundary_plan,
         timeline,
         sample_rate,
         expected_frames,
@@ -653,10 +740,8 @@ def render_edited_video(
         "final_render_manifest_sha256": sha256_file(
             final_render_manifest_path.resolve()
         ),
-        "semantic_pause_manifest": final["semantic_pause_manifest"],
-        "semantic_pause_manifest_sha256": sha256_file(
-            Path(final["semantic_pause_manifest"])
-        ),
+        "final_boundary_plan": final["final_boundary_plan"],
+        "final_boundary_plan_sha256": sha256_file(Path(final["final_boundary_plan"])),
         "final_audio": str(final_audio),
         "final_audio_sha256": sha256_file(final_audio),
         "output_video": str(output_path),
@@ -680,6 +765,7 @@ def render_edited_video(
             segment.freeze_after_samples for segment in timeline
         )
         / sample_rate,
+        "boundary_plan_renderer": boundary_plan.get("planner"),
     }
     write_json(resolved_manifest_path, manifest)
     return manifest

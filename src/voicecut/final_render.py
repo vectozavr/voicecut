@@ -3037,14 +3037,27 @@ def render_boundary_plan(
                 continue
             source_start = int(segment["source_start_sample"])
             source_end = int(segment["source_end_sample"])
-            if source_start <= protected_start and source_end >= protected_end:
+            # The same retained word can be aligned in independent contexts at
+            # its leading and trailing cuts.  MFA emits float32 interval times,
+            # so conservative sample rounding can make those contexts disagree
+            # by one sample even though their continuous-time phone edge is the
+            # same.  Accept only that documented rounding tolerance; larger
+            # omissions still prove that retained speech disappeared.
+            if (
+                source_start <= protected_start + MFA_SAMPLE_ROUNDING_OVERLAP
+                and source_end >= protected_end - MFA_SAMPLE_ROUNDING_OVERLAP
+            ):
+                mapped_start = max(source_start, protected_start)
+                mapped_end = min(source_end, protected_end)
+                if mapped_end <= mapped_start:
+                    continue
                 output_start = int(segment["output_start_sample"]) + (
-                    protected_start - source_start
+                    mapped_start - source_start
                 )
-                output_end = output_start + protected_end - protected_start
+                output_end = output_start + mapped_end - mapped_start
                 if not np.array_equal(
                     rendered_audio[output_start:output_end],
-                    source_audio[protected_start:protected_end],
+                    source_audio[mapped_start:mapped_end],
                 ):
                     raise FinalRenderError(
                         "retained aligned speech changed during single-pass render"

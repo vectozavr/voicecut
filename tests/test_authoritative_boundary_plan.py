@@ -5,14 +5,17 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.final_render import (
+    FinalRenderError,
     _alignment_event_specs,
     _prepare_alignment_jobs,
     _ranges_from_selection,
     _thought_bounds,
+    render_boundary_plan,
     render_final_cut,
 )
 from voicecut.mfa_alignment import MFA_MODEL_ID, MFA_VERSION, normalize_mfa_token
@@ -550,6 +553,62 @@ def test_overlapping_whisper_timestamps_are_not_clamped_into_speech(
     assert right["selected_source_sample"] <= 1100
     assert left["whisper_timestamps"]["retained_end_seconds"] == 0.70
     assert left["aligned_timestamps"]["retained_end_seconds"] == 0.50
+
+
+def test_single_render_accepts_only_one_sample_cross_context_rounding(
+    tmp_path: Path,
+) -> None:
+    source = _source(2200)
+    _speech(source, 100, 400, 173.0)
+    _speech(source, 600, 1000, 191.0)
+    _speech(source, 1000, 1400, 211.0)
+    words = [
+        {"id": 0, "text": "removed", "start": 0.10, "end": 0.40},
+        {"id": 1, "text": "retained", "start": 0.60, "end": 1.00},
+        {"id": 2, "text": "discarded", "start": 1.00, "end": 1.40},
+    ]
+    manifest, plan, _, audio_path = _render(
+        tmp_path,
+        source=source,
+        words=words,
+        thought_ranges=[[(1, 2)]],
+        spans=[(0.10, 0.40), (0.60, 1.00), (1.00, 1.40)],
+    )
+    leading = _boundary(plan, "omitted_to_selected")
+    retained = next(
+        interval
+        for interval in leading["protected_speech_intervals"]
+        if interval["role"] == "first_retained_right"
+    )
+    source_segment = next(
+        segment for segment in plan["output_segments"] if segment["kind"] == "source"
+    )
+    retained["end_sample"] = source_segment["source_end_sample"] + 1
+    retained["end_seconds"] = retained["end_sample"] / SAMPLE_RATE
+    mutated_plan = tmp_path / "one_sample_rounding_boundary_plan.json"
+    write_json(mutated_plan, plan)
+
+    result = render_boundary_plan(
+        audio_path=audio_path,
+        boundary_plan_path=mutated_plan,
+        output_path=tmp_path / "one_sample_rounding.wav",
+    )
+
+    assert result["frame_count"] == plan["expected_output_frame_count"]
+    assert Path(manifest["final_cut_wav"]).is_file()
+
+    retained["end_sample"] += 1
+    retained["end_seconds"] = retained["end_sample"] / SAMPLE_RATE
+    write_json(mutated_plan, plan)
+    with pytest.raises(
+        FinalRenderError,
+        match="retained aligned speech is absent from output trace",
+    ):
+        render_boundary_plan(
+            audio_path=audio_path,
+            boundary_plan_path=mutated_plan,
+            output_path=tmp_path / "two_sample_gap_must_fail.wav",
+        )
 
 
 def test_semantic_pause_inside_contiguous_range_uses_aligned_quiet_gap(

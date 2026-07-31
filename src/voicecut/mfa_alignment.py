@@ -43,6 +43,7 @@ DEFAULT_MFA_CACHE_ROOT = REPOSITORY_ROOT / ".voicecut-cache" / "runtime" / "mfa"
 _VERSION_RE = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)*")
 _SILENCE_PHONES = frozenset({"", "<eps>", "sil", "silence", "sp"})
+_SILENCE_WORD_LABELS = frozenset({"", "<eps>"})
 
 
 class MFAAlignmentError(RuntimeError):
@@ -166,7 +167,10 @@ def is_mfa_silence_phone(phone: str) -> bool:
 
 
 def _is_mfa_silence_word(word: str) -> bool:
-    return str(word).strip().casefold() in _SILENCE_PHONES
+    # MFA uses ``<eps>`` for non-lexical intervals in the word tier.  Phone
+    # labels such as ``sil`` and ``silence`` are deliberately *not* reused
+    # here: ``silence`` can be an ordinary spoken source token.
+    return str(word).strip().casefold() in _SILENCE_WORD_LABELS
 
 
 def _normalize_mfa_token_piece(value: str) -> list[str]:

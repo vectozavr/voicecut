@@ -259,6 +259,42 @@ def test_parse_mfa_json_maps_repeated_words_sequentially_and_preserves_phones(
     assert context["phones"][0]["is_silence"] is True
 
 
+def test_parse_mfa_json_keeps_lexical_word_silence(tmp_path: Path) -> None:
+    paths = _prepare(
+        tmp_path,
+        words=[
+            _word(12, "ordinary", 0.6, 0.9),
+            _word(13, "silence", 0.9, 1.3),
+        ],
+    )
+    _write_mfa_json(
+        paths,
+        word_entries=[
+            [0.0, 0.20, "<eps>"],
+            [0.20, 0.55, "ordinary"],
+            [0.55, 0.95, "silence"],
+            [0.95, 2.0, "<eps>"],
+        ],
+        phone_entries=[
+            [0.0, 0.20, "sil"],
+            [0.20, 0.35, "AO1"],
+            [0.35, 0.55, "IY0"],
+            [0.55, 0.65, "S"],
+            [0.65, 0.78, "AY1"],
+            [0.78, 0.95, "S"],
+            [0.95, 2.0, "sil"],
+        ],
+    )
+
+    context = parse_mfa_batch(paths)["contexts"][0]
+
+    assert [word["mfa_token"] for word in context["words"]] == [
+        "ordinary",
+        "silence",
+    ]
+    assert source_word_alignment(context, 13)["last_non_silence_phone"]["phone"] == "S"
+
+
 def test_parse_mfa_json_converts_crop_relative_times_to_absolute_samples(
     tmp_path: Path,
 ) -> None:

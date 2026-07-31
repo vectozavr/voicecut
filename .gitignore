@@ -3,10 +3,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 build/
 dist/
+.env
 
 .venv/
 .venv-*/
@@ -21,9 +23,28 @@ venv/
 *.flac
 *.aac
 *.ogg
+*.oga
+*.opus
+*.aif
+*.aiff
+*.mp4
+*.mov
+*.mkv
+*.webm
 
 !tests/fixtures/
 !tests/fixtures/**
 
 narration_run*/
 runs/
+.voicecut-cache/
+
+# Local development/validation artifacts are never product source.
+.codex_tmp/
+validation/
+notebooks/output/
+*_out/
+*_out_*/
+*_run*/
+sample_cut_run*/
+example_no_script_*/

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Waveform, VAD, atom, and room-tone analysis for narration recordings."""
+"""Split a narration waveform into non-overlapping transcription atoms."""
 
 from __future__ import annotations
 
@@ -33,26 +33,14 @@ def load_mono(path: Path) -> tuple[np.ndarray, int, int]:
     return mono, int(sample_rate), int(channels)
 
 
-def frame_features(audio: np.ndarray, frame_samples: int) -> dict[str, np.ndarray]:
+def frame_rms_db(audio: np.ndarray, frame_samples: int) -> np.ndarray:
+    """Compute the only frame feature required for VAD atom construction."""
+
     frame_count = math.ceil(len(audio) / frame_samples)
     padded = np.pad(audio, (0, frame_count * frame_samples - len(audio)))
     framed = padded.reshape(frame_count, frame_samples)
     rms = np.sqrt(np.mean(np.square(framed, dtype=np.float64), axis=1))
-    rms_db = 20.0 * np.log10(np.maximum(rms, 1e-10))
-    peak = np.max(np.abs(framed), axis=1)
-    peak_db = 20.0 * np.log10(np.maximum(peak, 1e-10))
-    if frame_samples > 1:
-        zcr = np.mean(
-            np.signbit(framed[:, 1:]) != np.signbit(framed[:, :-1]), axis=1
-        )
-    else:
-        zcr = np.zeros(frame_count, dtype=np.float64)
-    return {
-        "rms_db": rms_db.astype(np.float32),
-        "peak": peak.astype(np.float32),
-        "peak_db": peak_db.astype(np.float32),
-        "zcr": zcr.astype(np.float32),
-    }
+    return (20.0 * np.log10(np.maximum(rms, 1e-10))).astype(np.float32)
 
 
 def silero_mask(
@@ -168,9 +156,7 @@ def build_atoms(
     for index, (start_frame, end_frame) in enumerate(raw_regions):
         previous_end = raw_regions[index - 1][1] if index else 0
         next_start = (
-            raw_regions[index + 1][0]
-            if index + 1 < len(raw_regions)
-            else len(rms_db)
+            raw_regions[index + 1][0] if index + 1 < len(raw_regions) else len(rms_db)
         )
         left_limit = (previous_end + start_frame) // 2
         right_limit = (end_frame + next_start) // 2
@@ -194,74 +180,6 @@ def build_atoms(
     return atoms
 
 
-def choose_room_tone(
-    *,
-    rms_db: np.ndarray,
-    peak_db: np.ndarray,
-    vad_mask: np.ndarray,
-    noise_floor_db: float,
-    frame_samples: int,
-    sample_rate: int,
-    total_samples: int,
-    count: int = 6,
-) -> list[dict[str, float | int]]:
-    frame_seconds = frame_samples / sample_rate
-    guard_frames = max(1, round(0.18 / frame_seconds))
-    no_speech = ~binary_dilation(vad_mask, structure=np.ones(guard_frames))
-
-    def candidates(extra_db: float, minimum_seconds: float) -> list[tuple[float, int, int]]:
-        quiet = (
-            no_speech
-            & (rms_db <= noise_floor_db + extra_db)
-            & (peak_db <= max(-38.0, noise_floor_db + 16.0))
-        )
-        minimum_frames = max(1, round(minimum_seconds / frame_seconds))
-        rows: list[tuple[float, int, int]] = []
-        for start, end in true_runs(quiet):
-            if end - start < minimum_frames:
-                continue
-            window_frames = min(end - start, max(minimum_frames, round(1.1 / frame_seconds)))
-            for offset in range(start, end - window_frames + 1, max(1, window_frames // 2)):
-                finish = offset + window_frames
-                local = rms_db[offset:finish]
-                stationarity = float(np.std(local))
-                level_distance = abs(float(np.mean(local)) - noise_floor_db)
-                score = stationarity + 0.12 * level_distance
-                rows.append((score, offset, finish))
-        return rows
-
-    rows = candidates(5.0, 0.55)
-    if not rows:
-        rows = candidates(9.0, 0.30)
-    rows.sort()
-
-    selected: list[tuple[float, int, int]] = []
-    minimum_separation = round(5.0 / frame_seconds)
-    for row in rows:
-        _, start, end = row
-        center = (start + end) // 2
-        if any(abs(center - (a + b) // 2) < minimum_separation for _, a, b in selected):
-            continue
-        selected.append(row)
-        if len(selected) >= count:
-            break
-    result: list[dict[str, float | int]] = []
-    for score, start_frame, end_frame in sorted(selected, key=lambda item: item[1]):
-        start_sample = start_frame * frame_samples
-        end_sample = min(total_samples, end_frame * frame_samples)
-        result.append(
-            {
-                "start_sample": start_sample,
-                "end_sample": end_sample,
-                "start": start_sample / sample_rate,
-                "end": end_sample / sample_rate,
-                "rms_db": float(np.mean(rms_db[start_frame:end_frame])),
-                "stationarity_score": score,
-            }
-        )
-    return result
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio", type=Path, required=True)
@@ -273,15 +191,17 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     audio, sample_rate, channels = load_mono(args.audio)
+    if not len(audio):
+        parser.error("audio file contains no samples")
     frame_samples = max(1, round(sample_rate * args.frame_ms / 1000.0))
-    features = frame_features(audio, frame_samples)
-    finite_rms = features["rms_db"][np.isfinite(features["rms_db"])]
+    rms_db = frame_rms_db(audio, frame_samples)
+    finite_rms = rms_db[np.isfinite(rms_db)]
     noise_floor_db = float(np.percentile(finite_rms, 12.0))
     vad_mask, vad_regions = silero_mask(
         audio, sample_rate, frame_samples, args.vad_threshold
     )
     atoms = build_atoms(
-        rms_db=features["rms_db"],
+        rms_db=rms_db,
         vad_mask=vad_mask,
         noise_floor_db=noise_floor_db,
         frame_samples=frame_samples,
@@ -289,26 +209,6 @@ def main() -> None:
         total_samples=len(audio),
         max_atom_seconds=args.max_atom_seconds,
     )
-    room_tone = choose_room_tone(
-        rms_db=features["rms_db"],
-        peak_db=features["peak_db"],
-        vad_mask=vad_mask,
-        noise_floor_db=noise_floor_db,
-        frame_samples=frame_samples,
-        sample_rate=sample_rate,
-        total_samples=len(audio),
-    )
-
-    feature_path = args.output_dir / "waveform_features.npz"
-    np.savez_compressed(
-        feature_path,
-        rms_db=features["rms_db"],
-        peak=features["peak"],
-        peak_db=features["peak_db"],
-        zcr=features["zcr"],
-        vad_mask=vad_mask.astype(np.uint8),
-    )
-    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
     result = {
         "schema_version": 1,
         "audio": str(args.audio.resolve()),
@@ -321,15 +221,9 @@ def main() -> None:
         "frame_ms": args.frame_ms,
         "noise_floor_db": noise_floor_db,
         "activity_threshold_db": float(np.clip(noise_floor_db + 17.0, -56.0, -34.0)),
-        "peak": peak,
-        "clip_sample_count": int(np.sum(np.abs(audio) >= 0.999)),
-        "dc_offset": float(np.mean(audio)) if len(audio) else 0.0,
         "vad_threshold": args.vad_threshold,
         "vad_regions": vad_regions,
         "atoms": atoms,
-        "room_tone_regions": room_tone,
-        "room_tone_status": "validated_source" if room_tone else "unavailable",
-        "features": str(feature_path.resolve()),
     }
     write_json(args.output_dir / "analysis.json", result)
     print(
@@ -341,8 +235,6 @@ def main() -> None:
                 "noise_floor_db": noise_floor_db,
                 "vad_regions": len(vad_regions),
                 "atoms": len(atoms),
-                "room_tone_regions": len(room_tone),
-                "clip_sample_count": result["clip_sample_count"],
             },
             indent=2,
         )

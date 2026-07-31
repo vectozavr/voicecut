@@ -4,19 +4,57 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voicecut"
-version = "0.1.0"
-description = "Local, script-aware editing and mastering for retake-heavy narration"
+version = "0.2.0"
+description = "Semantic, source-grounded editing for retake-heavy narration"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = { file = "LICENSE" }
 authors = [{ name = "VoiceCut contributors" }]
-keywords = ["audio", "narration", "speech", "whisper", "voice-over"]
+keywords = [
+  "audio",
+  "video",
+  "narration",
+  "speech",
+  "whisper",
+  "voice-over",
+]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: Multimedia :: Sound/Audio :: Speech",
+  "Topic :: Multimedia :: Video",
+]
+
+[project.optional-dependencies]
+audio = [
+  "numpy==2.4.6",
+  "scipy==1.17.1",
+  "soundfile==0.14.0",
+  "torch==2.8.0",
+  "torchaudio==2.8.0",
+  "whisperx==3.8.6",
+  "silero-vad==6.2.1",
+  "librosa==0.11.0",
+  "matplotlib>=3.10.0,<4",
+]
+mlx = [
+  "numpy==2.4.6",
+  "mlx==0.32.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-lm==0.31.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-whisper==0.4.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+cloud = [
+  "google-genai>=1.64.0,<2",
+  "openai>=1.68.0,<3",
+  "python-dotenv>=1.1.0,<2",
+]
+dev = [
+  "build>=1.2.2,<2",
+  "pytest>=8.4.0,<9",
+  "ruff>=0.12.0,<1",
 ]
 
 [project.urls]
@@ -24,30 +62,18 @@ Homepage = "https://github.com/vectozavr/voicecut"
 Repository = "https://github.com/vectozavr/voicecut"
 Issues = "https://github.com/vectozavr/voicecut/issues"
 
-[project.optional-dependencies]
-audio = [
-  "numpy==2.4.6",
-  "scipy==1.17.1",
-  "soundfile==0.14.0",
-  "rapidfuzz==3.14.5",
-  "torch==2.8.0",
-  "torchaudio==2.8.0",
-  "whisperx==3.8.6",
-  "faster-whisper==1.2.1",
-  "silero-vad==6.2.1",
-  "librosa==0.11.0",
-]
-mlx = [
-  "mlx==0.32.0",
-  "mlx-whisper==0.4.3",
-  "numpy==2.4.6",
-]
-
 [project.scripts]
-voicecut = "voicecut.pipeline:main"
+voicecut = "voicecut.full_pipeline:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88

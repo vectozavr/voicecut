@@ -1,3 +1,0 @@
-mlx==0.32.0
-mlx-whisper==0.4.3
-numpy==2.4.6

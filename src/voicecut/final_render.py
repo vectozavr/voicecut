@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from statistics import median
 from typing import Any, Sequence
@@ -17,6 +18,22 @@ from typing import Any, Sequence
 import numpy as np
 import soundfile as sf
 
+from .breath_cleanup import (
+    BREATH_EVENT_GUARD_MS,
+    BREATH_TRANSITION_MS,
+    breath_room_tone_exclusions,
+    plan_breath_replacements,
+)
+from .breath_detection import (
+    DEFAULT_BREATH_MIN_DURATION_MS,
+    DEFAULT_BREATH_THRESHOLD,
+    DEFAULT_RESPIRO_CACHE_ROOT,
+    RESPIRO_CHECKPOINT_SHA256,
+    RESPIRO_FRAME_HOP_MS,
+    RESPIRO_UPSTREAM_COMMIT,
+    BreathDetectionError,
+    analyze_breath_evidence,
+)
 from .common import read_json, sha256_file, write_json
 from .mfa_alignment import (
     DEFAULT_MFA_CACHE_ROOT,
@@ -47,6 +64,7 @@ from .rough_render import (
 from .semantic_pause import (
     PAUSE_TARGETS_MS,
     ROOM_TONE_FADE_MS,
+    PausePlanError,
     SourceRoomToneAllocator,
     create_pause_plan,
     refine_eof_tail,
@@ -72,6 +90,8 @@ MIN_RETAINED_EDGE_CHARACTER_SCORE = 0.48
 MIN_RETAINED_EDGE_TO_CONTEXT_RATIO = 0.55
 ALIGNMENT_GEOMETRY_EPSILON_SECONDS = 1e-6
 MFA_SAMPLE_ROUNDING_OVERLAP = 1
+BREATH_CLEANUP_MODES = ("off", "replace")
+BREATH_ALIGNMENT_MIN_GAP_MS = 20.0
 
 
 class FinalRenderError(RuntimeError):
@@ -852,6 +872,7 @@ def _alignment_event_specs(
     words: Sequence[PlanWord],
     ranges: Sequence[MergedRange],
     thought_bounds: Sequence[tuple[int, int]],
+    include_breath_gaps: bool = False,
 ) -> list[dict[str, Any]]:
     """Describe every MFA context needed before any coordinate is selected.
 
@@ -946,6 +967,44 @@ def _alignment_event_specs(
                 },
             }
         )
+    if include_breath_gaps:
+        existing_pairs = {
+            (
+                int(spec["role_word_ids"]["previous_retained"]),
+                int(spec["role_word_ids"]["next_retained"]),
+            )
+            for spec in specs
+            if spec["event_kind"] == "internal_thought_gap"
+        }
+        gap_index = 0
+        for range_index, source_range in enumerate(ranges):
+            for left_word_id in range(
+                source_range.start_word_id,
+                source_range.end_word_id - 1,
+            ):
+                right_word_id = left_word_id + 1
+                if (left_word_id, right_word_id) in existing_pairs:
+                    continue
+                approximate_gap_ms = max(
+                    0.0,
+                    (words[right_word_id].start - words[left_word_id].end) * 1000.0,
+                )
+                if approximate_gap_ms < BREATH_ALIGNMENT_MIN_GAP_MS:
+                    continue
+                specs.append(
+                    {
+                        "event_key": f"breath_retained_gap_{gap_index:04d}",
+                        "event_kind": "breath_retained_gap",
+                        "range_index": range_index,
+                        "approximate_gap_ms": approximate_gap_ms,
+                        "completeness_required": False,
+                        "role_word_ids": {
+                            "previous_retained": left_word_id,
+                            "next_retained": right_word_id,
+                        },
+                    }
+                )
+                gap_index += 1
     return specs
 
 
@@ -1995,6 +2054,622 @@ def _validated_mfa_contexts(
     return context_by_id
 
 
+def _selected_word_ids(ranges: Sequence[MergedRange]) -> set[int]:
+    return {
+        word_id
+        for source_range in ranges
+        for word_id in range(
+            source_range.start_word_id,
+            source_range.end_word_id,
+        )
+    }
+
+
+def _retained_mfa_phone_mask(
+    *,
+    mfa_contexts: Sequence[dict[str, Any]],
+    source_intervals: Sequence[dict[str, Any]],
+    selected_word_ids: set[int],
+    sample_rate: int,
+    total_samples: int,
+) -> list[dict[str, Any]]:
+    """Protect every MFA non-silence phone intersecting retained source."""
+
+    margin = round(PROTECTED_SPEECH_MARGIN_MS * sample_rate / 1000.0)
+    mask: list[dict[str, Any]] = []
+    seen: set[tuple[int, tuple[int, ...], str, int, int, int, int]] = set()
+    for context in mfa_contexts:
+        context_id = str(context.get("context_id", ""))
+        aligned_words = [
+            word for word in context.get("words", []) if isinstance(word, dict)
+        ]
+        for phone in context.get("phones", []):
+            if not isinstance(phone, dict) or bool(phone.get("is_silence")):
+                continue
+            phone_start = seconds_to_sample(
+                float(phone["start_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            phone_end = seconds_to_sample(
+                float(phone["end_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            if not 0 <= phone_start < phone_end <= total_samples:
+                raise FinalRenderError("retained MFA phone has invalid geometry")
+            mapped_ids: set[int] = set()
+            for aligned_word in aligned_words:
+                word_ids = {
+                    int(value)
+                    for value in aligned_word.get("source_word_ids", [])
+                    if type(value) is int and int(value) in selected_word_ids
+                }
+                if not word_ids:
+                    continue
+                for word_phone in aligned_word.get("phones", []):
+                    if not isinstance(word_phone, dict):
+                        continue
+                    word_phone_start = seconds_to_sample(
+                        float(word_phone["start_seconds"]),
+                        sample_rate,
+                        boundary="ceil",
+                    )
+                    word_phone_end = seconds_to_sample(
+                        float(word_phone["end_seconds"]),
+                        sample_rate,
+                        boundary="ceil",
+                    )
+                    if (
+                        str(word_phone.get("phone", "")) == str(phone.get("phone", ""))
+                        and abs(word_phone_start - phone_start)
+                        <= MFA_SAMPLE_ROUNDING_OVERLAP
+                        and abs(word_phone_end - phone_end)
+                        <= MFA_SAMPLE_ROUNDING_OVERLAP
+                    ):
+                        mapped_ids.update(word_ids)
+            retained_ids = tuple(sorted(mapped_ids))
+            for interval in source_intervals:
+                interval_start = int(interval["source_start_sample"])
+                interval_end = int(interval["source_end_sample"])
+                if not _intervals_overlap(
+                    phone_start,
+                    phone_end,
+                    interval_start,
+                    interval_end,
+                ):
+                    continue
+                protected_start = max(interval_start, phone_start - margin)
+                protected_end = min(interval_end, phone_end + margin)
+                interval_index = int(interval["source_interval_index"])
+                key = (
+                    interval_index,
+                    retained_ids,
+                    str(phone.get("phone", "")),
+                    phone_start,
+                    phone_end,
+                    protected_start,
+                    protected_end,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                mask.append(
+                    {
+                        "source_interval_index": interval_index,
+                        "source_word_ids": list(retained_ids),
+                        "phone": str(phone.get("phone", "")),
+                        "phone_start_sample": phone_start,
+                        "phone_end_sample": phone_end,
+                        "start_sample": protected_start,
+                        "end_sample": protected_end,
+                        "protected_margin_ms": PROTECTED_SPEECH_MARGIN_MS,
+                        "alignment_backend": "mfa",
+                        "context_ids": [context_id],
+                        "source_word_mapping": (
+                            "mapped_retained_word"
+                            if retained_ids
+                            else "context_non_silence_phone"
+                        ),
+                    }
+                )
+    return sorted(
+        mask,
+        key=lambda item: (
+            int(item["start_sample"]),
+            int(item["end_sample"]),
+            str(item["phone"]),
+        ),
+    )
+
+
+def _collect_mfa_non_silence_source_spans(
+    *,
+    mfa_contexts: Sequence[dict[str, Any]],
+    sample_rate: int,
+    total_samples: int,
+) -> list[dict[str, Any]]:
+    """Union every context-level MFA non-silence phone in source time."""
+
+    raw: list[tuple[int, int, str, str]] = []
+    for context in mfa_contexts:
+        context_id = str(context.get("context_id", ""))
+        for phone in context.get("phones", []):
+            if not isinstance(phone, dict) or bool(phone.get("is_silence")):
+                continue
+            start = max(
+                0,
+                seconds_to_sample(
+                    float(phone["start_seconds"]),
+                    sample_rate,
+                    boundary="ceil",
+                ),
+            )
+            end = min(
+                total_samples,
+                seconds_to_sample(
+                    float(phone["end_seconds"]),
+                    sample_rate,
+                    boundary="ceil",
+                ),
+            )
+            if end > start:
+                raw.append((start, end, context_id, str(phone.get("phone", ""))))
+    merged: list[dict[str, Any]] = []
+    for start, end, context_id, phone in sorted(raw):
+        if not merged or start > int(merged[-1]["end_sample"]):
+            merged.append(
+                {
+                    "start_sample": start,
+                    "end_sample": end,
+                    "context_ids": [context_id],
+                    "phones": [phone],
+                    "verification": "mfa_non_silence_phone",
+                }
+            )
+            continue
+        merged[-1]["end_sample"] = max(int(merged[-1]["end_sample"]), end)
+        if context_id not in merged[-1]["context_ids"]:
+            merged[-1]["context_ids"].append(context_id)
+        if phone not in merged[-1]["phones"]:
+            merged[-1]["phones"].append(phone)
+    return merged
+
+
+def _mfa_gap_evidence(
+    *,
+    jobs: Sequence[dict[str, Any]],
+    mfa_context_by_key: dict[str, dict[str, Any]],
+    source_intervals: Sequence[dict[str, Any]],
+    sample_rate: int,
+) -> list[dict[str, Any]]:
+    """Return retained gaps that MFA proves contain no non-silence phone."""
+
+    evidence: list[dict[str, Any]] = []
+    for job in jobs:
+        if job["event_kind"] not in {
+            "breath_retained_gap",
+            "internal_thought_gap",
+        }:
+            continue
+        context_id = str(job["event_key"])
+        context = mfa_context_by_key.get(context_id)
+        if context is None:
+            continue
+        role_ids = job["role_word_ids"]
+        previous_id = int(role_ids["previous_retained"])
+        next_id = int(role_ids["next_retained"])
+        try:
+            previous = source_word_alignment(context, previous_id)
+            following = source_word_alignment(context, next_id)
+            previous_end = seconds_to_sample(
+                float(previous["last_non_silence_phone"]["end_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            following_start = seconds_to_sample(
+                float(following["first_non_silence_phone"]["start_seconds"]),
+                sample_rate,
+                boundary="ceil",
+            )
+            non_speech = _mfa_non_speech_interval(
+                context=context,
+                start_sample=previous_end,
+                end_sample=following_start,
+                sample_rate=sample_rate,
+            )
+        except (MFAAlignmentError, KeyError, TypeError, ValueError):
+            continue
+        if non_speech is None:
+            continue
+        interval = source_intervals[int(job["range_index"])]
+        start = max(
+            int(non_speech["start_sample"]),
+            int(interval["source_start_sample"]),
+        )
+        end = min(
+            int(non_speech["end_sample"]),
+            int(interval["source_end_sample"]),
+        )
+        if end <= start:
+            continue
+        evidence.append(
+            {
+                "start_sample": start,
+                "end_sample": end,
+                "source_interval_index": int(interval["source_interval_index"]),
+                "context_id": context_id,
+                "previous_word_id": previous_id,
+                "next_word_id": next_id,
+                "verification": "mfa_phone_free_interval",
+            }
+        )
+    return evidence
+
+
+def _mfa_silence_source_spans(
+    *,
+    mfa_contexts: Sequence[dict[str, Any]],
+    non_silence_spans: Sequence[dict[str, Any]],
+    sample_rate: int,
+    total_samples: int,
+) -> list[dict[str, Any]]:
+    """Collect explicit MFA silence phones as verified room-tone candidates."""
+
+    raw: list[tuple[int, int, str]] = []
+    for context in mfa_contexts:
+        context_id = str(context.get("context_id", ""))
+        for phone in context.get("phones", []):
+            if not isinstance(phone, dict) or not bool(phone.get("is_silence")):
+                continue
+            start = max(
+                0,
+                seconds_to_sample(
+                    float(phone["start_seconds"]),
+                    sample_rate,
+                    boundary="ceil",
+                ),
+            )
+            end = min(
+                total_samples,
+                seconds_to_sample(
+                    float(phone["end_seconds"]),
+                    sample_rate,
+                    boundary="ceil",
+                ),
+            )
+            if end > start:
+                raw.append((start, end, context_id))
+    safe_raw: list[tuple[int, int, str]] = []
+    exclusions = [
+        (int(item["start_sample"]), int(item["end_sample"]))
+        for item in non_silence_spans
+    ]
+    for start, end, context_id in raw:
+        safe_raw.extend(
+            (safe_start, safe_end, context_id)
+            for safe_start, safe_end in _subtract_sample_intervals(
+                [(start, end)],
+                exclusions,
+            )
+        )
+    merged: list[dict[str, Any]] = []
+    for start, end, context_id in sorted(safe_raw):
+        if not merged or start > int(merged[-1]["end_sample"]):
+            merged.append(
+                {
+                    "start_sample": start,
+                    "end_sample": end,
+                    "context_ids": [context_id],
+                    "verification": "mfa_silence_phone",
+                }
+            )
+            continue
+        merged[-1]["end_sample"] = max(int(merged[-1]["end_sample"]), end)
+        if context_id not in merged[-1]["context_ids"]:
+            merged[-1]["context_ids"].append(context_id)
+    return merged
+
+
+def _subtract_sample_intervals(
+    spans: Sequence[tuple[int, int]],
+    exclusions: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    remaining = list(spans)
+    for excluded_start, excluded_end in sorted(exclusions):
+        next_remaining: list[tuple[int, int]] = []
+        for start, end in remaining:
+            overlap_start = max(start, excluded_start)
+            overlap_end = min(end, excluded_end)
+            if overlap_end <= overlap_start:
+                next_remaining.append((start, end))
+                continue
+            if start < overlap_start:
+                next_remaining.append((start, overlap_start))
+            if overlap_end < end:
+                next_remaining.append((overlap_end, end))
+        remaining = next_remaining
+    return remaining
+
+
+def _suppress_fades_over_protected_speech(
+    *,
+    boundaries: Sequence[dict[str, Any]],
+    joins: Sequence[dict[str, Any]],
+    protected_speech_mask: Sequence[dict[str, Any]],
+) -> None:
+    """Remove any fade that conflicts with the authoritative MFA mask.
+
+    Boundary-local alignment contexts can expose a slightly larger quiet
+    handle than another context for the same retained phone.  The union mask
+    is authoritative.  Shortening a ramp would change its gain geometry, so
+    the conservative operation is to suppress the whole fade before the plan
+    becomes immutable.
+    """
+
+    for owner in [*boundaries, *joins]:
+        fades = owner.get("fade_intervals", [])
+        if not isinstance(fades, list) or not fades:
+            continue
+        safe: list[dict[str, Any]] = []
+        suppressed: list[dict[str, Any]] = []
+        for raw_fade in fades:
+            fade = dict(raw_fade)
+            overlaps = [
+                {
+                    "source_word_ids": list(interval.get("source_word_ids", [])),
+                    "phone": interval.get("phone"),
+                    "start_sample": int(interval["start_sample"]),
+                    "end_sample": int(interval["end_sample"]),
+                }
+                for interval in protected_speech_mask
+                if _intervals_overlap(
+                    int(fade["source_start_sample"]),
+                    int(fade["source_end_sample"]),
+                    int(interval["start_sample"]),
+                    int(interval["end_sample"]),
+                )
+            ]
+            if overlaps:
+                suppressed.append(
+                    {
+                        **fade,
+                        "reason": "mfa_protected_speech_or_margin_overlap",
+                        "protected_intersections": overlaps,
+                    }
+                )
+            else:
+                safe.append(fade)
+        owner["fade_intervals"] = safe
+        if suppressed:
+            owner.setdefault("suppressed_fade_intervals", []).extend(suppressed)
+
+
+def _editable_non_speech_intervals(
+    *,
+    gap_evidence: Sequence[dict[str, Any]],
+    source_intervals: Sequence[dict[str, Any]],
+    boundaries: Sequence[dict[str, Any]],
+    joins: Sequence[dict[str, Any]],
+    protected_speech_mask: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Union only MFA-confirmed gaps that are physically retained in output."""
+
+    boundary_by_id = {str(item["boundary_id"]): item for item in boundaries}
+    candidates: list[dict[str, Any]] = [dict(item) for item in gap_evidence]
+    for interval in source_intervals:
+        interval_start = int(interval["source_start_sample"])
+        interval_end = int(interval["source_end_sample"])
+        for boundary_key in ("start_boundary_id", "end_boundary_id"):
+            boundary = boundary_by_id[str(interval[boundary_key])]
+            quiet = boundary.get("verified_quiet_interval")
+            if not isinstance(quiet, dict):
+                continue
+            start = max(interval_start, int(quiet["start_sample"]))
+            end = min(interval_end, int(quiet["end_sample"]))
+            if end > start:
+                candidates.append(
+                    {
+                        "start_sample": start,
+                        "end_sample": end,
+                        "source_interval_index": int(interval["source_interval_index"]),
+                        "context_id": boundary.get("mfa_context_id"),
+                        "verification": "mfa_boundary_phone_free_interval",
+                    }
+                )
+
+    split_points_by_interval: dict[int, set[int]] = {}
+    fade_exclusions_by_interval: dict[int, list[tuple[int, int]]] = {}
+    for join in joins:
+        if join.get("join_kind") != "internal_thought_pause":
+            continue
+        interval_index = int(join["source_interval_index"])
+        insertion = join.get("source_insertion_sample")
+        if type(insertion) is int:
+            split_points_by_interval.setdefault(interval_index, set()).add(insertion)
+        for fade in join.get("fade_intervals", []):
+            fade_exclusions_by_interval.setdefault(interval_index, []).append(
+                (
+                    int(fade["source_start_sample"]),
+                    int(fade["source_end_sample"]),
+                )
+            )
+    for interval in source_intervals:
+        interval_index = int(interval["source_interval_index"])
+        for boundary_key in ("start_boundary_id", "end_boundary_id"):
+            boundary = boundary_by_id[str(interval[boundary_key])]
+            for fade in boundary.get("fade_intervals", []):
+                fade_exclusions_by_interval.setdefault(interval_index, []).append(
+                    (
+                        int(fade["source_start_sample"]),
+                        int(fade["source_end_sample"]),
+                    )
+                )
+
+    result: list[dict[str, Any]] = []
+    for interval in source_intervals:
+        interval_index = int(interval["source_interval_index"])
+        raw_spans = sorted(
+            (
+                max(
+                    int(item["start_sample"]),
+                    int(interval["source_start_sample"]),
+                ),
+                min(
+                    int(item["end_sample"]),
+                    int(interval["source_end_sample"]),
+                ),
+            )
+            for item in candidates
+            if int(item["source_interval_index"]) == interval_index
+        )
+        merged: list[list[int]] = []
+        for start, end in raw_spans:
+            if end <= start:
+                continue
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        exclusions = [
+            (int(item["start_sample"]), int(item["end_sample"]))
+            for item in protected_speech_mask
+            if int(item["source_interval_index"]) == interval_index
+        ]
+        exclusions.extend(fade_exclusions_by_interval.get(interval_index, []))
+        safe_spans = _subtract_sample_intervals(
+            [(start, end) for start, end in merged],
+            exclusions,
+        )
+        for split_point in sorted(split_points_by_interval.get(interval_index, set())):
+            safe_spans = [
+                piece
+                for start, end in safe_spans
+                for piece in (
+                    ((start, split_point), (split_point, end))
+                    if start < split_point < end
+                    else ((start, end),)
+                )
+                if piece[1] > piece[0]
+            ]
+        result.extend(
+            {
+                "start_sample": start,
+                "end_sample": end,
+                "source_interval_index": interval_index,
+                "verification": "mfa_confirmed_editable_non_speech",
+            }
+            for start, end in safe_spans
+        )
+    return result
+
+
+def _baseline_room_tone_exclusions(
+    *,
+    protected_speech_mask: Sequence[dict[str, Any]],
+    mfa_non_silence_spans: Sequence[dict[str, Any]],
+    boundaries: Sequence[dict[str, Any]],
+    joins: Sequence[dict[str, Any]],
+    words: Sequence[PlanWord],
+    sample_rate: int,
+    total_samples: int,
+) -> list[dict[str, Any]]:
+    exclusions = [
+        {
+            "start_sample": int(item["start_sample"]),
+            "end_sample": int(item["end_sample"]),
+            "reason": "mfa_non_silence_phone",
+        }
+        for item in mfa_non_silence_spans
+    ]
+    exclusions.extend(
+        {
+            "start_sample": int(item["start_sample"]),
+            "end_sample": int(item["end_sample"]),
+            "reason": "mfa_protected_phone_margin",
+        }
+        for item in protected_speech_mask
+    )
+    for boundary in boundaries:
+        selected = boundary.get("selected_source_sample")
+        if type(selected) is int:
+            exclusions.append(
+                {
+                    "start_sample": max(0, selected - 1),
+                    "end_sample": min(total_samples, selected + 1),
+                    "reason": "cut_transition",
+                }
+            )
+        for word_id in boundary.get("forbidden_word_ids", []):
+            if type(word_id) is not int or not 0 <= word_id < len(words):
+                continue
+            exclusions.append(
+                {
+                    "start_sample": max(
+                        0,
+                        math.floor(words[word_id].start * sample_rate),
+                    ),
+                    "end_sample": min(
+                        total_samples,
+                        math.ceil(words[word_id].end * sample_rate),
+                    ),
+                    "reason": "forbidden_or_weak_word",
+                }
+            )
+    for join in joins:
+        insertion = join.get("source_insertion_sample")
+        if type(insertion) is int:
+            exclusions.append(
+                {
+                    "start_sample": max(0, insertion - 1),
+                    "end_sample": min(total_samples, insertion + 1),
+                    "reason": "cut_transition",
+                }
+            )
+    return exclusions
+
+
+def _validate_breath_payload(
+    payload: dict[str, Any],
+    *,
+    threshold: float,
+    minimum_duration_ms: int,
+    total_samples: int,
+) -> dict[str, Any]:
+    if (
+        payload.get("backend") != "respiro-en"
+        or payload.get("upstream_commit") != RESPIRO_UPSTREAM_COMMIT
+        or payload.get("checkpoint_sha256") != RESPIRO_CHECKPOINT_SHA256
+        or payload.get("frame_hop_ms") != RESPIRO_FRAME_HOP_MS
+    ):
+        raise BreathDetectionError("breath payload has incompatible provenance")
+    if (
+        float(payload.get("threshold", -1.0)) != threshold
+        or int(payload.get("minimum_duration_ms", -1)) != minimum_duration_ms
+    ):
+        raise BreathDetectionError("breath payload has stale detector settings")
+    if payload.get("status") not in {"complete", "no_relevant_regions"}:
+        raise BreathDetectionError("breath payload is incomplete")
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list):
+        raise BreathDetectionError("breath payload contains no event list")
+    previous_end = 0
+    for event in raw_events:
+        if not isinstance(event, dict):
+            raise BreathDetectionError("breath payload contains a malformed event")
+        start = event.get("start_sample")
+        end = event.get("end_sample")
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 0 <= start < end <= total_samples
+            or start < previous_end
+        ):
+            raise BreathDetectionError("breath event geometry is invalid or overlaps")
+        previous_end = end
+    return json.loads(json.dumps(payload))
+
+
 def _room_tone_ranges(
     *,
     allocator: SourceRoomToneAllocator,
@@ -2021,6 +2696,39 @@ def _room_tone_ranges(
     return ranges, allocator.fade_samples
 
 
+def _allocate_semantic_pause_room_tone(
+    *,
+    allocator: SourceRoomToneAllocator,
+    joins: Sequence[dict[str, Any]],
+    source_intervals: Sequence[dict[str, Any]],
+) -> None:
+    """Allocate pause content without changing any resolved source endpoint."""
+
+    for join in joins:
+        join.pop("room_tone_source_ranges", None)
+        join.pop("room_tone_fade_samples", None)
+    for join in sorted(joins, key=lambda item: int(item["join_index"])):
+        frame_count = int(join["inserted_pause_samples"])
+        if frame_count <= 0:
+            continue
+        reference = (
+            int(join["source_insertion_sample"])
+            if join["join_kind"] == "internal_thought_pause"
+            else int(
+                source_intervals[int(join["left_source_interval_index"])][
+                    "source_end_sample"
+                ]
+            )
+        )
+        ranges_payload, room_fade = _room_tone_ranges(
+            allocator=allocator,
+            frame_count=frame_count,
+            reference_sample=reference,
+        )
+        join["room_tone_source_ranges"] = ranges_payload
+        join["room_tone_fade_samples"] = room_fade
+
+
 def _append_source_segment(
     segments: list[dict[str, Any]],
     *,
@@ -2029,6 +2737,7 @@ def _append_source_segment(
     output_cursor: int,
     fades: Sequence[dict[str, Any]],
     source_interval_index: int,
+    breath_replacements: Sequence[dict[str, Any]],
 ) -> int:
     if source_end <= source_start:
         return output_cursor
@@ -2037,6 +2746,12 @@ def _append_source_segment(
         for fade in fades
         if int(fade["source_start_sample"]) >= source_start
         and int(fade["source_end_sample"]) <= source_end
+    ]
+    local_replacements = [
+        json.loads(json.dumps(replacement))
+        for replacement in breath_replacements
+        if int(replacement["target_start_sample"]) >= source_start
+        and int(replacement["target_end_sample"]) <= source_end
     ]
     output_end = output_cursor + source_end - source_start
     segments.append(
@@ -2049,6 +2764,7 @@ def _append_source_segment(
             "output_start_sample": output_cursor,
             "output_end_sample": output_end,
             "gain_envelopes": local_fades,
+            "sample_replacements": local_replacements,
         }
     )
     return output_end
@@ -2107,6 +2823,7 @@ def _build_output_segments(
     source_intervals: list[dict[str, Any]],
     boundaries: Sequence[dict[str, Any]],
     joins: list[dict[str, Any]],
+    breath_replacements: Sequence[dict[str, Any]] = (),
 ) -> list[dict[str, Any]]:
     boundary_by_id = {str(boundary["boundary_id"]): boundary for boundary in boundaries}
     internal_by_interval: dict[int, list[dict[str, Any]]] = {
@@ -2144,6 +2861,7 @@ def _build_output_segments(
                 output_cursor=output_cursor,
                 fades=fades,
                 source_interval_index=interval_index,
+                breath_replacements=breath_replacements,
             )
             pause_start = output_cursor
             output_cursor = _append_room_tone_segments(
@@ -2163,6 +2881,7 @@ def _build_output_segments(
             output_cursor=output_cursor,
             fades=fades,
             source_interval_index=interval_index,
+            breath_replacements=breath_replacements,
         )
         interval["output_end_sample"] = output_cursor
         if interval_index < len(source_intervals) - 1:
@@ -2177,6 +2896,14 @@ def _build_output_segments(
             )
             join["output_pause_start_sample"] = pause_start
             join["output_pause_end_sample"] = output_cursor
+    planned_replacements = {str(item["replacement_id"]) for item in breath_replacements}
+    attached_replacements = {
+        str(item["replacement_id"])
+        for segment in output_segments
+        for item in segment.get("sample_replacements", [])
+    }
+    if attached_replacements != planned_replacements:
+        raise FinalRenderError("breath replacement does not map to one source segment")
     return output_segments
 
 
@@ -2196,11 +2923,22 @@ def build_final_boundary_plan(
     mfa_num_jobs: int = 1,
     alignment_payload: dict[str, Any] | None = None,
     mfa_payload: dict[str, Any] | None = None,
+    breath_cleanup: str = "off",
+    breath_threshold: float = DEFAULT_BREATH_THRESHOLD,
+    breath_min_duration_ms: int = DEFAULT_BREATH_MIN_DURATION_MS,
+    respiro_cache_root: Path = DEFAULT_RESPIRO_CACHE_ROOT,
+    breath_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve every source boundary before rendering any output waveform."""
 
     if alignment_backend != "mfa":
         raise FinalRenderError("production cut coordinates require MFA")
+    if breath_cleanup not in BREATH_CLEANUP_MODES:
+        raise ValueError(f"unsupported breath cleanup mode: {breath_cleanup}")
+    if not 0.0 <= breath_threshold <= 1.0:
+        raise ValueError("breath threshold must be inside [0, 1]")
+    if breath_min_duration_ms <= 0:
+        raise ValueError("breath minimum duration must be positive")
     source_audio, sample_rate = sf.read(
         audio_path,
         dtype="float32",
@@ -2223,6 +2961,7 @@ def build_final_boundary_plan(
         words=words,
         ranges=ranges,
         thought_bounds=thought_bounds,
+        include_breath_gaps=breath_cleanup == "replace",
     )
     jobs = _prepare_alignment_jobs(
         specs=specs,
@@ -2232,6 +2971,9 @@ def build_final_boundary_plan(
         sample_rate=sample_rate,
         output_dir=output_dir,
     )
+    completeness_jobs = [
+        job for job in jobs if bool(job.get("completeness_required", True))
+    ]
     jobs_path = output_dir / "completeness_jobs.json"
     write_json(
         jobs_path,
@@ -2243,14 +2985,14 @@ def build_final_boundary_plan(
             "device": "cpu",
             "purpose": "retained_word_completeness_veto",
             "coordinate_authority": False,
-            "jobs": jobs,
+            "jobs": completeness_jobs,
         },
     )
     worker_path = output_dir / "completeness_worker_result.json"
     if alignment_payload is not None:
         worker_result = alignment_payload
         write_json(worker_path, worker_result)
-    elif jobs:
+    elif completeness_jobs:
         worker_result = _run_completeness_worker(
             jobs_path=jobs_path,
             result_path=worker_path,
@@ -2270,7 +3012,7 @@ def build_final_boundary_plan(
         }
         write_json(worker_path, worker_result)
     completeness_contexts = _collect_completeness_evidence(
-        jobs=jobs,
+        jobs=completeness_jobs,
         worker_result=worker_result,
         sample_rate=sample_rate,
         total_samples=total_samples,
@@ -2704,37 +3446,243 @@ def build_final_boundary_plan(
 
     plan_status = "unsafe" if unsafe_boundaries else "safe"
     output_segments: list[dict[str, Any]] = []
+    protected_speech_mask: list[dict[str, Any]] = []
+    editable_non_speech: list[dict[str, Any]] = []
+    mfa_non_silence_source_spans: list[dict[str, Any]] = []
+    room_tone_mfa_source_spans: list[dict[str, Any]] = []
+    breath_replacements: list[dict[str, Any]] = []
+    breath_cleanup_plan: dict[str, Any] = {
+        "mode": breath_cleanup,
+        "backend": "respiro-en" if breath_cleanup == "replace" else None,
+        "upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+        "checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+        "threshold": breath_threshold,
+        "minimum_duration_ms": breath_min_duration_ms,
+        "event_guard_ms": BREATH_EVENT_GUARD_MS,
+        "transition_ms": BREATH_TRANSITION_MS,
+        "status": (
+            "disabled" if breath_cleanup == "off" else "not_run_unsafe_boundary_plan"
+        ),
+        "detected_events": [],
+        "events": [],
+        "replacements": [],
+        "room_tone_exclusions": [],
+        "room_tone_candidate_rejections": [],
+        "room_tone_allocations": [],
+        "error": None,
+    }
     if plan_status == "safe":
+        allocator_kwargs: dict[str, Any] = {}
+        breath_evidence: dict[str, Any] | None = None
+        if breath_cleanup == "replace":
+            protected_speech_mask = _retained_mfa_phone_mask(
+                mfa_contexts=list(mfa_context_by_key.values()),
+                source_intervals=source_intervals,
+                selected_word_ids=_selected_word_ids(ranges),
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            _suppress_fades_over_protected_speech(
+                boundaries=boundaries,
+                joins=joins,
+                protected_speech_mask=protected_speech_mask,
+            )
+            gap_evidence = _mfa_gap_evidence(
+                jobs=jobs,
+                mfa_context_by_key=mfa_context_by_key,
+                source_intervals=source_intervals,
+                sample_rate=sample_rate,
+            )
+            editable_non_speech = _editable_non_speech_intervals(
+                gap_evidence=gap_evidence,
+                source_intervals=source_intervals,
+                boundaries=boundaries,
+                joins=joins,
+                protected_speech_mask=protected_speech_mask,
+            )
+            mfa_non_silence_source_spans = _collect_mfa_non_silence_source_spans(
+                mfa_contexts=list(mfa_context_by_key.values()),
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            room_tone_mfa_source_spans = _mfa_silence_source_spans(
+                mfa_contexts=list(mfa_context_by_key.values()),
+                non_silence_spans=mfa_non_silence_source_spans,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            room_tone_allowed_spans = [
+                (int(item["start_sample"]), int(item["end_sample"]))
+                for item in [
+                    *editable_non_speech,
+                    *room_tone_mfa_source_spans,
+                ]
+            ]
+            baseline_exclusions = _baseline_room_tone_exclusions(
+                protected_speech_mask=protected_speech_mask,
+                mfa_non_silence_spans=mfa_non_silence_source_spans,
+                boundaries=boundaries,
+                joins=joins,
+                words=words,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            preliminary_allocator = SourceRoomToneAllocator(
+                source_audio=source_audio,
+                mono=mono,
+                words=words,
+                sample_rate=sample_rate,
+                word_guard_ms=0.0,
+                allowed_source_spans=room_tone_allowed_spans,
+                exclusion_intervals=baseline_exclusions,
+            )
+            relevant_ranges = [
+                (int(item["start_sample"]), int(item["end_sample"]))
+                for item in editable_non_speech
+            ]
+            relevant_ranges.extend(preliminary_allocator.candidate_ranges)
+            relevant_ranges.extend(
+                (selected, min(total_samples, selected + 1))
+                for boundary in boundaries
+                if type(boundary.get("selected_source_sample")) is int
+                for selected in [int(boundary["selected_source_sample"])]
+                if selected < total_samples
+            )
+            try:
+                raw_breath_evidence = (
+                    breath_payload
+                    if breath_payload is not None
+                    else analyze_breath_evidence(
+                        source_audio=source_audio,
+                        source_sample_rate=sample_rate,
+                        relevant_ranges=relevant_ranges,
+                        threshold=breath_threshold,
+                        minimum_duration_ms=breath_min_duration_ms,
+                        cache_root=respiro_cache_root,
+                    )
+                )
+                breath_evidence = _validate_breath_payload(
+                    raw_breath_evidence,
+                    threshold=breath_threshold,
+                    minimum_duration_ms=breath_min_duration_ms,
+                    total_samples=total_samples,
+                )
+            except Exception as error:
+                warning = (
+                    "Respiro-en breath cleanup was skipped; preserving the "
+                    f"otherwise valid MFA edit: {type(error).__name__}: {error}"
+                )
+                warnings.warn(warning, RuntimeWarning, stacklevel=2)
+                breath_cleanup_plan["status"] = (
+                    "breath_cleanup_skipped_detector_failure"
+                )
+                breath_cleanup_plan["error"] = warning
+
+            detected_events = (
+                list(breath_evidence["events"]) if breath_evidence is not None else []
+            )
+            detector_exclusions = breath_room_tone_exclusions(
+                detected_events,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            if breath_evidence is not None:
+                allocator_kwargs = {
+                    "word_guard_ms": 0.0,
+                    "allowed_source_spans": room_tone_allowed_spans,
+                    "allow_reuse": True,
+                    "exclusion_intervals": [
+                        *baseline_exclusions,
+                        *detector_exclusions,
+                    ],
+                }
+                room_tone_exclusions = [
+                    *baseline_exclusions,
+                    *detector_exclusions,
+                ]
+            else:
+                # Respiro is optional. Restore the pre-feature allocator so a
+                # detector/runtime failure cannot invalidate a safe MFA edit.
+                allocator_kwargs = {}
+                room_tone_exclusions = []
+            breath_cleanup_plan["detector_evidence"] = breath_evidence
+            breath_cleanup_plan["detected_events"] = detected_events
+            breath_cleanup_plan["room_tone_exclusions"] = room_tone_exclusions
+
         allocator = SourceRoomToneAllocator(
             source_audio=source_audio,
             mono=mono,
             words=words,
             sample_rate=sample_rate,
+            **allocator_kwargs,
         )
-        for join in sorted(joins, key=lambda item: int(item["join_index"])):
-            frame_count = int(join["inserted_pause_samples"])
-            if frame_count <= 0:
-                continue
-            reference = (
-                int(join["source_insertion_sample"])
-                if join["join_kind"] == "internal_thought_pause"
-                else int(
-                    source_intervals[int(join["left_source_interval_index"])][
-                        "source_end_sample"
-                    ]
-                )
-            )
-            ranges_payload, room_fade = _room_tone_ranges(
+        try:
+            _allocate_semantic_pause_room_tone(
                 allocator=allocator,
-                frame_count=frame_count,
-                reference_sample=reference,
+                joins=joins,
+                source_intervals=source_intervals,
             )
-            join["room_tone_source_ranges"] = ranges_payload
-            join["room_tone_fade_samples"] = room_fade
+        except PausePlanError as error:
+            if breath_cleanup != "replace" or breath_evidence is None:
+                raise
+            warning = (
+                "Respiro-en breath cleanup was skipped because verified clean "
+                "room tone could not satisfy the existing semantic pauses; "
+                f"preserving the valid MFA edit: {error}"
+            )
+            warnings.warn(warning, RuntimeWarning, stacklevel=2)
+            breath_cleanup_plan["status"] = "breath_cleanup_skipped_no_clean_room_tone"
+            breath_cleanup_plan["error"] = warning
+            breath_cleanup_plan["enhancement_candidate_rejections"] = (
+                allocator.rejection_ledger
+            )
+            breath_cleanup_plan["events"] = [
+                {
+                    **dict(event),
+                    "event_index": event_index,
+                    "editable_intersection": [],
+                    "protected_phone_intersections": [],
+                    "replacements": [],
+                    "status": "breath_cleanup_skipped_no_clean_room_tone",
+                }
+                for event_index, event in enumerate(
+                    breath_cleanup_plan["detected_events"]
+                )
+            ]
+            breath_cleanup_plan["room_tone_exclusions"] = []
+            breath_evidence = None
+            allocator = SourceRoomToneAllocator(
+                source_audio=source_audio,
+                mono=mono,
+                words=words,
+                sample_rate=sample_rate,
+            )
+            _allocate_semantic_pause_room_tone(
+                allocator=allocator,
+                joins=joins,
+                source_intervals=source_intervals,
+            )
+        if breath_cleanup == "replace" and breath_evidence is not None:
+            breath_replacements, event_records = plan_breath_replacements(
+                events=list(breath_evidence["events"]),
+                editable_non_speech=editable_non_speech,
+                protected_speech_mask=protected_speech_mask,
+                allocator=allocator,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+            )
+            breath_cleanup_plan["events"] = event_records
+            breath_cleanup_plan["replacements"] = breath_replacements
+            breath_cleanup_plan["status"] = "complete"
+        breath_cleanup_plan["room_tone_candidate_rejections"] = (
+            allocator.rejection_ledger
+        )
+        breath_cleanup_plan["room_tone_allocations"] = allocator.allocation_ledger
         output_segments = _build_output_segments(
             source_intervals=source_intervals,
             boundaries=boundaries,
             joins=joins,
+            breath_replacements=breath_replacements,
         )
 
     expected_frames = (
@@ -2774,6 +3722,12 @@ def build_final_boundary_plan(
             "mfa_zero_crossing_snap_ms": MFA_ZERO_CROSSING_SNAP_MS,
             "room_tone_fade_ms": ROOM_TONE_FADE_MS,
             "pause_targets_ms": PAUSE_TARGETS_MS,
+            "breath_cleanup": breath_cleanup,
+            "breath_threshold": breath_threshold,
+            "breath_min_duration_ms": breath_min_duration_ms,
+            "respiro_upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+            "respiro_checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+            "respiro_cache_root": str(respiro_cache_root.resolve()),
             "retained_word_support": {
                 "edge_character_count": RETAINED_WORD_EDGE_CHARACTER_COUNT,
                 "local_context_character_count": (
@@ -2799,6 +3753,11 @@ def build_final_boundary_plan(
         "source_intervals": source_intervals,
         "boundaries": boundaries,
         "joins": joins,
+        "protected_speech_mask": protected_speech_mask,
+        "editable_non_speech": editable_non_speech,
+        "mfa_non_silence_source_spans": mfa_non_silence_source_spans,
+        "room_tone_mfa_source_spans": room_tone_mfa_source_spans,
+        "breath_cleanup": breath_cleanup_plan,
         "output_segments": output_segments,
         "expected_output_frame_count": expected_frames,
         "alignment_context_count": len(jobs),
@@ -2857,6 +3816,9 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
         raise FinalRenderError("boundary plan has no boundary/join ledger")
     if not isinstance(segments, list) or not segments:
         raise FinalRenderError("safe boundary plan has no output trace")
+    protected_mask = boundary_plan.get("protected_speech_mask", [])
+    if not isinstance(protected_mask, list):
+        raise FinalRenderError("boundary plan has a malformed protected-speech mask")
     boundary_ids: set[str] = set()
     for boundary in boundaries:
         boundary_id = str(boundary.get("boundary_id"))
@@ -2913,6 +3875,11 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                         f"semantic pause {join.get('join_id')} fade overlaps speech"
                     )
     cursor = 0
+    replacement_ids: set[str] = set()
+    room_tone_exclusions = boundary_plan.get("breath_cleanup", {}).get(
+        "room_tone_exclusions",
+        [],
+    )
     for expected_index, segment in enumerate(segments):
         if segment.get("segment_index") != expected_index:
             raise FinalRenderError("output trace segment indices are not immutable")
@@ -2927,6 +3894,112 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
             or source_end - source_start != output_end - output_start
         ):
             raise FinalRenderError("output trace geometry is inconsistent")
+        if segment.get("kind") == "room_tone":
+            for exclusion in room_tone_exclusions:
+                if _intervals_overlap(
+                    source_start,
+                    source_end,
+                    int(exclusion["start_sample"]),
+                    int(exclusion["end_sample"]),
+                ):
+                    raise FinalRenderError(
+                        "semantic pause uses forbidden room-tone source"
+                    )
+        gain_envelopes = segment.get("gain_envelopes", [])
+        for envelope in gain_envelopes:
+            for protected in protected_mask:
+                if _intervals_overlap(
+                    int(envelope["source_start_sample"]),
+                    int(envelope["source_end_sample"]),
+                    int(protected["start_sample"]),
+                    int(protected["end_sample"]),
+                ):
+                    raise FinalRenderError(
+                        "source fade overlaps the retained MFA phone mask"
+                    )
+        previous_replacement_end = source_start
+        for replacement in segment.get("sample_replacements", []):
+            replacement_id = str(replacement.get("replacement_id", ""))
+            if not replacement_id or replacement_id in replacement_ids:
+                raise FinalRenderError("breath replacement IDs are empty or duplicated")
+            replacement_ids.add(replacement_id)
+            target_start = int(replacement["target_start_sample"])
+            target_end = int(replacement["target_end_sample"])
+            if not (
+                source_start
+                <= previous_replacement_end
+                <= target_start
+                < target_end
+                <= source_end
+            ):
+                raise FinalRenderError("breath replacement target leaves its segment")
+            previous_replacement_end = target_end
+            replacement_ranges = replacement.get("replacement_room_tone_source_ranges")
+            if not isinstance(replacement_ranges, list) or not replacement_ranges:
+                raise FinalRenderError("breath replacement has no room-tone source")
+            replacement_length = sum(
+                int(item["source_end_sample"]) - int(item["source_start_sample"])
+                for item in replacement_ranges
+            )
+            if replacement_length != target_end - target_start:
+                raise FinalRenderError("breath replacement changes output duration")
+            for source_range in replacement_ranges:
+                replacement_start = int(source_range["source_start_sample"])
+                replacement_end = int(source_range["source_end_sample"])
+                if not (
+                    0
+                    <= replacement_start
+                    < replacement_end
+                    <= int(boundary_plan["source_frame_count"])
+                ):
+                    raise FinalRenderError(
+                        "breath room-tone source has invalid canonical geometry"
+                    )
+                for exclusion in room_tone_exclusions:
+                    if _intervals_overlap(
+                        replacement_start,
+                        replacement_end,
+                        int(exclusion["start_sample"]),
+                        int(exclusion["end_sample"]),
+                    ):
+                        raise FinalRenderError(
+                            "breath replacement uses forbidden room-tone source"
+                        )
+            for protected in protected_mask:
+                if _intervals_overlap(
+                    target_start,
+                    target_end,
+                    int(protected["start_sample"]),
+                    int(protected["end_sample"]),
+                ):
+                    raise FinalRenderError(
+                        "breath replacement overlaps a retained MFA phone"
+                    )
+            for transition in replacement.get("transition_ranges", []):
+                transition_start = int(transition["target_start_sample"])
+                transition_end = int(transition["target_end_sample"])
+                if not target_start <= transition_start < transition_end <= target_end:
+                    raise FinalRenderError("breath transition leaves its target")
+                for protected in protected_mask:
+                    if _intervals_overlap(
+                        transition_start,
+                        transition_end,
+                        int(protected["start_sample"]),
+                        int(protected["end_sample"]),
+                    ):
+                        raise FinalRenderError(
+                            "breath transition overlaps a retained MFA phone"
+                        )
+            for envelope in gain_envelopes:
+                if _intervals_overlap(
+                    target_start,
+                    target_end,
+                    int(envelope["source_start_sample"]),
+                    int(envelope["source_end_sample"]),
+                ):
+                    raise FinalRenderError(
+                        "breath replacement overlaps an existing source fade"
+                    )
         cursor = output_end
     if cursor != int(boundary_plan["expected_output_frame_count"]):
         raise FinalRenderError("output trace does not match planned frame count")
@@ -2952,6 +4025,65 @@ def _apply_source_gain_envelopes(
             raise FinalRenderError("boundary plan contains an unknown fade curve")
         rendered[start:end] *= gain[:, None]
     return rendered
+
+
+def _apply_breath_replacements(
+    rendered: np.ndarray,
+    *,
+    canonical_chunk: np.ndarray,
+    canonical_source: np.ndarray,
+    source_start: int,
+    replacements: Sequence[dict[str, Any]],
+) -> np.ndarray:
+    output = np.array(rendered, dtype=np.float32, copy=True)
+    for replacement in replacements:
+        target_start = int(replacement["target_start_sample"])
+        target_end = int(replacement["target_end_sample"])
+        local_start = target_start - source_start
+        local_end = target_end - source_start
+        if not 0 <= local_start < local_end <= len(output):
+            raise FinalRenderError("breath replacement leaves its source chunk")
+        replacement_parts = [
+            canonical_source[
+                int(source_range["source_start_sample"]) : int(
+                    source_range["source_end_sample"]
+                )
+            ]
+            for source_range in replacement["replacement_room_tone_source_ranges"]
+        ]
+        room_tone = np.concatenate(replacement_parts, axis=0)
+        if len(room_tone) != local_end - local_start:
+            raise FinalRenderError("breath replacement room tone has wrong duration")
+        original = canonical_chunk[local_start:local_end]
+        replacement_audio = np.array(room_tone, dtype=np.float32, copy=True)
+        transition = int(replacement.get("transition_samples", 0))
+        if transition:
+            if transition * 2 > len(replacement_audio):
+                raise FinalRenderError("breath transition is longer than its target")
+            fade_in = np.linspace(
+                0.0,
+                1.0,
+                transition,
+                endpoint=True,
+                dtype=np.float32,
+            )[:, None]
+            fade_out = np.linspace(
+                1.0,
+                0.0,
+                transition,
+                endpoint=True,
+                dtype=np.float32,
+            )[:, None]
+            replacement_audio[:transition] = (
+                original[:transition] * (1.0 - fade_in)
+                + room_tone[:transition] * fade_in
+            )
+            replacement_audio[-transition:] = (
+                original[-transition:] * (1.0 - fade_out)
+                + room_tone[-transition:] * fade_out
+            )
+        output[local_start:local_end] = replacement_audio
+    return output
 
 
 def render_boundary_plan(
@@ -3002,6 +4134,13 @@ def render_boundary_plan(
                 source_start=source_start,
                 envelopes=segment.get("gain_envelopes", []),
             )
+            rendered = _apply_breath_replacements(
+                rendered,
+                canonical_chunk=chunk,
+                canonical_source=source_audio,
+                source_start=source_start,
+                replacements=segment.get("sample_replacements", []),
+            )
         else:
             rendered = np.array(chunk, dtype=np.float32, copy=True)
             fade_in = int(segment.get("fade_in_samples", 0))
@@ -3030,6 +4169,14 @@ def render_boundary_plan(
         for interval in boundary.get("protected_speech_intervals", [])
         if "retained" in str(interval.get("role", ""))
     }
+    protected_retained.update(
+        (
+            -1,
+            int(interval["start_sample"]),
+            int(interval["end_sample"]),
+        )
+        for interval in boundary_plan.get("protected_speech_mask", [])
+    )
     for _, protected_start, protected_end in protected_retained:
         mapped = False
         for segment in boundary_plan["output_segments"]:
@@ -3112,6 +4259,11 @@ def render_final_cut(
     alignment_payloads: Sequence[dict[str, Any]] | None = None,
     mfa_payload: dict[str, Any] | None = None,
     mfa_payloads: Sequence[dict[str, Any]] | None = None,
+    breath_cleanup: str = "off",
+    breath_threshold: float = DEFAULT_BREATH_THRESHOLD,
+    breath_min_duration_ms: int = DEFAULT_BREATH_MIN_DURATION_MS,
+    respiro_cache_root: Path = DEFAULT_RESPIRO_CACHE_ROOT,
+    breath_payload: dict[str, Any] | None = None,
     max_acoustic_retries: int = DEFAULT_MAX_ACOUSTIC_RETRIES,
     write_debug_artifacts: bool = False,
 ) -> dict[str, Any]:
@@ -3134,6 +4286,12 @@ def render_final_cut(
         raise ValueError("MFA is the only production alignment backend")
     if mfa_num_jobs <= 0:
         raise ValueError("mfa_num_jobs must be positive")
+    if breath_cleanup not in BREATH_CLEANUP_MODES:
+        raise ValueError(f"unsupported breath cleanup mode: {breath_cleanup}")
+    if not 0.0 <= breath_threshold <= 1.0:
+        raise ValueError("breath threshold must be inside [0, 1]")
+    if breath_min_duration_ms <= 0:
+        raise ValueError("breath minimum duration must be positive")
     original_plan_path = plan_path
     plan, grounding_path, selected_range_count = _validate_grounded_plan(
         audio_path=audio_path,
@@ -3208,6 +4366,11 @@ def render_final_cut(
                 mfa_num_jobs=mfa_num_jobs,
                 alignment_payload=attempt_payload,
                 mfa_payload=attempt_mfa_payload,
+                breath_cleanup=breath_cleanup,
+                breath_threshold=breath_threshold,
+                breath_min_duration_ms=breath_min_duration_ms,
+                respiro_cache_root=respiro_cache_root,
+                breath_payload=breath_payload,
             )
             if boundary_plan["status"] == "safe":
                 break
@@ -3336,6 +4499,29 @@ def render_final_cut(
         final_path.unlink(missing_ok=True)
         raise FinalRenderError("final boundary plan changed during rendering")
 
+    debug_manifest: dict[str, Any] | None = None
+    if write_debug_artifacts:
+        try:
+            from .breath_debug import write_breath_debug_artifacts
+
+            debug_manifest = write_breath_debug_artifacts(
+                canonical_audio_path=audio_path,
+                rendered_audio_path=final_path,
+                boundary_plan_path=boundary_plan_path,
+                output_dir=output_dir / "breath_debug",
+            )
+        except Exception as error:
+            debug_manifest = {
+                "status": "failed",
+                "errors": [f"{type(error).__name__}: {error}"],
+            }
+            warnings.warn(
+                "Breath diagnostics could not be written; the frozen plan "
+                f"and final render remain valid: {type(error).__name__}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
     manifest = {
         "schema_version": 3,
         "renderer": "authoritative_single_pass_final_render_v3",
@@ -3344,6 +4530,26 @@ def render_final_cut(
         "mfa_version": MFA_VERSION,
         "mfa_model": MFA_MODEL_ID,
         "mfa_fine_tune": True,
+        "breath_cleanup_mode": breath_cleanup,
+        "breath_threshold": breath_threshold,
+        "breath_min_duration_ms": breath_min_duration_ms,
+        "respiro_upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+        "respiro_checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+        "breath_cleanup_status": boundary_plan["breath_cleanup"]["status"],
+        "breaths_detected": len(
+            boundary_plan["breath_cleanup"].get("detected_events", [])
+        ),
+        "breath_replacement_intervals": len(
+            boundary_plan["breath_cleanup"].get("replacements", [])
+        ),
+        "breaths_replaced": sum(
+            event.get("status") == "breath_replaced_with_verified_room_tone"
+            for event in boundary_plan["breath_cleanup"].get("events", [])
+        ),
+        "breaths_skipped_phone_overlap": sum(
+            event.get("status") == "breath_cleanup_skipped_phone_overlap"
+            for event in boundary_plan["breath_cleanup"].get("events", [])
+        ),
         "source_audio": str(audio_path),
         "source_audio_sha256": sha256_file(audio_path),
         "streaming_plan": str(original_plan_path),
@@ -3370,7 +4576,19 @@ def render_final_cut(
         "acoustic_repairs": acoustic_repair_records,
         "rendered_clips": len(boundary_plan["source_intervals"]),
         "debug_artifacts_requested": write_debug_artifacts,
-        "debug_artifacts_written": False,
+        "debug_artifacts_written": (
+            debug_manifest is not None
+            and debug_manifest.get("status") in {"complete", "complete_with_failures"}
+        ),
+        "breath_debug_manifest": (
+            debug_manifest.get("manifest_path") if debug_manifest is not None else None
+        ),
+        "breath_debug_status": (
+            debug_manifest.get("status") if debug_manifest is not None else None
+        ),
+        "breath_debug_errors": (
+            list(debug_manifest.get("errors", [])) if debug_manifest is not None else []
+        ),
         "alignment_contexts": boundary_plan["alignment_context_count"],
         "alignment_resolved_boundaries": boundary_plan["alignment_resolved_boundaries"],
         "unsafe_dense_boundaries": boundary_plan["unsafe_dense_boundaries"],
@@ -3426,6 +4644,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mfa-micromamba", default="micromamba")
     parser.add_argument("--mfa-num-jobs", type=int, default=1)
+    parser.add_argument(
+        "--breath-cleanup",
+        choices=BREATH_CLEANUP_MODES,
+        default="replace",
+        help=(
+            "Optional Respiro-en cleanup planned inside MFA-confirmed "
+            "non-speech (default: replace)."
+        ),
+    )
+    parser.add_argument(
+        "--breath-threshold",
+        type=float,
+        default=DEFAULT_BREATH_THRESHOLD,
+        help="Respiro-en frame-probability threshold (default: 0.5).",
+    )
+    parser.add_argument(
+        "--breath-min-duration-ms",
+        type=int,
+        default=DEFAULT_BREATH_MIN_DURATION_MS,
+        help="Minimum consecutive breath-positive duration (default: 80 ms).",
+    )
+    parser.add_argument(
+        "--respiro-cache-root",
+        type=Path,
+        default=DEFAULT_RESPIRO_CACHE_ROOT,
+        help="Verified pinned Respiro-en runtime-model cache.",
+    )
     add_planner_backend_arguments(parser)
     parser.add_argument(
         "--max-output-tokens",
@@ -3461,6 +4706,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--max-acoustic-retries must be non-negative")
     if args.mfa_num_jobs <= 0:
         raise SystemExit("--mfa-num-jobs must be positive")
+    if not 0.0 <= args.breath_threshold <= 1.0:
+        raise SystemExit("--breath-threshold must be inside [0, 1]")
+    if args.breath_min_duration_ms <= 0:
+        raise SystemExit("--breath-min-duration-ms must be positive")
     manifest = render_final_cut(
         audio_path=args.audio,
         plan_path=args.plan,
@@ -3472,6 +4721,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         mfa_cache_root=args.mfa_cache_root,
         mfa_micromamba=args.mfa_micromamba,
         mfa_num_jobs=args.mfa_num_jobs,
+        breath_cleanup=args.breath_cleanup,
+        breath_threshold=args.breath_threshold,
+        breath_min_duration_ms=args.breath_min_duration_ms,
+        respiro_cache_root=args.respiro_cache_root,
         env_file=args.env_file,
         planner_backend=args.planner_backend,
         planner_model=args.planner_model,
@@ -3491,6 +4744,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"alignment-resolved boundaries: {manifest['alignment_resolved_boundaries']}")
     print(f"unsafe dense boundaries: {manifest['unsafe_dense_boundaries']}")
     print(f"unresolved boundaries: {manifest['unresolved_boundaries']}")
+    print(f"breaths detected: {manifest['breaths_detected']}")
+    print(f"breaths replaced: {manifest['breaths_replaced']}")
     print(f"duration: {manifest['duration_seconds']:.3f} s")
     print(f"output path: {manifest['final_cut_wav']}")
     print(

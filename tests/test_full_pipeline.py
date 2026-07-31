@@ -175,6 +175,9 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                 args.mfa_micromamba.absolute()
             )
             assert command[command.index("--mfa-num-jobs") + 1] == "2"
+            assert command[command.index("--breath-cleanup") + 1] == "replace"
+            assert command[command.index("--breath-threshold") + 1] == "0.5"
+            assert command[command.index("--breath-min-duration-ms") + 1] == "80"
             output_dir = Path(command[command.index("--output-dir") + 1])
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
@@ -191,6 +194,15 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                     "mfa_version": "3.4.1",
                     "mfa_model": "english_us_arpa",
                     "mfa_fine_tune": True,
+                    "breath_cleanup_mode": "replace",
+                    "breath_threshold": 0.5,
+                    "breath_min_duration_ms": 80,
+                    "respiro_upstream_commit": (
+                        "70e01c60c2f582c41092730680f2894ab24d6467"
+                    ),
+                    "respiro_checkpoint_sha256": (
+                        "1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
+                    ),
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),
@@ -236,6 +248,9 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
     assert configuration["mfa_cache_root"] == str(args.mfa_cache_root.absolute())
     assert configuration["mfa_micromamba"] == str(args.mfa_micromamba.absolute())
     assert configuration["mfa_num_jobs"] == 2
+    assert configuration["breath_cleanup"] == "replace"
+    assert configuration["breath_threshold"] == 0.5
+    assert configuration["breath_min_duration_ms"] == 80
     assert (
         configuration["alignment_python_role"]
         == "whisperx_retained_word_completeness_veto_only"
@@ -463,6 +478,15 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                     "mfa_version": "3.4.1",
                     "mfa_model": "english_us_arpa",
                     "mfa_fine_tune": True,
+                    "breath_cleanup_mode": "replace",
+                    "breath_threshold": 0.5,
+                    "breath_min_duration_ms": 80,
+                    "respiro_upstream_commit": (
+                        "70e01c60c2f582c41092730680f2894ab24d6467"
+                    ),
+                    "respiro_checkpoint_sha256": (
+                        "1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
+                    ),
                     "source_audio_sha256": audio_sha,
                     "streaming_plan": str(plan.resolve()),
                     "streaming_plan_sha256": sha256_file(plan),

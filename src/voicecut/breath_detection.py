@@ -31,6 +31,7 @@ RESPIRO_FRAME_HOP_MS = 10
 DEFAULT_BREATH_THRESHOLD = 0.5
 DEFAULT_BREATH_MIN_DURATION_MS = 80
 DEFAULT_BREATH_CONTEXT_MS = 750.0
+DEFAULT_BREATH_MAX_CROP_SECONDS = 30.0
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESPIRO_CACHE_ROOT = (
@@ -238,6 +239,35 @@ def merge_analysis_crops(
     return [(start, end) for start, end in merged]
 
 
+def split_long_analysis_crops(
+    crops: Sequence[tuple[int, int]],
+    *,
+    sample_rate: int,
+    max_crop_seconds: float = DEFAULT_BREATH_MAX_CROP_SECONDS,
+    context_ms: float = DEFAULT_BREATH_CONTEXT_MS,
+) -> list[tuple[int, int]]:
+    """Bound Conformer memory while retaining context at every split."""
+
+    if sample_rate <= 0 or max_crop_seconds <= 0.0 or context_ms < 0.0:
+        raise ValueError("invalid breath-analysis chunk configuration")
+    maximum = round(max_crop_seconds * sample_rate)
+    overlap = round(2.0 * context_ms * sample_rate / 1000.0)
+    if maximum <= overlap:
+        raise ValueError("breath-analysis crop must exceed its split overlap")
+    chunks: list[tuple[int, int]] = []
+    for crop_start, crop_end in crops:
+        start = int(crop_start)
+        end = int(crop_end)
+        if end <= start:
+            continue
+        while end - start > maximum:
+            chunk_end = start + maximum
+            chunks.append((start, chunk_end))
+            start = chunk_end - overlap
+        chunks.append((start, end))
+    return chunks
+
+
 def _resample_mono(
     mono: np.ndarray,
     *,
@@ -342,6 +372,68 @@ def _events_for_crop(
     return events
 
 
+def _deduplicate_events(events: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge threshold runs duplicated by bounded overlapping crops."""
+
+    merged: list[dict[str, Any]] = []
+    for raw in sorted(events, key=lambda item: int(item["start_sample"])):
+        event = dict(raw)
+        event["crop_ids"] = [str(event.pop("crop_id"))]
+        event["detection_fragments"] = [
+            {
+                "crop_id": event["crop_ids"][0],
+                "start_sample": int(event["start_sample"]),
+                "end_sample": int(event["end_sample"]),
+                "maximum_probability": float(event["maximum_probability"]),
+                "mean_probability": float(event["mean_probability"]),
+            }
+        ]
+        if not merged or int(event["start_sample"]) > int(merged[-1]["end_sample"]):
+            merged.append(event)
+            continue
+        previous = merged[-1]
+        previous_duration = int(previous["end_sample"]) - int(previous["start_sample"])
+        event_duration = int(event["end_sample"]) - int(event["start_sample"])
+        overlap_duration = max(
+            0,
+            min(int(previous["end_sample"]), int(event["end_sample"]))
+            - max(int(previous["start_sample"]), int(event["start_sample"])),
+        )
+        new_unique_duration = max(0, event_duration - overlap_duration)
+        total_weight = previous_duration + new_unique_duration
+        previous["start_sample"] = min(
+            int(previous["start_sample"]),
+            int(event["start_sample"]),
+        )
+        previous["end_sample"] = max(
+            int(previous["end_sample"]),
+            int(event["end_sample"]),
+        )
+        previous["start_seconds"] = min(
+            float(previous["start_seconds"]),
+            float(event["start_seconds"]),
+        )
+        previous["end_seconds"] = max(
+            float(previous["end_seconds"]),
+            float(event["end_seconds"]),
+        )
+        previous["maximum_probability"] = max(
+            float(previous["maximum_probability"]),
+            float(event["maximum_probability"]),
+        )
+        previous["mean_probability"] = (
+            float(previous["mean_probability"]) * previous_duration
+            + float(event["mean_probability"]) * new_unique_duration
+        ) / total_weight
+        previous["crop_ids"].extend(
+            crop_id
+            for crop_id in event["crop_ids"]
+            if crop_id not in previous["crop_ids"]
+        )
+        previous["detection_fragments"].extend(event["detection_fragments"])
+    return merged
+
+
 def analyze_breath_evidence(
     *,
     source_audio: np.ndarray,
@@ -350,6 +442,7 @@ def analyze_breath_evidence(
     threshold: float = DEFAULT_BREATH_THRESHOLD,
     minimum_duration_ms: int = DEFAULT_BREATH_MIN_DURATION_MS,
     context_ms: float = DEFAULT_BREATH_CONTEXT_MS,
+    max_crop_seconds: float = DEFAULT_BREATH_MAX_CROP_SECONDS,
     cache_root: Path = DEFAULT_RESPIRO_CACHE_ROOT,
     runtime: RespiroRuntime | None = None,
     probability_provider: Callable[[np.ndarray], np.ndarray] | None = None,
@@ -368,10 +461,15 @@ def analyze_breath_evidence(
     if minimum_duration_ms <= 0:
         raise ValueError("breath minimum duration must be positive")
 
-    crops = merge_analysis_crops(
-        relevant_ranges,
-        total_samples=len(audio),
+    crops = split_long_analysis_crops(
+        merge_analysis_crops(
+            relevant_ranges,
+            total_samples=len(audio),
+            sample_rate=source_sample_rate,
+            context_ms=context_ms,
+        ),
         sample_rate=source_sample_rate,
+        max_crop_seconds=max_crop_seconds,
         context_ms=context_ms,
     )
     base: dict[str, Any] = {
@@ -387,6 +485,7 @@ def analyze_breath_evidence(
         "threshold": threshold,
         "minimum_duration_ms": minimum_duration_ms,
         "context_ms": context_ms,
+        "max_crop_seconds": max_crop_seconds,
         "analysis_crops": [],
         "events": [],
     }
@@ -450,7 +549,7 @@ def analyze_breath_evidence(
         "status": "complete",
         "execution_device": execution_device,
         "analysis_crops": crop_records,
-        "events": sorted(events, key=lambda item: int(item["start_sample"])),
+        "events": _deduplicate_events(events),
     }
 
 
@@ -458,6 +557,7 @@ __all__ = [
     "BreathDetectionError",
     "DEFAULT_BREATH_CONTEXT_MS",
     "DEFAULT_BREATH_MIN_DURATION_MS",
+    "DEFAULT_BREATH_MAX_CROP_SECONDS",
     "DEFAULT_BREATH_THRESHOLD",
     "DEFAULT_RESPIRO_CACHE_ROOT",
     "RESPIRO_CHECKPOINT_SHA256",
@@ -470,5 +570,6 @@ __all__ = [
     "analyze_breath_evidence",
     "load_respiro_runtime",
     "merge_analysis_crops",
+    "split_long_analysis_crops",
     "verify_respiro_runtime",
 ]

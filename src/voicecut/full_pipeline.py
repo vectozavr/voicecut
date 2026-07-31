@@ -23,6 +23,13 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
+from .breath_detection import (
+    DEFAULT_BREATH_MIN_DURATION_MS,
+    DEFAULT_BREATH_THRESHOLD,
+    DEFAULT_RESPIRO_CACHE_ROOT,
+    RESPIRO_CHECKPOINT_SHA256,
+    RESPIRO_UPSTREAM_COMMIT,
+)
 from .common import read_json, sha256_file, write_json
 from .media import (
     AUDIO_OUTPUT_EXTENSIONS,
@@ -59,7 +66,7 @@ MFA_MODEL = MFA_MODEL_ID
 MFA_FINE_TUNE = True
 DEFAULT_MFA_MICROMAMBA = Path("micromamba")
 DEFAULT_MFA_NUM_JOBS = max(1, min(os.cpu_count() or 1, 4))
-PIPELINE_SCHEMA_VERSION = 5
+PIPELINE_SCHEMA_VERSION = 6
 
 
 def _preferred_python(relative_path: str) -> Path:
@@ -197,6 +204,9 @@ def _render_is_current(
     plan_path: Path,
     backend: str,
     model: str,
+    breath_cleanup: str,
+    breath_threshold: float,
+    breath_min_duration_ms: int,
 ) -> bool:
     value = _read_object(manifest_path)
     if value is None:
@@ -214,6 +224,16 @@ def _render_is_current(
         and value.get("mfa_version") == MFA_VERSION
         and value.get("mfa_model") == MFA_MODEL
         and value.get("mfa_fine_tune") is MFA_FINE_TUNE
+        and value.get("breath_cleanup_mode") == breath_cleanup
+        and value.get("breath_threshold") == breath_threshold
+        and value.get("breath_min_duration_ms") == breath_min_duration_ms
+        and value.get("respiro_upstream_commit") == RESPIRO_UPSTREAM_COMMIT
+        and value.get("respiro_checkpoint_sha256") == RESPIRO_CHECKPOINT_SHA256
+        and (
+            breath_cleanup != "replace"
+            or value.get("breath_cleanup_status")
+            != "breath_cleanup_skipped_detector_failure"
+        )
         and value.get("source_audio_sha256") == audio_sha256
         and value.get("streaming_plan") == str(plan_path.resolve())
         and value.get("streaming_plan_sha256") == sha256_file(plan_path)
@@ -503,6 +523,12 @@ def _configuration(
         "mfa_cache_root": str(mfa_cache_root),
         "mfa_micromamba": str(mfa_micromamba),
         "mfa_num_jobs": int(args.mfa_num_jobs),
+        "breath_cleanup": args.breath_cleanup,
+        "breath_threshold": float(args.breath_threshold),
+        "breath_min_duration_ms": int(args.breath_min_duration_ms),
+        "respiro_upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+        "respiro_checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+        "respiro_cache_root": str(args.respiro_cache_root.expanduser().absolute()),
         # WhisperX remains only as a retained-word completeness veto. It is
         # not permitted to provide production source-sample coordinates.
         "alignment_python": str(alignment_python),
@@ -640,6 +666,10 @@ def run_full_pipeline(
         raise FullPipelineError("--window-seconds must be positive")
     if args.max_output_tokens <= 0:
         raise FullPipelineError("--max-output-tokens must be positive")
+    if not 0.0 <= args.breath_threshold <= 1.0:
+        raise FullPipelineError("--breath-threshold must be inside [0, 1]")
+    if args.breath_min_duration_ms <= 0:
+        raise FullPipelineError("--breath-min-duration-ms must be positive")
 
     asr_python = args.asr_python.absolute()
     alignment_python = args.alignment_python.absolute()
@@ -905,6 +935,9 @@ def run_full_pipeline(
         plan_path=plan_path,
         backend=args.planner_backend,
         model=planner_model,
+        breath_cleanup=args.breath_cleanup,
+        breath_threshold=args.breath_threshold,
+        breath_min_duration_ms=args.breath_min_duration_ms,
     ):
         stages["final_render"] = "cached"
     else:
@@ -934,6 +967,14 @@ def run_full_pipeline(
             str(args.mfa_num_jobs),
             "--max-acoustic-retries",
             str(args.max_acoustic_retries),
+            "--breath-cleanup",
+            args.breath_cleanup,
+            "--breath-threshold",
+            str(args.breath_threshold),
+            "--breath-min-duration-ms",
+            str(args.breath_min_duration_ms),
+            "--respiro-cache-root",
+            str(args.respiro_cache_root.expanduser().absolute()),
             *planner_arguments,
         ]
         if args.debug_artifacts:
@@ -951,6 +992,9 @@ def run_full_pipeline(
             plan_path=plan_path,
             backend=args.planner_backend,
             model=planner_model,
+            breath_cleanup=args.breath_cleanup,
+            breath_threshold=args.breath_threshold,
+            breath_min_duration_ms=args.breath_min_duration_ms,
         ):
             raise FullPipelineError(
                 "the final renderer did not produce a validated final cut"
@@ -1124,6 +1168,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_MFA_NUM_JOBS,
         help="Parallel MFA jobs used by the single batched align_hf invocation.",
     )
+    parser.add_argument(
+        "--breath-cleanup",
+        choices=("off", "replace"),
+        default="replace",
+        help=(
+            "Optional Respiro-en cleanup inside MFA-confirmed non-speech "
+            "(default: replace)."
+        ),
+    )
+    parser.add_argument(
+        "--breath-threshold",
+        type=float,
+        default=DEFAULT_BREATH_THRESHOLD,
+        help="Respiro-en frame-probability threshold (default: 0.5).",
+    )
+    parser.add_argument(
+        "--breath-min-duration-ms",
+        type=int,
+        default=DEFAULT_BREATH_MIN_DURATION_MS,
+        help="Minimum consecutive breath-positive duration (default: 80 ms).",
+    )
+    parser.add_argument(
+        "--respiro-cache-root",
+        type=Path,
+        default=DEFAULT_RESPIRO_CACHE_ROOT,
+        help="Verified pinned Respiro-en runtime-model cache.",
+    )
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL)
     parser.add_argument(
         "--language",
@@ -1168,6 +1239,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.max_acoustic_retries < 0:
         parser.error("--max-acoustic-retries must be non-negative")
+    if not 0.0 <= args.breath_threshold <= 1.0:
+        parser.error("--breath-threshold must be inside [0, 1]")
+    if args.breath_min_duration_ms <= 0:
+        parser.error("--breath-min-duration-ms must be positive")
     try:
         result = run_full_pipeline(args)
     except (FullPipelineError, FileExistsError, FileNotFoundError) as error:

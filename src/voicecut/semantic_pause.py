@@ -709,6 +709,9 @@ class SourceRoomToneAllocator:
         sample_rate: int,
         word_guard_ms: float = ROOM_TONE_WORD_GUARD_MS,
         fade_ms: float = ROOM_TONE_FADE_MS,
+        allowed_source_spans: Sequence[tuple[int, int]] | None = None,
+        exclusion_intervals: Sequence[dict[str, Any]] = (),
+        allow_reuse: bool = False,
     ) -> None:
         if source_audio.ndim != 2 or len(source_audio) != len(mono):
             raise ValueError("source audio and mono analysis must share geometry")
@@ -718,11 +721,152 @@ class SourceRoomToneAllocator:
         self.mono = mono
         self.sample_rate = sample_rate
         self.fade_samples = round(fade_ms * sample_rate / 1000.0)
+        self.allow_reuse = bool(allow_reuse)
         self._allocated: list[tuple[int, int]] = []
-        self._runs = self._discover_runs(
+        self._rejection_ledger: list[dict[str, Any]] = []
+        self._allocation_ledger: list[dict[str, Any]] = []
+        raw_runs = self._discover_runs(
             words=words,
             word_guard_samples=round(word_guard_ms * sample_rate / 1000.0),
         )
+        self._runs = self._filter_runs(
+            raw_runs,
+            allowed_source_spans=allowed_source_spans,
+            exclusion_intervals=exclusion_intervals,
+        )
+
+    @property
+    def candidate_ranges(self) -> list[tuple[int, int]]:
+        return [(start, end) for start, end, _, _ in self._runs]
+
+    @property
+    def rejection_ledger(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._rejection_ledger]
+
+    @property
+    def allocation_ledger(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self._allocation_ledger]
+
+    @staticmethod
+    def _subtract_interval(
+        spans: Sequence[tuple[int, int]],
+        *,
+        excluded_start: int,
+        excluded_end: int,
+    ) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+        remaining: list[tuple[int, int]] = []
+        removed: list[tuple[int, int]] = []
+        for start, end in spans:
+            overlap_start = max(start, excluded_start)
+            overlap_end = min(end, excluded_end)
+            if overlap_end <= overlap_start:
+                remaining.append((start, end))
+                continue
+            removed.append((overlap_start, overlap_end))
+            if start < overlap_start:
+                remaining.append((start, overlap_start))
+            if overlap_end < end:
+                remaining.append((overlap_end, end))
+        return remaining, removed
+
+    @staticmethod
+    def _merged_spans(
+        spans: Sequence[tuple[int, int]],
+        *,
+        total_samples: int,
+    ) -> list[tuple[int, int]]:
+        normalized = sorted(
+            (max(0, int(start)), min(total_samples, int(end)))
+            for start, end in spans
+            if int(end) > int(start)
+        )
+        merged: list[list[int]] = []
+        for start, end in normalized:
+            if end <= start:
+                continue
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return [(start, end) for start, end in merged]
+
+    def _filter_runs(
+        self,
+        runs: Sequence[tuple[int, int, float, float]],
+        *,
+        allowed_source_spans: Sequence[tuple[int, int]] | None,
+        exclusion_intervals: Sequence[dict[str, Any]],
+    ) -> list[tuple[int, int, float, float]]:
+        total_samples = len(self.mono)
+        allowed = (
+            self._merged_spans(
+                allowed_source_spans,
+                total_samples=total_samples,
+            )
+            if allowed_source_spans is not None
+            else None
+        )
+        exclusions: list[tuple[int, int, str]] = []
+        for raw in exclusion_intervals:
+            start = max(0, int(raw["start_sample"]))
+            end = min(total_samples, int(raw["end_sample"]))
+            reason = str(raw.get("reason") or "unspecified_exclusion")
+            if end > start:
+                exclusions.append((start, end, reason))
+
+        filtered: list[tuple[int, int, float, float]] = []
+        for run_start, run_end, noise_floor, threshold in runs:
+            spans = [(run_start, run_end)]
+            for excluded_start, excluded_end, reason in sorted(exclusions):
+                spans, removed = self._subtract_interval(
+                    spans,
+                    excluded_start=excluded_start,
+                    excluded_end=excluded_end,
+                )
+                self._rejection_ledger.extend(
+                    {
+                        "candidate_start_sample": run_start,
+                        "candidate_end_sample": run_end,
+                        "rejected_start_sample": start,
+                        "rejected_end_sample": end,
+                        "reason": reason,
+                    }
+                    for start, end in removed
+                )
+            if allowed is not None:
+                allowed_parts = [
+                    (max(start, allowed_start), min(end, allowed_end))
+                    for start, end in spans
+                    for allowed_start, allowed_end in allowed
+                    if min(end, allowed_end) > max(start, allowed_start)
+                ]
+                disallowed = list(spans)
+                for allowed_start, allowed_end in allowed:
+                    disallowed, _ = self._subtract_interval(
+                        disallowed,
+                        excluded_start=allowed_start,
+                        excluded_end=allowed_end,
+                    )
+                self._rejection_ledger.extend(
+                    {
+                        "candidate_start_sample": run_start,
+                        "candidate_end_sample": run_end,
+                        "rejected_start_sample": start,
+                        "rejected_end_sample": end,
+                        "reason": "not_mfa_verified_non_speech",
+                    }
+                    for start, end in disallowed
+                )
+                spans = self._merged_spans(
+                    allowed_parts,
+                    total_samples=total_samples,
+                )
+            filtered.extend(
+                (start, end, noise_floor, threshold)
+                for start, end in spans
+                if end > start
+            )
+        return filtered
 
     def _discover_runs(
         self,
@@ -838,7 +982,8 @@ class SourceRoomToneAllocator:
             for start, end in self._available_spans(run_start, run_end):
                 if end > start:
                     candidates.append((start, end, noise_floor, threshold))
-        if sum(end - start for start, end, _, _ in candidates) < frame_count:
+        unique_capacity = sum(end - start for start, end, _, _ in candidates)
+        if unique_capacity < frame_count and not self.allow_reuse:
             raise PausePlanError(
                 "verified source room tone cannot satisfy a required pause "
                 f"of {frame_count * 1000.0 / self.sample_rate:.1f} ms"
@@ -855,43 +1000,75 @@ class SourceRoomToneAllocator:
         selected_ranges: list[tuple[int, int]] = []
         selected_noise_floors: list[float] = []
         selected_thresholds: list[float] = []
-        for available_start, available_end, noise_floor, threshold in ranked:
+        reusable = sorted(
+            self._runs,
+            key=lambda item: (
+                abs(((item[0] + item[1]) // 2) - reference_sample),
+                -(item[1] - item[0]),
+            ),
+        )
+        candidate_batches = [ranked]
+        if self.allow_reuse:
+            if not reusable:
+                raise PausePlanError("no verified source room tone is available")
+            repeated_capacity = sum(end - start for start, end, _, _ in reusable)
+            repeat_count = max(
+                1, math.ceil(max(0, remaining - unique_capacity) / repeated_capacity)
+            )
+            candidate_batches.extend(reusable for _ in range(repeat_count))
+        for batch in candidate_batches:
+            for available_start, available_end, noise_floor, threshold in batch:
+                if remaining <= 0:
+                    break
+                take = min(remaining, available_end - available_start)
+                desired_start = reference_sample - take // 2
+                start = max(
+                    available_start,
+                    min(available_end - take, desired_start),
+                )
+                end = start + take
+                reused = any(
+                    max(start, used_start) < min(end, used_end)
+                    for used_start, used_end in self._allocated
+                )
+                chunk = np.array(
+                    self.source_audio[start:end],
+                    dtype=np.float32,
+                    copy=True,
+                )
+                fade = min(self.fade_samples, len(chunk) // 2)
+                if fade:
+                    chunk[:fade] *= np.linspace(
+                        0.0,
+                        1.0,
+                        fade,
+                        endpoint=True,
+                        dtype=np.float32,
+                    )[:, None]
+                    chunk[-fade:] *= np.linspace(
+                        1.0,
+                        0.0,
+                        fade,
+                        endpoint=True,
+                        dtype=np.float32,
+                    )[:, None]
+                chunks.append(chunk)
+                selected_ranges.append((start, end))
+                selected_noise_floors.append(noise_floor)
+                selected_thresholds.append(threshold)
+                self._allocated.append((start, end))
+                self._allocation_ledger.append(
+                    {
+                        "source_start_sample": start,
+                        "source_end_sample": end,
+                        "reference_sample": reference_sample,
+                        "requested_frame_count": frame_count,
+                        "reused": reused,
+                    }
+                )
+                remaining -= take
             if remaining <= 0:
                 break
-            take = min(remaining, available_end - available_start)
-            desired_start = reference_sample - take // 2
-            start = max(
-                available_start,
-                min(available_end - take, desired_start),
-            )
-            end = start + take
-            chunk = np.array(
-                self.source_audio[start:end],
-                dtype=np.float32,
-                copy=True,
-            )
-            fade = min(self.fade_samples, len(chunk) // 2)
-            if fade:
-                chunk[:fade] *= np.linspace(
-                    0.0,
-                    1.0,
-                    fade,
-                    endpoint=True,
-                    dtype=np.float32,
-                )[:, None]
-                chunk[-fade:] *= np.linspace(
-                    1.0,
-                    0.0,
-                    fade,
-                    endpoint=True,
-                    dtype=np.float32,
-                )[:, None]
-            chunks.append(chunk)
-            selected_ranges.append((start, end))
-            selected_noise_floors.append(noise_floor)
-            selected_thresholds.append(threshold)
-            self._allocated.append((start, end))
-            remaining -= take
         if remaining:
             raise PausePlanError("room-tone allocation accounting failed")
         audio = np.concatenate(chunks, axis=0)

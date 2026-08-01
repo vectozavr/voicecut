@@ -3,7 +3,8 @@
 
 The public pipeline accepts an audio or video file, creates one canonical WAV,
 builds a source-grounded semantic edit plan, renders safe word boundaries and
-semantic pauses, and publishes the requested media format. Expensive completed
+the output-specific pause policy, and publishes the requested media format.
+Audio may use semantic pauses; video uses direct cuts. Expensive completed
 stages are content-addressed and reused on an identical rerun.
 """
 
@@ -66,7 +67,7 @@ MFA_MODEL = MFA_MODEL_ID
 MFA_FINE_TUNE = True
 DEFAULT_MFA_MICROMAMBA = Path("micromamba")
 DEFAULT_MFA_NUM_JOBS = max(1, min(os.cpu_count() or 1, 4))
-PIPELINE_SCHEMA_VERSION = 6
+PIPELINE_SCHEMA_VERSION = 7
 
 
 def _preferred_python(relative_path: str) -> Path:
@@ -207,6 +208,7 @@ def _render_is_current(
     breath_cleanup: str,
     breath_threshold: float,
     breath_min_duration_ms: int,
+    pause_policy: str,
 ) -> bool:
     value = _read_object(manifest_path)
     if value is None:
@@ -227,6 +229,7 @@ def _render_is_current(
         and value.get("breath_cleanup_mode") == breath_cleanup
         and value.get("breath_threshold") == breath_threshold
         and value.get("breath_min_duration_ms") == breath_min_duration_ms
+        and value.get("pause_policy") == pause_policy
         and value.get("respiro_upstream_commit") == RESPIRO_UPSTREAM_COMMIT
         and value.get("respiro_checkpoint_sha256") == RESPIRO_CHECKPOINT_SHA256
         and (
@@ -237,8 +240,10 @@ def _render_is_current(
         and value.get("source_audio_sha256") == audio_sha256
         and value.get("streaming_plan") == str(plan_path.resolve())
         and value.get("streaming_plan_sha256") == sha256_file(plan_path)
-        and value.get("pause_planner_backend") == backend
-        and value.get("pause_planner_model") == model
+        and value.get("pause_planner_backend")
+        == (backend if pause_policy == "semantic" else "deterministic_video_cuts")
+        and value.get("pause_planner_model")
+        == (model if pause_policy == "semantic" else None)
         and isinstance(final_cut, str)
         and Path(final_cut).is_file()
         and isinstance(final_cut_sha, str)
@@ -497,6 +502,7 @@ def _configuration(
     mfa_prefix: Path,
     mfa_cache_root: Path,
     mfa_micromamba: Path,
+    pause_policy: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": PIPELINE_SCHEMA_VERSION,
@@ -513,6 +519,7 @@ def _configuration(
         "window_seconds": float(args.window_seconds),
         "max_output_tokens": int(args.max_output_tokens),
         "max_acoustic_retries": int(args.max_acoustic_retries),
+        "pause_policy": pause_policy,
         "debug_artifacts": bool(args.debug_artifacts),
         "asr_python": str(asr_python),
         "alignment_backend": args.alignment_backend,
@@ -670,6 +677,7 @@ def run_full_pipeline(
         raise FullPipelineError("--breath-threshold must be inside [0, 1]")
     if args.breath_min_duration_ms <= 0:
         raise FullPipelineError("--breath-min-duration-ms must be positive")
+    pause_policy = "cuts" if output_kind == "video" else "semantic"
 
     asr_python = args.asr_python.absolute()
     alignment_python = args.alignment_python.absolute()
@@ -720,6 +728,7 @@ def run_full_pipeline(
         mfa_prefix=mfa_prefix,
         mfa_cache_root=mfa_cache_root,
         mfa_micromamba=mfa_micromamba,
+        pause_policy=pause_policy,
     )
     work_dir = _resolve_work_dir(
         requested=args.work_dir,
@@ -938,6 +947,7 @@ def run_full_pipeline(
         breath_cleanup=args.breath_cleanup,
         breath_threshold=args.breath_threshold,
         breath_min_duration_ms=args.breath_min_duration_ms,
+        pause_policy=pause_policy,
     ):
         stages["final_render"] = "cached"
     else:
@@ -967,6 +977,8 @@ def run_full_pipeline(
             str(args.mfa_num_jobs),
             "--max-acoustic-retries",
             str(args.max_acoustic_retries),
+            "--pause-policy",
+            pause_policy,
             "--breath-cleanup",
             args.breath_cleanup,
             "--breath-threshold",
@@ -995,6 +1007,7 @@ def run_full_pipeline(
             breath_cleanup=args.breath_cleanup,
             breath_threshold=args.breath_threshold,
             breath_min_duration_ms=args.breath_min_duration_ms,
+            pause_policy=pause_policy,
         ):
             raise FullPipelineError(
                 "the final renderer did not produce a validated final cut"
@@ -1071,6 +1084,7 @@ def run_full_pipeline(
         "alignment_backend": args.alignment_backend,
         "mfa_version": MFA_VERSION,
         "mfa_model": MFA_MODEL,
+        "pause_policy": pause_policy,
         "stages": stages,
         "media_input_manifest": str(media_manifest_path),
         "analysis": str(analysis_path),

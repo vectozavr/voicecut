@@ -22,7 +22,7 @@ from voicecut.video_render import (
 
 def _boundary_plan() -> dict[str, object]:
     return {
-        "planner": "authoritative_single_pass_boundary_plan_v1",
+        "planner": "authoritative_single_pass_boundary_plan_v2",
         "status": "safe",
         "source_sample_rate": 1000,
         "expected_output_frame_count": 2000,
@@ -108,6 +108,60 @@ def test_visual_timeline_preserves_motion_and_freezes_only_inserted_time() -> No
         )
         == expected_frames
     )
+
+
+def test_visual_timeline_accepts_previous_single_pass_manifest_version() -> None:
+    plan = _boundary_plan()
+    plan["planner"] = "authoritative_single_pass_boundary_plan_v1"
+
+    _, sample_rate, expected_frames = build_visual_timeline(plan)
+
+    assert sample_rate == 1000
+    assert expected_frames == 2000
+
+
+def test_video_cut_policy_rejects_inserted_frame_hold() -> None:
+    plan = _boundary_plan()
+    plan["pause_policy"] = "cuts"
+
+    with pytest.raises(VideoRenderError, match="cannot contain.*room-tone"):
+        build_visual_timeline(plan)
+
+
+def test_video_cut_policy_joins_only_selected_source_motion() -> None:
+    plan = {
+        "planner": "authoritative_single_pass_boundary_plan_v2",
+        "status": "safe",
+        "pause_policy": "cuts",
+        "source_sample_rate": 1000,
+        "expected_output_frame_count": 1000,
+        "output_segments": [
+            {
+                "segment_index": 0,
+                "kind": "source",
+                "source_interval_index": 0,
+                "source_start_sample": 1000,
+                "source_end_sample": 1500,
+                "output_start_sample": 0,
+                "output_end_sample": 500,
+            },
+            {
+                "segment_index": 1,
+                "kind": "source",
+                "source_interval_index": 1,
+                "source_start_sample": 3000,
+                "source_end_sample": 3500,
+                "output_start_sample": 500,
+                "output_end_sample": 1000,
+            },
+        ],
+    }
+
+    timeline, _, expected_frames = build_visual_timeline(plan)
+
+    assert expected_frames == 1000
+    assert len(timeline) == 2
+    assert all(segment.freeze_after_samples == 0 for segment in timeline)
 
 
 def test_visual_timeline_rejects_trace_that_disagrees_with_audio_timeline() -> None:
@@ -314,7 +368,7 @@ def test_video_render_muxes_final_audio_and_holds_frame_for_internal_pause(
     write_json(
         boundary_path,
         {
-            "planner": "authoritative_single_pass_boundary_plan_v1",
+            "planner": "authoritative_single_pass_boundary_plan_v2",
             "status": "safe",
             "source_sample_rate": sample_rate,
             "expected_output_frame_count": expected_frames,

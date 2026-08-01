@@ -8,9 +8,9 @@ Forced Aligner (MFA), optionally replaces breaths only inside MFA-confirmed
 non-speech, and renders the accepted edit once from the source.
 
 It accepts audio or video. Video is edited from its speech track: selected
-audio intervals select the corresponding picture intervals, and an inserted
-semantic pause holds the last selected frame. VoiceCut does not interpret the
-visual content.
+audio intervals select the corresponding picture intervals and are joined with
+direct visual cuts. VoiceCut does not add artificial semantic pauses or frozen
+frames to video, and it does not interpret the visual content.
 
 VoiceCut never synthesizes speech, replaces words, denoises the recording, or
 adds generated background noise. Retained voice samples come directly from the
@@ -295,7 +295,9 @@ For video:
 
 - retained speech keeps the corresponding source pictures at normal speed;
 - removed speech removes the corresponding pictures;
-- extra semantic pause time holds the last retained frame;
+- selected source intervals are joined with direct cuts;
+- no semantic pause time or frozen-frame hold is added;
+- natural pauses already present inside a retained continuous take remain;
 - the final edited audio replaces the original audio track;
 - VoiceCut checks output audio/video duration and synchronization.
 
@@ -317,7 +319,8 @@ voicecut interview.mov \
 The work directory contains the canonical input WAV, analysis, word transcript,
 acoustic retry evidence, streaming semantic plan, grounding report, local
 WhisperX completeness-veto crops, the batched MFA corpus and word/phone
-alignment JSON, the semantic pause plan, one authoritative
+alignment JSON, a semantic audio-pause or deterministic video-cut transition
+plan, one authoritative
 `final_boundary_plan.json`, Respiro-en frame probabilities for relevant source
 regions, breath-replacement provenance, and one final internal WAV. MFA context
 WAVs are crops from the canonical source used only as alignment input; they are
@@ -462,12 +465,18 @@ phone. Fades are allowed only in MFA-confirmed non-speech, so retained speech,
 including quiet final fricatives such as `/s/`, remains copied directly from
 the canonical WAV.
 
-A separate semantic pause classification still assigns `continuation`, `short`,
-`thought`, or `section`. Existing natural quiet counts toward the target total
-gap. Any deficit is filled with verified room tone only at an MFA-resolved
-join, or inside an MFA-confirmed inter-word non-speech interval within a
-contiguous take. If there is no confirmed internal gap, the extra pause is
-skipped.
+For audio output, a separate semantic pause classification assigns
+`continuation`, `short`, `thought`, or `section`. Existing natural quiet counts
+toward the target total gap. Any deficit is filled with verified room tone only
+at an MFA-resolved join, or inside an MFA-confirmed inter-word non-speech
+interval within a contiguous take. If there is no confirmed internal gap, the
+extra pause is skipped.
+
+Video output automatically uses the `cuts` pause policy. It skips the semantic
+pause model call, assigns zero inserted duration to every join, and joins only
+the selected source-motion intervals. Natural timing inside each retained
+continuous take is preserved, but no room-tone extension or frame hold is
+created.
 
 After pause planning, the pinned official Respiro-en model analyzes only source
 regions that can appear in the output or supply room tone. It produces one
@@ -479,7 +488,7 @@ phone is left unchanged, including possible false positives over quiet final
 `/s/`, `/z/`, `/f/`, `/th/`, `/sh/`, and `/tion/` phones. Breath-positive
 source is also excluded from room-tone candidates. Replacement uses clean,
 traceable room tone from the source and preserves the exact pause duration;
-the semantic pause target and every MFA endpoint remain unchanged.
+the selected pause policy and every MFA endpoint remain unchanged.
 
 At EOF, the complete final MFA phone is protected before the existing safe
 tail is retained and any fade can begin.
@@ -493,9 +502,9 @@ Every replaced sample is traceable to a verified source room-tone sample.
 ### 7. Publication
 
 The validated internal WAV is encoded to the requested audio container. For
-video, the same source interval timeline is applied to the pictures and the
-edited audio is muxed back in. Publication validates the output stream type,
-duration, and synchronization before replacing the destination.
+video, the same direct-cut source interval timeline is applied to the pictures
+and the edited audio is muxed back in. Publication validates the output stream
+type, duration, and synchronization before replacing the destination.
 
 ## CLI reference
 
@@ -645,7 +654,8 @@ ruff format --check src tests
 The tests include semantic validation and retry behavior, source grounding,
 MFA phone-protected `/s/` and leading-word regressions, dense phone-to-phone
 boundaries, overlapping Whisper anchors, confidence-aware weak-word rejection,
-fail-closed MFA mapping and geometry errors, semantic pauses, EOF tails,
+fail-closed MFA mapping and geometry errors, semantic audio pauses, clear-cut
+video timelines without frame holds, EOF tails,
 sample-trace invariants, media conversion, video timeline construction,
 caching, one-command orchestration, frame-wise breath geometry, MFA-protected
 breath replacement, exact-duration room-tone substitution, detector failure,

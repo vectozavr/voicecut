@@ -92,6 +92,8 @@ ALIGNMENT_GEOMETRY_EPSILON_SECONDS = 1e-6
 MFA_SAMPLE_ROUNDING_OVERLAP = 1
 BREATH_CLEANUP_MODES = ("off", "replace")
 BREATH_ALIGNMENT_MIN_GAP_MS = 20.0
+PAUSE_POLICIES = ("semantic", "cuts")
+CUTS_PAUSE_BACKEND = "deterministic_video_cuts"
 
 
 class FinalRenderError(RuntimeError):
@@ -217,6 +219,47 @@ def _validate_grounded_plan(
     return plan, grounding_path, len(ranges)
 
 
+def _write_cut_pause_plan(*, plan_path: Path, destination: Path) -> Path:
+    """Write a no-model, zero-insertion transition ledger for video cuts."""
+
+    plan = read_json(plan_path)
+    committed = plan.get("committed") if isinstance(plan, dict) else None
+    if not isinstance(committed, list) or not committed:
+        raise FinalRenderError("cut pause policy requires committed thoughts")
+    transitions = [
+        {
+            "after_thought_index": index,
+            "before_thought_index": index + 1,
+            "pause_type": "continuation",
+        }
+        for index in range(len(committed) - 1)
+    ]
+    write_json(
+        destination,
+        {
+            "schema_version": 1,
+            "planner": "semantic_pause_planner_v1",
+            "backend": CUTS_PAUSE_BACKEND,
+            "model": None,
+            "pause_policy": "cuts",
+            "streaming_plan": str(plan_path.resolve()),
+            "streaming_plan_sha256": sha256_file(plan_path),
+            "thought_count": len(committed),
+            "transition_count": len(transitions),
+            "transitions": transitions,
+            "attempts": [
+                {
+                    "attempt": 0,
+                    "raw_response": None,
+                    "validation_error": None,
+                    "model_call_skipped": "video output uses clear source cuts",
+                }
+            ],
+        },
+    )
+    return destination
+
+
 def _cache_pause_plan(
     *,
     plan_path: Path,
@@ -231,8 +274,18 @@ def _cache_pause_plan(
     local_python: Path,
     local_files_only: bool,
     max_output_tokens: int,
+    pause_policy: str,
 ) -> Path:
     destination = output_dir / "pause_plan.json"
+    if pause_policy == "cuts":
+        if supplied_pause_plan_path is not None:
+            raise FinalRenderError(
+                "pause_plan_path cannot be supplied when pause_policy='cuts'"
+            )
+        return _write_cut_pause_plan(
+            plan_path=plan_path,
+            destination=destination,
+        )
     if supplied_pause_plan_path is not None:
         supplied = supplied_pause_plan_path.resolve()
         if not supplied.is_file():
@@ -2705,8 +2758,8 @@ def _allocate_semantic_pause_room_tone(
     """Allocate pause content without changing any resolved source endpoint."""
 
     for join in joins:
-        join.pop("room_tone_source_ranges", None)
-        join.pop("room_tone_fade_samples", None)
+        join["room_tone_source_ranges"] = []
+        join["room_tone_fade_samples"] = 0
     for join in sorted(joins, key=lambda item: int(item["join_index"])):
         frame_count = int(join["inserted_pause_samples"])
         if frame_count <= 0:
@@ -2928,6 +2981,7 @@ def build_final_boundary_plan(
     breath_min_duration_ms: int = DEFAULT_BREATH_MIN_DURATION_MS,
     respiro_cache_root: Path = DEFAULT_RESPIRO_CACHE_ROOT,
     breath_payload: dict[str, Any] | None = None,
+    pause_policy: str = "semantic",
 ) -> dict[str, Any]:
     """Resolve every source boundary before rendering any output waveform."""
 
@@ -2935,6 +2989,8 @@ def build_final_boundary_plan(
         raise FinalRenderError("production cut coordinates require MFA")
     if breath_cleanup not in BREATH_CLEANUP_MODES:
         raise ValueError(f"unsupported breath cleanup mode: {breath_cleanup}")
+    if pause_policy not in PAUSE_POLICIES:
+        raise ValueError(f"unsupported pause policy: {pause_policy}")
     if not 0.0 <= breath_threshold <= 1.0:
         raise ValueError("breath threshold must be inside [0, 1]")
     if breath_min_duration_ms <= 0:
@@ -3228,7 +3284,11 @@ def build_final_boundary_plan(
                     "source join has no semantic pause classification"
                 )
             pause_type = str(transition["pause_type"])
-        target_samples = round(PAUSE_TARGETS_MS[pause_type] * sample_rate / 1000.0)
+        target_samples = (
+            0
+            if pause_policy == "cuts"
+            else round(PAUSE_TARGETS_MS[pause_type] * sample_rate / 1000.0)
+        )
         if (
             left_boundary["safety_status"] == "safe"
             and right_boundary["safety_status"] == "safe"
@@ -3303,7 +3363,11 @@ def build_final_boundary_plan(
         spec = completeness_context["_spec"]
         mfa_context = mfa_context_by_key.get(context_key)
         pause_type = str(transition["pause_type"])
-        target_samples = round(PAUSE_TARGETS_MS[pause_type] * sample_rate / 1000.0)
+        target_samples = (
+            0
+            if pause_policy == "cuts"
+            else round(PAUSE_TARGETS_MS[pause_type] * sample_rate / 1000.0)
+        )
         common = {
             "join_id": context_key,
             "join_index": len(joins),
@@ -3706,6 +3770,7 @@ def build_final_boundary_plan(
         "streaming_plan_sha256": sha256_file(semantic_plan_path),
         "pause_plan": str(pause_plan_path),
         "pause_plan_sha256": sha256_file(pause_plan_path),
+        "pause_policy": pause_policy,
         "configuration": {
             "alignment_backend": "mfa",
             "mfa_version": MFA_VERSION,
@@ -3722,6 +3787,7 @@ def build_final_boundary_plan(
             "mfa_zero_crossing_snap_ms": MFA_ZERO_CROSSING_SNAP_MS,
             "room_tone_fade_ms": ROOM_TONE_FADE_MS,
             "pause_targets_ms": PAUSE_TARGETS_MS,
+            "pause_policy": pause_policy,
             "breath_cleanup": breath_cleanup,
             "breath_threshold": breath_threshold,
             "breath_min_duration_ms": breath_min_duration_ms,
@@ -4266,6 +4332,7 @@ def render_final_cut(
     breath_payload: dict[str, Any] | None = None,
     max_acoustic_retries: int = DEFAULT_MAX_ACOUSTIC_RETRIES,
     write_debug_artifacts: bool = False,
+    pause_policy: str = "semantic",
 ) -> dict[str, Any]:
     """Build one immutable boundary plan, then render canonical samples once."""
 
@@ -4288,6 +4355,8 @@ def render_final_cut(
         raise ValueError("mfa_num_jobs must be positive")
     if breath_cleanup not in BREATH_CLEANUP_MODES:
         raise ValueError(f"unsupported breath cleanup mode: {breath_cleanup}")
+    if pause_policy not in PAUSE_POLICIES:
+        raise ValueError(f"unsupported pause policy: {pause_policy}")
     if not 0.0 <= breath_threshold <= 1.0:
         raise ValueError("breath threshold must be inside [0, 1]")
     if breath_min_duration_ms <= 0:
@@ -4311,6 +4380,7 @@ def render_final_cut(
         local_python=planner_python,
         local_files_only=local_files_only,
         max_output_tokens=max_output_tokens,
+        pause_policy=pause_policy,
     )
     effective_plan = plan
     effective_plan_path = plan_path
@@ -4371,6 +4441,7 @@ def render_final_cut(
                 breath_min_duration_ms=breath_min_duration_ms,
                 respiro_cache_root=respiro_cache_root,
                 breath_payload=breath_payload,
+                pause_policy=pause_policy,
             )
             if boundary_plan["status"] == "safe":
                 break
@@ -4530,6 +4601,7 @@ def render_final_cut(
         "mfa_version": MFA_VERSION,
         "mfa_model": MFA_MODEL_ID,
         "mfa_fine_tune": True,
+        "pause_policy": pause_policy,
         "breath_cleanup_mode": breath_cleanup,
         "breath_threshold": breath_threshold,
         "breath_min_duration_ms": breath_min_duration_ms,
@@ -4621,6 +4693,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pause-plan", type=Path)
+    parser.add_argument(
+        "--pause-policy",
+        choices=PAUSE_POLICIES,
+        default="semantic",
+        help=(
+            "Use semantic room-tone pauses for audio or zero-insertion clear "
+            "cuts for video (default: semantic)."
+        ),
+    )
     parser.add_argument(
         "--alignment-python",
         type=Path,
@@ -4735,6 +4816,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_output_tokens=args.max_output_tokens,
         max_acoustic_retries=args.max_acoustic_retries,
         write_debug_artifacts=args.debug_artifacts,
+        pause_policy=args.pause_policy,
     )
     print("\nFINAL CUT CREATED")
     print(f"semantic thoughts: {manifest['semantic_thoughts']}")

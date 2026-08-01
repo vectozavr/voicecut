@@ -1,9 +1,10 @@
 """Render a video from VoiceCut's final, sample-accurate audio edit timeline.
 
 VoiceCut does not interpret pictures. Selected source-audio intervals therefore
-select the corresponding source-video intervals. When the audio renderer adds
-room tone for a semantic pause, this module holds the last selected video frame
-for exactly that added duration. It never slows, loops, or invents motion.
+select the corresponding source-video intervals. Production video edits join
+those intervals directly, without artificial semantic pauses or frame holds.
+Legacy/debug manifests containing inserted audio may still be inspected. This
+module never slows, loops, or invents motion.
 """
 
 from __future__ import annotations
@@ -32,9 +33,17 @@ class VideoRenderError(MediaError):
     """The audio edit timeline cannot be applied safely to the source video."""
 
 
+AUTHORITATIVE_BOUNDARY_PLAN_RENDERERS = frozenset(
+    {
+        "authoritative_single_pass_boundary_plan_v1",
+        "authoritative_single_pass_boundary_plan_v2",
+    }
+)
+
+
 @dataclass(frozen=True)
 class VisualTimelineSegment:
-    """One normal-speed source-video span, optionally followed by a frame hold."""
+    """One source-video span; frame holds are supported only for old manifests."""
 
     clip_index: int
     source_start_sample: int
@@ -171,6 +180,13 @@ def _build_single_pass_visual_timeline(
     raw_segments = boundary_plan.get("output_segments")
     if not isinstance(raw_segments, list) or not raw_segments:
         raise VideoRenderError("boundary plan contains no output trace")
+    if boundary_plan.get("pause_policy") == "cuts" and any(
+        isinstance(segment, dict) and segment.get("kind") == "room_tone"
+        for segment in raw_segments
+    ):
+        raise VideoRenderError(
+            "video cut policy cannot contain an inserted room-tone segment"
+        )
 
     timeline: list[VisualTimelineSegment] = []
     output_cursor = 0
@@ -233,9 +249,9 @@ def _build_single_pass_visual_timeline(
 def build_visual_timeline(
     semantic_manifest: dict[str, Any],
 ) -> tuple[list[VisualTimelineSegment], int, int]:
-    """Translate the final audio manifest into source-motion/frame-hold spans."""
+    """Translate a final audio manifest into its source-motion timeline."""
 
-    if semantic_manifest.get("planner") == "authoritative_single_pass_boundary_plan_v1":
+    if semantic_manifest.get("planner") in AUTHORITATIVE_BOUNDARY_PLAN_RENDERERS:
         return _build_single_pass_visual_timeline(semantic_manifest)
 
     sample_rate = _integer(
@@ -724,8 +740,13 @@ def render_edited_video(
         "renderer": "voicecut_visual_timeline_v1",
         "status": "complete",
         "visual_policy": (
-            "normal-speed selected source video; last-frame hold during "
-            "VoiceCut-inserted semantic pauses"
+            "normal-speed selected source video with clear cuts and no "
+            "inserted frame holds"
+            if boundary_plan.get("pause_policy") == "cuts"
+            else (
+                "normal-speed selected source video; last-frame hold during "
+                "VoiceCut-inserted semantic pauses"
+            )
         ),
         "frame_quantization_policy": (
             "source video cuts occur on decoded frame timestamps; the last "

@@ -178,6 +178,7 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
             assert command[command.index("--breath-cleanup") + 1] == "replace"
             assert command[command.index("--breath-threshold") + 1] == "0.5"
             assert command[command.index("--breath-min-duration-ms") + 1] == "80"
+            assert command[command.index("--pause-policy") + 1] == "semantic"
             output_dir = Path(command[command.index("--output-dir") + 1])
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
@@ -194,6 +195,7 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                     "mfa_version": "3.4.1",
                     "mfa_model": "english_us_arpa",
                     "mfa_fine_tune": True,
+                    "pause_policy": "semantic",
                     "breath_cleanup_mode": "replace",
                     "breath_threshold": 0.5,
                     "breath_min_duration_ms": 80,
@@ -462,6 +464,7 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                 },
             )
         elif module == "voicecut.final_render":
+            assert command[command.index("--pause-policy") + 1] == "cuts"
             output_dir = Path(command[command.index("--output-dir") + 1])
             output_dir.mkdir(parents=True)
             final_cut = output_dir / "final_cut.wav"
@@ -478,6 +481,7 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                     "mfa_version": "3.4.1",
                     "mfa_model": "english_us_arpa",
                     "mfa_fine_tune": True,
+                    "pause_policy": "cuts",
                     "breath_cleanup_mode": "replace",
                     "breath_threshold": 0.5,
                     "breath_min_duration_ms": 80,
@@ -492,8 +496,8 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                     "streaming_plan_sha256": sha256_file(plan),
                     "effective_streaming_plan": str(plan.resolve()),
                     "effective_streaming_plan_sha256": sha256_file(plan),
-                    "pause_planner_backend": "gemini",
-                    "pause_planner_model": "gemini-3.6-flash",
+                    "pause_planner_backend": "deterministic_video_cuts",
+                    "pause_planner_model": None,
                     "final_cut_wav": str(final_cut.resolve()),
                     "final_cut_wav_sha256": sha256_file(final_cut),
                     "final_boundary_plan": str(boundary_plan.resolve()),
@@ -544,6 +548,7 @@ def test_full_pipeline_routes_video_input_to_video_publication(
     assert video_calls == 1
     assert result["input_kind"] == "video"
     assert result["output_kind"] == "video"
+    assert result["pause_policy"] == "cuts"
     assert Path(result["output"]).read_bytes() == b"published video"
 
 

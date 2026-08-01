@@ -1034,6 +1034,40 @@ def test_final_render_builds_one_boundary_plan_and_renders_source_once(
     assert saved == manifest
 
 
+def test_cut_pause_policy_skips_planner_and_inserts_no_room_tone(
+    tmp_path: Path,
+) -> None:
+    audio_path, plan_path, _, _ = _grounded_fixture(tmp_path)
+    words = read_json(plan_path)["words"]
+    completeness, mfa = _grounded_evidence(words=words, audio_path=audio_path)
+    output_dir = tmp_path / "video-cuts"
+
+    manifest = render_final_cut(
+        audio_path=audio_path,
+        plan_path=plan_path,
+        output_dir=output_dir,
+        alignment_python=tmp_path / "model-must-not-run",
+        pause_backend=ExplodingPauseBackend(),
+        alignment_payload=completeness,
+        mfa_payload=mfa,
+        pause_policy="cuts",
+    )
+
+    pause_plan = read_json(output_dir / "pause_plan.json")
+    boundary_plan = read_json(output_dir / "final_boundary_plan.json")
+    assert manifest["pause_policy"] == "cuts"
+    assert manifest["pause_planner_backend"] == "deterministic_video_cuts"
+    assert manifest["pause_planner_model"] is None
+    assert pause_plan["pause_policy"] == "cuts"
+    assert pause_plan["attempts"][0]["model_call_skipped"]
+    assert boundary_plan["pause_policy"] == "cuts"
+    assert all(join["target_pause_samples"] == 0 for join in boundary_plan["joins"])
+    assert all(join["inserted_pause_samples"] == 0 for join in boundary_plan["joins"])
+    assert all(
+        segment["kind"] == "source" for segment in boundary_plan["output_segments"]
+    )
+
+
 def test_debug_flag_does_not_reintroduce_staged_production_wavs(
     tmp_path: Path,
 ) -> None:

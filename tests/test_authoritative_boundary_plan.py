@@ -8,6 +8,11 @@ import numpy as np
 import pytest
 import soundfile as sf
 
+from voicecut.breath_detection import (
+    RESPIRO_CHECKPOINT_SHA256,
+    RESPIRO_FRAME_HOP_MS,
+    RESPIRO_UPSTREAM_COMMIT,
+)
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.final_render import (
     FinalRenderError,
@@ -409,6 +414,17 @@ def _render(
             spans,
             source_audio_sha256=sha256_file(audio_path),
         ),
+        breath_cleanup="replace",
+        breath_payload={
+            "backend": "respiro-en",
+            "upstream_commit": RESPIRO_UPSTREAM_COMMIT,
+            "checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+            "frame_hop_ms": RESPIRO_FRAME_HOP_MS,
+            "threshold": 0.5,
+            "minimum_duration_ms": 80,
+            "status": "complete",
+            "events": [],
+        },
         max_acoustic_retries=0,
     )
     boundary_plan = read_json(Path(manifest["final_boundary_plan"]))

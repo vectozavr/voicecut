@@ -18,6 +18,13 @@ from typing import Any, Sequence
 import numpy as np
 import soundfile as sf
 
+from .ambience import (
+    DEFAULT_AMBIENCE_CROSSFADE_MS,
+    DEFAULT_AMBIENCE_THRESHOLDS,
+    build_clean_ambience_bank,
+    evaluate_ambience_candidate,
+    plan_ambience_assembly,
+)
 from .breath_cleanup import (
     BREATH_EVENT_GUARD_MS,
     BREATH_TRANSITION_MS,
@@ -63,9 +70,6 @@ from .rough_render import (
 )
 from .semantic_pause import (
     PAUSE_TARGETS_MS,
-    ROOM_TONE_FADE_MS,
-    PausePlanError,
-    SourceRoomToneAllocator,
     create_pause_plan,
     refine_eof_tail,
     validate_pause_response,
@@ -100,6 +104,8 @@ BREATH_CLEANUP_MODES = ("off", "replace")
 BREATH_ALIGNMENT_MIN_GAP_MS = 20.0
 PAUSE_POLICIES = ("semantic", "cuts")
 CUTS_PAUSE_BACKEND = "deterministic_video_cuts"
+AMBIENCE_BANK_SCHEMA_VERSION = 1
+AMBIENCE_ARTIFACT_GUARD_MS = 0.0
 
 
 class FinalRenderError(RuntimeError):
@@ -2605,6 +2611,126 @@ def _subtract_sample_intervals(
     return remaining
 
 
+def _subtract_artifact_replacements_from_breath_events(
+    *,
+    events: Sequence[dict[str, Any]],
+    artifact_replacements: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Prevent two cleanup decisions from owning the same canonical samples."""
+
+    artifact_targets = [
+        (
+            int(replacement["target_start_sample"]),
+            int(replacement["target_end_sample"]),
+        )
+        for replacement in artifact_replacements
+    ]
+    fragments: list[dict[str, Any]] = []
+    covered_records: list[dict[str, Any]] = []
+    for source_event_index, event in enumerate(events):
+        event_start = int(event["start_sample"])
+        event_end = int(event["end_sample"])
+        uncovered = _subtract_sample_intervals(
+            [(event_start, event_end)],
+            artifact_targets,
+        )
+        if not uncovered:
+            covered_records.append(
+                {
+                    **dict(event),
+                    "event_index": source_event_index,
+                    "source_event_index": source_event_index,
+                    "editable_intersection": [],
+                    "protected_phone_intersections": [],
+                    "replacements": [
+                        replacement["replacement_id"]
+                        for replacement in artifact_replacements
+                        if _intervals_overlap(
+                            event_start,
+                            event_end,
+                            int(replacement["target_start_sample"]),
+                            int(replacement["target_end_sample"]),
+                        )
+                    ],
+                    "status": "breath_cleanup_covered_by_artifact_replacement",
+                }
+            )
+            continue
+        for fragment_index, (fragment_start, fragment_end) in enumerate(uncovered):
+            fragments.append(
+                {
+                    **dict(event),
+                    "start_sample": fragment_start,
+                    "end_sample": fragment_end,
+                    "source_event_index": source_event_index,
+                    "fragment_index": fragment_index,
+                }
+            )
+    return fragments, covered_records
+
+
+def _aggregate_breath_fragment_records(
+    *,
+    source_events: Sequence[dict[str, Any]],
+    fragment_records: Sequence[dict[str, Any]],
+    covered_records: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Restore one stable diagnostic record per detector event."""
+
+    covered_by_index = {
+        int(record["source_event_index"]): dict(record) for record in covered_records
+    }
+    aggregated: list[dict[str, Any]] = []
+    for source_event_index, source_event in enumerate(source_events):
+        covered = covered_by_index.get(source_event_index)
+        if covered is not None:
+            aggregated.append(covered)
+            continue
+        fragments = [
+            dict(record)
+            for record in fragment_records
+            if int(record.get("source_event_index", record.get("event_index", -1)))
+            == source_event_index
+        ]
+        replacements = [
+            str(replacement_id)
+            for fragment in fragments
+            for replacement_id in fragment.get("replacements", [])
+        ]
+        protected = [
+            dict(interval)
+            for fragment in fragments
+            for interval in fragment.get("protected_phone_intersections", [])
+        ]
+        editable = [
+            dict(interval)
+            for fragment in fragments
+            for interval in fragment.get("editable_intersection", [])
+        ]
+        statuses = [str(fragment.get("status", "")) for fragment in fragments]
+        if replacements:
+            status = "breath_replaced_with_verified_clean_ambience"
+        elif "breath_cleanup_skipped_phone_overlap" in statuses:
+            status = "breath_cleanup_skipped_phone_overlap"
+        elif "clean_ambience_unavailable" in statuses:
+            status = "clean_ambience_unavailable"
+        else:
+            status = "breath_cleanup_skipped_no_mfa_non_speech"
+        aggregated.append(
+            {
+                **dict(source_event),
+                "event_index": source_event_index,
+                "source_event_index": source_event_index,
+                "fragments": fragments,
+                "editable_intersection": editable,
+                "protected_phone_intersections": protected,
+                "replacements": replacements,
+                "status": status,
+            }
+        )
+    return aggregated
+
+
 def _suppress_fades_over_protected_speech(
     *,
     boundaries: Sequence[dict[str, Any]],
@@ -2842,6 +2968,333 @@ def _baseline_room_tone_exclusions(
     return exclusions
 
 
+def _merge_verified_ambience_spans(
+    spans: Sequence[dict[str, Any]],
+    *,
+    total_samples: int,
+) -> list[dict[str, Any]]:
+    """Union MFA-confirmed non-speech while retaining its provenance."""
+
+    merged: list[dict[str, Any]] = []
+    for raw in sorted(
+        spans,
+        key=lambda item: (int(item["start_sample"]), int(item["end_sample"])),
+    ):
+        start = max(0, min(total_samples, int(raw["start_sample"])))
+        end = max(start, min(total_samples, int(raw["end_sample"])))
+        if end <= start:
+            continue
+        raw_verification = raw.get("verification", "mfa_confirmed_non_speech")
+        verifications = (
+            [str(value) for value in raw_verification]
+            if isinstance(raw_verification, list)
+            else [str(raw_verification)]
+        )
+        context_ids = {str(value) for value in raw.get("context_ids", []) if str(value)}
+        context_id = raw.get("context_id")
+        if context_id:
+            context_ids.add(str(context_id))
+        if not merged or start > int(merged[-1]["end_sample"]):
+            merged.append(
+                {
+                    "start_sample": start,
+                    "end_sample": end,
+                    "verification": verifications,
+                    "context_ids": sorted(context_ids),
+                }
+            )
+            continue
+        merged[-1]["end_sample"] = max(int(merged[-1]["end_sample"]), end)
+        for verification in verifications:
+            if verification not in merged[-1]["verification"]:
+                merged[-1]["verification"].append(verification)
+        merged[-1]["context_ids"] = sorted({*merged[-1]["context_ids"], *context_ids})
+    return merged
+
+
+def _ambience_candidate_pieces(
+    *,
+    verified_spans: Sequence[dict[str, Any]],
+    exclusions: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split verified spans so every accepted/rejected sample is inspectable."""
+
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    candidate_index = 0
+    rejected_index = 0
+    for span in verified_spans:
+        span_start = int(span["start_sample"])
+        span_end = int(span["end_sample"])
+        overlapping = [
+            exclusion
+            for exclusion in exclusions
+            if _intervals_overlap(
+                span_start,
+                span_end,
+                int(exclusion["start_sample"]),
+                int(exclusion["end_sample"]),
+            )
+        ]
+        cut_points = {span_start, span_end}
+        for exclusion in overlapping:
+            cut_points.add(max(span_start, int(exclusion["start_sample"])))
+            cut_points.add(min(span_end, int(exclusion["end_sample"])))
+        ordered = sorted(cut_points)
+        for start, end in zip(ordered, ordered[1:]):
+            if end <= start:
+                continue
+            reasons = sorted(
+                {
+                    str(exclusion.get("reason", "excluded_source_interval"))
+                    for exclusion in overlapping
+                    if _intervals_overlap(
+                        start,
+                        end,
+                        int(exclusion["start_sample"]),
+                        int(exclusion["end_sample"]),
+                    )
+                }
+            )
+            common = {
+                "source_start_sample": start,
+                "source_end_sample": end,
+                "duration_samples": end - start,
+                "mfa_verification": list(span["verification"]),
+                "mfa_context_ids": list(span["context_ids"]),
+            }
+            if reasons:
+                rejected.append(
+                    {
+                        "candidate_id": f"ambience_rejected_{rejected_index:05d}",
+                        **common,
+                        "accepted": False,
+                        "status": "rejected",
+                        "rejection_reasons": [
+                            {"code": reason, "source": "source_mask"}
+                            for reason in reasons
+                        ],
+                    }
+                )
+                rejected_index += 1
+                continue
+            candidates.append(
+                {
+                    "candidate_id": f"ambience_{candidate_index:05d}",
+                    **common,
+                }
+            )
+            candidate_index += 1
+    return candidates, rejected
+
+
+def _build_verified_ambience_bank(
+    *,
+    source_audio: np.ndarray,
+    sample_rate: int,
+    total_samples: int,
+    verified_spans: Sequence[dict[str, Any]],
+    exclusions: Sequence[dict[str, Any]],
+    detector_status: str,
+    detector_error: str | None,
+) -> dict[str, Any]:
+    """Build the sole production bank from untouched canonical samples."""
+
+    merged_spans = _merge_verified_ambience_spans(
+        verified_spans,
+        total_samples=total_samples,
+    )
+    candidates, mask_rejections = _ambience_candidate_pieces(
+        verified_spans=merged_spans,
+        exclusions=exclusions,
+    )
+    bank = build_clean_ambience_bank(
+        source_audio,
+        candidates=candidates,
+        sample_rate=sample_rate,
+        thresholds=DEFAULT_AMBIENCE_THRESHOLDS,
+    )
+    accepted = list(bank["accepted_candidates"])
+    if accepted:
+        target_rms_db = float(
+            median(float(item["metrics"]["rms_db"]) for item in accepted)
+        )
+        for item in bank["candidates"]:
+            item["target_rms_db"] = target_rms_db
+            item["noise_level_delta_db"] = abs(
+                float(item["metrics"]["rms_db"]) - target_rms_db
+            )
+        bank["target_rms_db"] = target_rms_db
+    deterministic_rejections = list(bank["rejected_candidates"])
+    all_rejections = [*mask_rejections, *deterministic_rejections]
+    for item in all_rejections:
+        reasons = item.get("rejection_reasons", [])
+        item["reason"] = (
+            str(reasons[0].get("code", "rejected"))
+            if isinstance(reasons, list) and reasons
+            else "rejected"
+        )
+    bank["schema_version"] = AMBIENCE_BANK_SCHEMA_VERSION
+    bank["detector_status"] = detector_status
+    bank["detector_error"] = detector_error
+    bank["verified_source_spans"] = merged_spans
+    bank["candidates"] = [*bank["candidates"], *mask_rejections]
+    bank["rejected_candidates"] = all_rejections
+    if detector_status not in {"complete", "no_relevant_regions"}:
+        # Respiro failure must not allow unverified ambience into inserted or
+        # cleaned pauses.  The edit can still render with source gaps intact.
+        rejection_code = (
+            "nuisance_detector_disabled"
+            if detector_status == "disabled_by_user"
+            else "breath_detector_unavailable"
+        )
+        invalidated = [
+            {
+                **dict(item),
+                "accepted": False,
+                "status": "rejected",
+                "rejection_reasons": [
+                    *list(item.get("rejection_reasons", [])),
+                    {"code": rejection_code, "source": "source_mask"},
+                ],
+                "reason": rejection_code,
+            }
+            for item in accepted
+        ]
+        invalidated_by_id = {str(item["candidate_id"]): item for item in invalidated}
+        bank["candidates"] = [
+            invalidated_by_id.get(str(item.get("candidate_id")), item)
+            for item in bank["candidates"]
+        ]
+        bank["rejected_candidates"] = [*all_rejections, *invalidated]
+        bank["accepted_candidates"] = []
+        bank["status"] = "clean_ambience_unavailable"
+        bank["failure_reason"] = rejection_code
+    bank["accepted_candidate_count"] = len(bank["accepted_candidates"])
+    bank["rejected_candidate_count"] = len(bank["rejected_candidates"])
+    return bank
+
+
+def _internal_gap_nuisance_evidence(
+    *,
+    joins: Sequence[dict[str, Any]],
+    source_audio: np.ndarray,
+    sample_rate: int,
+    detected_events: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flag deterministic artifacts only inside retained MFA-confirmed gaps."""
+
+    guard = round(AMBIENCE_ARTIFACT_GUARD_MS * sample_rate / 1000.0)
+    artifact_codes = {
+        "clipping",
+        "excessive_crest_factor",
+        "excessive_spectral_flux",
+        "unstable_log_band_energy",
+        "sudden_rms_burst",
+        "sample_discontinuity",
+    }
+    artifact_events: list[dict[str, Any]] = []
+    for join in joins:
+        pause_content = join.get("pause_content")
+        if not isinstance(pause_content, dict):
+            continue
+        if join.get("join_kind") != "internal_thought_pause":
+            pause_content["original_gap_content"] = "omitted_gap_not_used"
+            continue
+        quiet = join.get("verified_quiet_interval")
+        if not isinstance(quiet, dict):
+            pause_content["original_gap_content"] = "preserved_unverified"
+            continue
+        gap_start = int(quiet["start_sample"])
+        gap_end = int(quiet["end_sample"])
+        breath_intersections = [
+            {
+                "kind": "breath",
+                "start_sample": max(gap_start, int(event["start_sample"])),
+                "end_sample": min(gap_end, int(event["end_sample"])),
+                "maximum_probability": event.get("maximum_probability"),
+                "mean_probability": event.get("mean_probability"),
+            }
+            for event in detected_events
+            if _intervals_overlap(
+                gap_start,
+                gap_end,
+                int(event["start_sample"]),
+                int(event["end_sample"]),
+            )
+        ]
+        evaluation_start = gap_start + guard
+        evaluation_end = gap_end - guard
+        artifact_evidence: dict[str, Any] | None = None
+        if evaluation_end > evaluation_start:
+            artifact_evidence = evaluate_ambience_candidate(
+                source_audio,
+                candidate_id=f"existing_gap_{join['join_id']}",
+                start_sample=evaluation_start,
+                end_sample=evaluation_end,
+                sample_rate=sample_rate,
+                thresholds=DEFAULT_AMBIENCE_THRESHOLDS,
+            )
+        artifact_reasons = (
+            [
+                dict(reason)
+                for reason in artifact_evidence["rejection_reasons"]
+                if str(reason.get("code")) in artifact_codes
+            ]
+            if artifact_evidence is not None
+            else []
+        )
+        artifact_intersections: list[dict[str, Any]] = []
+        if artifact_reasons:
+            artifact = {
+                "event_type": "deterministic_nonstationary_artifact",
+                "start_sample": gap_start,
+                "end_sample": gap_end,
+                "analysis_start_sample": evaluation_start,
+                "analysis_end_sample": evaluation_end,
+                "join_id": str(join["join_id"]),
+                "metrics": artifact_evidence["metrics"],
+                "rejection_reasons": artifact_reasons,
+                "local_noise_floor_db": _local_source_noise_floor_db(
+                    source_audio,
+                    sample_rate=sample_rate,
+                    reference_sample=(gap_start + gap_end) // 2,
+                ),
+            }
+            artifact_events.append(artifact)
+            artifact_intersections.append(artifact)
+        pause_content["nuisance_mask_intersections"] = [
+            *breath_intersections,
+            *artifact_intersections,
+        ]
+        pause_content["existing_gap_stationarity"] = (
+            {
+                "analysis_start_sample": evaluation_start,
+                "analysis_end_sample": evaluation_end,
+                "metrics": artifact_evidence["metrics"],
+                "status": (
+                    "artifact_detected" if artifact_reasons else "verified_clean"
+                ),
+                "rejection_reasons": artifact_reasons,
+            }
+            if artifact_evidence is not None
+            else {
+                "status": "not_evaluated_insufficient_duration",
+                "analysis_start_sample": evaluation_start,
+                "analysis_end_sample": evaluation_end,
+            }
+        )
+        if breath_intersections or artifact_intersections:
+            pause_content["original_gap_content"] = "nuisance_detected"
+        elif artifact_evidence is not None:
+            pause_content["original_gap_content"] = "preserved_verified_clean"
+        else:
+            pause_content["original_gap_content"] = (
+                "preserved_unverified_insufficient_duration"
+            )
+    return artifact_events
+
+
 def _validate_breath_payload(
     payload: dict[str, Any],
     *,
@@ -2885,41 +3338,109 @@ def _validate_breath_payload(
 
 def _room_tone_ranges(
     *,
-    allocator: SourceRoomToneAllocator,
+    ambience_bank: dict[str, Any],
     frame_count: int,
     reference_sample: int,
-) -> tuple[list[dict[str, int]], int]:
+    reference_rms_db: float,
+    candidate_usage_counts: dict[str, int],
+) -> dict[str, Any]:
     if frame_count <= 0:
-        return [], 0
-    _, selection = allocator.allocate(
-        frame_count=frame_count,
+        return plan_ambience_assembly(
+            ambience_bank,
+            required_samples=0,
+            sample_rate=int(ambience_bank["sample_rate"]),
+        )
+    assembly = plan_ambience_assembly(
+        ambience_bank,
+        required_samples=frame_count,
+        sample_rate=int(ambience_bank["sample_rate"]),
         reference_sample=reference_sample,
+        reference_rms_db=reference_rms_db,
+        crossfade_ms=DEFAULT_AMBIENCE_CROSSFADE_MS,
+        candidate_usage_counts=candidate_usage_counts,
     )
-    if selection is None:
-        raise FinalRenderError("positive room-tone allocation returned no source")
-    ranges = [
-        {"source_start_sample": start, "source_end_sample": end}
-        for start, end in selection.source_ranges
-    ]
-    if (
-        sum(item["source_end_sample"] - item["source_start_sample"] for item in ranges)
-        != frame_count
-    ):
-        raise FinalRenderError("room-tone source ranges have the wrong duration")
-    return ranges, allocator.fade_samples
+    if assembly["status"] == "complete":
+        for candidate_id in assembly["candidate_ids"]:
+            key = str(candidate_id)
+            candidate_usage_counts[key] = candidate_usage_counts.get(key, 0) + 1
+    return assembly
 
 
-def _allocate_semantic_pause_room_tone(
+def _local_source_noise_floor_db(
+    source_audio: np.ndarray,
     *,
-    allocator: SourceRoomToneAllocator,
-    joins: Sequence[dict[str, Any]],
-    source_intervals: Sequence[dict[str, Any]],
-) -> None:
-    """Allocate pause content without changing any resolved source endpoint."""
+    sample_rate: int,
+    reference_sample: int,
+    radius_ms: float = 750.0,
+) -> float:
+    """Estimate the nearby canonical noise floor for ambience ranking only."""
+
+    radius = max(1, round(radius_ms * sample_rate / 1000.0))
+    start = max(0, reference_sample - radius)
+    end = min(len(source_audio), reference_sample + radius)
+    frame_samples = max(1, round(20.0 * sample_rate / 1000.0))
+    hop_samples = max(1, round(10.0 * sample_rate / 1000.0))
+    window = np.asarray(source_audio[start:end], dtype=np.float64)
+    if not len(window):
+        return -120.0
+    starts = list(range(0, max(1, len(window) - frame_samples + 1), hop_samples))
+    if not starts:
+        starts = [0]
+    frame_rms = []
+    for frame_start in starts:
+        frame = window[frame_start : frame_start + frame_samples]
+        if len(frame):
+            frame_rms.append(float(np.sqrt(np.mean(np.square(frame)))))
+    if not frame_rms:
+        return -120.0
+    rms = float(np.percentile(np.asarray(frame_rms), 20.0))
+    return 20.0 * math.log10(max(rms, 1.0e-12))
+
+
+def _initialize_pause_content(joins: Sequence[dict[str, Any]]) -> None:
+    """Create the pause provenance ledger before nuisance/bank analysis."""
 
     for join in joins:
         join["room_tone_source_ranges"] = []
         join["room_tone_fade_samples"] = 0
+        join["room_tone_crossfades"] = []
+        join["ambience_assembly"] = None
+        join["requested_inserted_pause_samples"] = int(join["inserted_pause_samples"])
+        join["pause_content"] = {
+            "pause_type": join["pause_type"],
+            "target_pause_samples": int(join["target_pause_samples"]),
+            "original_gap_samples": int(join["estimated_existing_pause_samples"]),
+            "original_content_preserved": (
+                join["join_kind"] == "internal_thought_pause"
+            ),
+            "original_content_replaced": False,
+            "nuisance_mask_intersections": [],
+            "clean_ambience_candidate_ids": [],
+            "source_to_output_sample_mapping": [],
+            "crossfades": [],
+            "stationarity_metrics": [],
+            "status": (
+                "original_gap_satisfies_target"
+                if int(join["inserted_pause_samples"]) <= 0
+                else "not_planned"
+            ),
+        }
+
+
+def _allocate_semantic_pause_room_tone(
+    *,
+    ambience_bank: dict[str, Any],
+    joins: Sequence[dict[str, Any]],
+    source_intervals: Sequence[dict[str, Any]],
+    source_audio: np.ndarray,
+    candidate_usage_counts: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Allocate pause content without changing any resolved source endpoint."""
+
+    usage_counts = candidate_usage_counts if candidate_usage_counts is not None else {}
+    allocation_ledger: list[dict[str, Any]] = []
+    if any(not isinstance(join.get("pause_content"), dict) for join in joins):
+        _initialize_pause_content(joins)
     for join in sorted(joins, key=lambda item: int(item["join_index"])):
         frame_count = int(join["inserted_pause_samples"])
         if frame_count <= 0:
@@ -2933,13 +3454,60 @@ def _allocate_semantic_pause_room_tone(
                 ]
             )
         )
-        ranges_payload, room_fade = _room_tone_ranges(
-            allocator=allocator,
-            frame_count=frame_count,
+        reference_rms_db = _local_source_noise_floor_db(
+            source_audio,
+            sample_rate=int(ambience_bank["sample_rate"]),
             reference_sample=reference,
         )
-        join["room_tone_source_ranges"] = ranges_payload
-        join["room_tone_fade_samples"] = room_fade
+        assembly = _room_tone_ranges(
+            ambience_bank=ambience_bank,
+            frame_count=frame_count,
+            reference_sample=reference,
+            reference_rms_db=reference_rms_db,
+            candidate_usage_counts=usage_counts,
+        )
+        ledger_entry = {
+            "join_id": str(join["join_id"]),
+            "reference_sample": reference,
+            "reference_noise_floor_db": reference_rms_db,
+            **json.loads(json.dumps(assembly)),
+        }
+        allocation_ledger.append(ledger_entry)
+        join["ambience_assembly"] = json.loads(json.dumps(assembly))
+        join["pause_content"]["surrounding_noise_floor_db"] = reference_rms_db
+        if assembly["status"] != "complete":
+            join["inserted_pause_samples"] = 0
+            join["inserted_pause_ms"] = 0.0
+            join["safety_status"] = "safe"
+            join["pause_content"]["status"] = "clean_ambience_unavailable"
+            continue
+        trace = list(assembly["source_trace"])
+        join["room_tone_source_ranges"] = [
+            {
+                "candidate_id": item["candidate_id"],
+                "source_start_sample": int(item["source_start_sample"]),
+                "source_end_sample": int(item["source_end_sample"]),
+            }
+            for item in trace
+        ]
+        join["room_tone_crossfades"] = list(assembly["crossfades"])
+        join["pause_content"].update(
+            {
+                "clean_ambience_candidate_ids": list(assembly["candidate_ids"]),
+                "source_to_output_sample_mapping": trace,
+                "crossfades": list(assembly["crossfades"]),
+                "stationarity_metrics": [
+                    {
+                        "candidate_id": item["candidate_id"],
+                        "stationarity_score": item["stationarity_score"],
+                        "noise_level_delta_db": item["noise_level_delta_db"],
+                    }
+                    for item in trace
+                ],
+                "status": "verified_clean_ambience",
+            }
+        )
+    return allocation_ledger
 
 
 def _append_source_segment(
@@ -2983,37 +3551,54 @@ def _append_source_segment(
     return output_end
 
 
-def _append_room_tone_segments(
+def _append_ambience_segment(
     segments: list[dict[str, Any]],
     *,
-    source_ranges: Sequence[dict[str, int]],
+    assembly: dict[str, Any],
     output_cursor: int,
-    fade_samples: int,
     join_id: str,
 ) -> int:
-    for source_range in source_ranges:
-        source_start = int(source_range["source_start_sample"])
-        source_end = int(source_range["source_end_sample"])
-        frame_count = source_end - source_start
-        if frame_count <= 0:
-            raise FinalRenderError("room-tone source range is empty")
-        actual_fade = min(fade_samples, frame_count // 2)
-        output_end = output_cursor + frame_count
-        segments.append(
+    if assembly.get("status") != "complete":
+        raise FinalRenderError("planned pause has no verified clean ambience")
+    frame_count = int(assembly["planned_output_samples"])
+    if frame_count <= 0:
+        raise FinalRenderError("positive ambience segment is empty")
+    output_end = output_cursor + frame_count
+    trace = []
+    for item in assembly["source_trace"]:
+        relative_start = int(item["output_start_sample"])
+        relative_end = int(item["output_end_sample"])
+        trace.append(
             {
-                "segment_index": len(segments),
-                "kind": "room_tone",
-                "join_id": join_id,
-                "source_start_sample": source_start,
-                "source_end_sample": source_end,
-                "output_start_sample": output_cursor,
-                "output_end_sample": output_end,
-                "fade_in_samples": actual_fade,
-                "fade_out_samples": actual_fade,
+                **dict(item),
+                "output_start_sample": output_cursor + relative_start,
+                "output_end_sample": output_cursor + relative_end,
             }
         )
-        output_cursor = output_end
-    return output_cursor
+    crossfades = []
+    for item in assembly["crossfades"]:
+        relative_start = int(item["output_start_sample"])
+        relative_end = int(item["output_end_sample"])
+        crossfades.append(
+            {
+                **dict(item),
+                "output_start_sample": output_cursor + relative_start,
+                "output_end_sample": output_cursor + relative_end,
+            }
+        )
+    segments.append(
+        {
+            "segment_index": len(segments),
+            "kind": "ambience",
+            "join_id": join_id,
+            "output_start_sample": output_cursor,
+            "output_end_sample": output_end,
+            "source_trace": trace,
+            "equal_power_crossfades": crossfades,
+            "source_reuse": bool(assembly.get("source_reuse", False)),
+        }
+    )
+    return output_end
 
 
 def _interval_fades(
@@ -3077,11 +3662,10 @@ def _build_output_segments(
                 breath_replacements=breath_replacements,
             )
             pause_start = output_cursor
-            output_cursor = _append_room_tone_segments(
+            output_cursor = _append_ambience_segment(
                 output_segments,
-                source_ranges=join["room_tone_source_ranges"],
+                assembly=join["ambience_assembly"],
                 output_cursor=output_cursor,
-                fade_samples=int(join["room_tone_fade_samples"]),
                 join_id=str(join["join_id"]),
             )
             join["output_pause_start_sample"] = pause_start
@@ -3100,13 +3684,13 @@ def _build_output_segments(
         if interval_index < len(source_intervals) - 1:
             join = clip_join_by_left[interval_index]
             pause_start = output_cursor
-            output_cursor = _append_room_tone_segments(
-                output_segments,
-                source_ranges=join["room_tone_source_ranges"],
-                output_cursor=output_cursor,
-                fade_samples=int(join["room_tone_fade_samples"]),
-                join_id=str(join["join_id"]),
-            )
+            if int(join["inserted_pause_samples"]) > 0:
+                output_cursor = _append_ambience_segment(
+                    output_segments,
+                    assembly=join["ambience_assembly"],
+                    output_cursor=output_cursor,
+                    join_id=str(join["join_id"]),
+                )
             join["output_pause_start_sample"] = pause_start
             join["output_pause_end_sample"] = output_cursor
     planned_replacements = {str(item["replacement_id"]) for item in breath_replacements}
@@ -3117,7 +3701,231 @@ def _build_output_segments(
     }
     if attached_replacements != planned_replacements:
         raise FinalRenderError("breath replacement does not map to one source segment")
+    ambience_segment_by_join = {
+        str(segment["join_id"]): segment
+        for segment in output_segments
+        if segment["kind"] == "ambience"
+    }
+    for join in joins:
+        segment = ambience_segment_by_join.get(str(join["join_id"]))
+        if segment is None:
+            continue
+        pause_content = join["pause_content"]
+        pause_content["source_to_output_sample_mapping"] = list(segment["source_trace"])
+        pause_content["crossfades"] = list(segment["equal_power_crossfades"])
     return output_segments
+
+
+def _plan_ambience_edge_transitions(
+    *,
+    segments: Sequence[dict[str, Any]],
+    joins: Sequence[dict[str, Any]],
+    source_audio: np.ndarray,
+    sample_rate: int,
+) -> None:
+    """Taper ambience only when adjacent source already reaches verified quiet."""
+
+    join_by_id = {str(join["join_id"]): join for join in joins}
+    requested = max(1, round(DEFAULT_AMBIENCE_CROSSFADE_MS * sample_rate / 1000.0))
+    for segment_index, segment in enumerate(segments):
+        if segment.get("kind") != "ambience":
+            continue
+        if segment_index == 0 or segment_index + 1 >= len(segments):
+            raise FinalRenderError("ambience segment has no adjacent retained source")
+        left = segments[segment_index - 1]
+        right = segments[segment_index + 1]
+        if left.get("kind") != "source" or right.get("kind") != "source":
+            raise FinalRenderError("ambience is not bounded by retained source")
+        duration = int(segment["output_end_sample"]) - int(
+            segment["output_start_sample"]
+        )
+        transition_samples = min(requested, duration // 2)
+        left_source_end = int(left["source_end_sample"])
+        right_source_start = int(right["source_start_sample"])
+        left_fade = next(
+            (
+                fade
+                for fade in left.get("gain_envelopes", [])
+                if fade.get("curve") == "fade_out"
+                and fade.get("verified_quiet") is True
+                and int(fade["source_end_sample"]) == left_source_end
+                and int(fade["source_end_sample"]) - int(fade["source_start_sample"])
+                >= 2
+            ),
+            None,
+        )
+        right_fade = next(
+            (
+                fade
+                for fade in right.get("gain_envelopes", [])
+                if fade.get("curve") == "fade_in"
+                and fade.get("verified_quiet") is True
+                and int(fade["source_start_sample"]) == right_source_start
+                and int(fade["source_end_sample"]) - int(fade["source_start_sample"])
+                >= 2
+            ),
+            None,
+        )
+        first_trace = segment["source_trace"][0]
+        last_trace = segment["source_trace"][-1]
+        raw_left = source_audio[left_source_end - 1]
+        raw_ambience_start = source_audio[int(first_trace["source_start_sample"])]
+        raw_ambience_end = source_audio[int(last_trace["source_end_sample"]) - 1]
+        raw_right = source_audio[right_source_start]
+        edge_envelopes: list[dict[str, Any]] = []
+        transition_records: list[dict[str, Any]] = []
+        for side, source_fade, raw_source, raw_ambience in (
+            ("left", left_fade, raw_left, raw_ambience_start),
+            ("right", right_fade, raw_right, raw_ambience_end),
+        ):
+            applied = source_fade is not None and transition_samples >= 2
+            if side == "left":
+                ambience_start = int(segment["output_start_sample"])
+                ambience_end = ambience_start + transition_samples
+                curve = "equal_power_fade_in"
+            else:
+                ambience_end = int(segment["output_end_sample"])
+                ambience_start = ambience_end - transition_samples
+                curve = "equal_power_fade_out"
+            if applied:
+                edge_envelopes.append(
+                    {
+                        "side": side,
+                        "curve": curve,
+                        "output_start_sample": ambience_start,
+                        "output_end_sample": ambience_end,
+                        "verified_ambience": True,
+                    }
+                )
+            raw_discontinuity = float(np.max(np.abs(raw_ambience - raw_source)))
+            transition_records.append(
+                {
+                    "side": side,
+                    "status": (
+                        "ambience_edge_taper_applied"
+                        if applied
+                        else "not_applied_no_verified_source_handle"
+                    ),
+                    "source_fade_interval": (
+                        dict(source_fade) if source_fade is not None else None
+                    ),
+                    "ambience_transition_interval": (
+                        {
+                            "output_start_sample": ambience_start,
+                            "output_end_sample": ambience_end,
+                            "curve": curve,
+                        }
+                        if applied
+                        else None
+                    ),
+                    "raw_maximum_sample_discontinuity": raw_discontinuity,
+                    "planned_maximum_sample_discontinuity": (
+                        0.0 if applied else raw_discontinuity
+                    ),
+                }
+            )
+        segment["edge_gain_envelopes"] = edge_envelopes
+        segment["outer_transitions"] = transition_records
+        join = join_by_id[str(segment["join_id"])]
+        join["pause_content"]["outer_transitions"] = transition_records
+        join["pause_content"]["maximum_sample_discontinuity"] = max(
+            float(record["planned_maximum_sample_discontinuity"])
+            for record in transition_records
+        )
+
+
+def _finalize_pause_output_provenance(
+    *,
+    joins: Sequence[dict[str, Any]],
+    segments: Sequence[dict[str, Any]],
+) -> None:
+    """Attach direct canonical-source-to-final-output mappings to each pause."""
+
+    source_segments = [
+        segment for segment in segments if segment.get("kind") == "source"
+    ]
+    replacement_location: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    for segment in source_segments:
+        for replacement in segment.get("sample_replacements", []):
+            replacement_location[str(replacement["replacement_id"])] = (
+                segment,
+                replacement,
+            )
+    for join in joins:
+        pause_content = join.get("pause_content")
+        if not isinstance(pause_content, dict):
+            continue
+        raw_gaps: list[dict[str, Any]] = []
+        quiet = join.get("verified_quiet_interval")
+        if isinstance(quiet, dict):
+            raw_gaps.append(quiet)
+        for item in join.get("verified_quiet_intervals", []):
+            if isinstance(item, dict):
+                raw_gaps.append(item)
+        original_mappings: list[dict[str, int]] = []
+        for gap in raw_gaps:
+            gap_start = int(gap["start_sample"])
+            gap_end = int(gap["end_sample"])
+            for segment in source_segments:
+                source_start = int(segment["source_start_sample"])
+                source_end = int(segment["source_end_sample"])
+                retained_start = max(gap_start, source_start)
+                retained_end = min(gap_end, source_end)
+                if retained_start >= retained_end:
+                    continue
+                output_start = int(segment["output_start_sample"]) + (
+                    retained_start - source_start
+                )
+                original_mappings.append(
+                    {
+                        "source_start_sample": retained_start,
+                        "source_end_sample": retained_end,
+                        "output_start_sample": output_start,
+                        "output_end_sample": output_start
+                        + retained_end
+                        - retained_start,
+                    }
+                )
+        pause_content["original_gap_source_to_output_mapping"] = original_mappings
+        for nuisance in pause_content.get("nuisance_replacements", []):
+            replacement_id = str(nuisance["replacement_id"])
+            location = replacement_location.get(replacement_id)
+            if location is None:
+                continue
+            segment, replacement = location
+            source_segment_start = int(segment["source_start_sample"])
+            output_segment_start = int(segment["output_start_sample"])
+            target_start = int(replacement["target_start_sample"])
+            target_end = int(replacement["target_end_sample"])
+            final_target_start = (
+                output_segment_start + target_start - source_segment_start
+            )
+            nuisance["output_target_start_sample"] = final_target_start
+            nuisance["output_target_end_sample"] = (
+                final_target_start + target_end - target_start
+            )
+            nuisance["source_to_output_sample_mapping"] = [
+                {
+                    **dict(contribution),
+                    "output_start_sample": final_target_start
+                    + int(contribution["output_start_sample"]),
+                    "output_end_sample": final_target_start
+                    + int(contribution["output_end_sample"]),
+                }
+                for contribution in replacement.get("source_trace", [])
+            ]
+            nuisance["crossfades"] = [
+                {
+                    **dict(crossfade),
+                    "output_start_sample": final_target_start
+                    + int(crossfade["output_start_sample"]),
+                    "output_end_sample": final_target_start
+                    + int(crossfade["output_end_sample"]),
+                }
+                for crossfade in replacement.get("ambience_assembly", {}).get(
+                    "crossfades", []
+                )
+            ]
 
 
 def build_final_boundary_plan(
@@ -3683,6 +4491,12 @@ def build_final_boundary_plan(
     mfa_non_silence_source_spans: list[dict[str, Any]] = []
     room_tone_mfa_source_spans: list[dict[str, Any]] = []
     breath_replacements: list[dict[str, Any]] = []
+    artifact_replacements: list[dict[str, Any]] = []
+    artifact_cleanup_plan: dict[str, Any] = {
+        "status": "not_run_unsafe_boundary_plan",
+        "events": [],
+        "replacements": [],
+    }
     breath_cleanup_plan: dict[str, Any] = {
         "mode": breath_cleanup,
         "backend": "respiro-en" if breath_cleanup == "replace" else None,
@@ -3703,76 +4517,72 @@ def build_final_boundary_plan(
         "room_tone_allocations": [],
         "error": None,
     }
+    clean_ambience_bank: dict[str, Any] = {
+        "schema_version": AMBIENCE_BANK_SCHEMA_VERSION,
+        "status": "not_built_unsafe_boundary_plan",
+        "sample_rate": sample_rate,
+        "accepted_candidates": [],
+        "rejected_candidates": [],
+        "candidates": [],
+    }
     if plan_status == "safe":
-        allocator_kwargs: dict[str, Any] = {}
+        protected_speech_mask = _retained_mfa_phone_mask(
+            mfa_contexts=list(mfa_context_by_key.values()),
+            source_intervals=source_intervals,
+            selected_word_ids=_selected_word_ids(ranges),
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
+        _suppress_fades_over_protected_speech(
+            boundaries=boundaries,
+            joins=joins,
+            protected_speech_mask=protected_speech_mask,
+        )
+        gap_evidence = _mfa_gap_evidence(
+            jobs=jobs,
+            mfa_context_by_key=mfa_context_by_key,
+            source_intervals=source_intervals,
+            sample_rate=sample_rate,
+        )
+        editable_non_speech = _editable_non_speech_intervals(
+            gap_evidence=gap_evidence,
+            source_intervals=source_intervals,
+            boundaries=boundaries,
+            joins=joins,
+            protected_speech_mask=protected_speech_mask,
+        )
+        mfa_non_silence_source_spans = _collect_mfa_non_silence_source_spans(
+            mfa_contexts=list(mfa_context_by_key.values()),
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
+        room_tone_mfa_source_spans = _mfa_silence_source_spans(
+            mfa_contexts=list(mfa_context_by_key.values()),
+            non_silence_spans=mfa_non_silence_source_spans,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
+        verified_ambience_spans = _merge_verified_ambience_spans(
+            [*editable_non_speech, *room_tone_mfa_source_spans],
+            total_samples=total_samples,
+        )
+        baseline_exclusions = _baseline_room_tone_exclusions(
+            protected_speech_mask=protected_speech_mask,
+            mfa_non_silence_spans=mfa_non_silence_source_spans,
+            boundaries=boundaries,
+            joins=joins,
+            words=words,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
         breath_evidence: dict[str, Any] | None = None
+        detector_error: str | None = None
+        detector_status = "disabled_by_user"
         if breath_cleanup == "replace":
-            protected_speech_mask = _retained_mfa_phone_mask(
-                mfa_contexts=list(mfa_context_by_key.values()),
-                source_intervals=source_intervals,
-                selected_word_ids=_selected_word_ids(ranges),
-                sample_rate=sample_rate,
-                total_samples=total_samples,
-            )
-            _suppress_fades_over_protected_speech(
-                boundaries=boundaries,
-                joins=joins,
-                protected_speech_mask=protected_speech_mask,
-            )
-            gap_evidence = _mfa_gap_evidence(
-                jobs=jobs,
-                mfa_context_by_key=mfa_context_by_key,
-                source_intervals=source_intervals,
-                sample_rate=sample_rate,
-            )
-            editable_non_speech = _editable_non_speech_intervals(
-                gap_evidence=gap_evidence,
-                source_intervals=source_intervals,
-                boundaries=boundaries,
-                joins=joins,
-                protected_speech_mask=protected_speech_mask,
-            )
-            mfa_non_silence_source_spans = _collect_mfa_non_silence_source_spans(
-                mfa_contexts=list(mfa_context_by_key.values()),
-                sample_rate=sample_rate,
-                total_samples=total_samples,
-            )
-            room_tone_mfa_source_spans = _mfa_silence_source_spans(
-                mfa_contexts=list(mfa_context_by_key.values()),
-                non_silence_spans=mfa_non_silence_source_spans,
-                sample_rate=sample_rate,
-                total_samples=total_samples,
-            )
-            room_tone_allowed_spans = [
-                (int(item["start_sample"]), int(item["end_sample"]))
-                for item in [
-                    *editable_non_speech,
-                    *room_tone_mfa_source_spans,
-                ]
-            ]
-            baseline_exclusions = _baseline_room_tone_exclusions(
-                protected_speech_mask=protected_speech_mask,
-                mfa_non_silence_spans=mfa_non_silence_source_spans,
-                boundaries=boundaries,
-                joins=joins,
-                words=words,
-                sample_rate=sample_rate,
-                total_samples=total_samples,
-            )
-            preliminary_allocator = SourceRoomToneAllocator(
-                source_audio=source_audio,
-                mono=mono,
-                words=words,
-                sample_rate=sample_rate,
-                word_guard_ms=0.0,
-                allowed_source_spans=room_tone_allowed_spans,
-                exclusion_intervals=baseline_exclusions,
-            )
             relevant_ranges = [
                 (int(item["start_sample"]), int(item["end_sample"]))
-                for item in editable_non_speech
+                for item in verified_ambience_spans
             ]
-            relevant_ranges.extend(preliminary_allocator.candidate_ranges)
             relevant_ranges.extend(
                 (selected, min(total_samples, selected + 1))
                 for boundary in boundaries
@@ -3799,6 +4609,7 @@ def build_final_boundary_plan(
                     minimum_duration_ms=breath_min_duration_ms,
                     total_samples=total_samples,
                 )
+                detector_status = str(breath_evidence["status"])
             except Exception as error:
                 warning = (
                     "Respiro-en breath cleanup was skipped; preserving the "
@@ -3809,112 +4620,232 @@ def build_final_boundary_plan(
                     "breath_cleanup_skipped_detector_failure"
                 )
                 breath_cleanup_plan["error"] = warning
+                detector_status = "breath_cleanup_skipped_detector_failure"
+                detector_error = warning
 
-            detected_events = (
-                list(breath_evidence["events"]) if breath_evidence is not None else []
-            )
-            detector_exclusions = breath_room_tone_exclusions(
-                detected_events,
-                sample_rate=sample_rate,
-                total_samples=total_samples,
-            )
-            if breath_evidence is not None:
-                allocator_kwargs = {
-                    "word_guard_ms": 0.0,
-                    "allowed_source_spans": room_tone_allowed_spans,
-                    "allow_reuse": True,
-                    "exclusion_intervals": [
-                        *baseline_exclusions,
-                        *detector_exclusions,
-                    ],
-                }
-                room_tone_exclusions = [
-                    *baseline_exclusions,
-                    *detector_exclusions,
-                ]
-            else:
-                # Respiro is optional. Restore the pre-feature allocator so a
-                # detector/runtime failure cannot invalidate a safe MFA edit.
-                allocator_kwargs = {}
-                room_tone_exclusions = []
-            breath_cleanup_plan["detector_evidence"] = breath_evidence
-            breath_cleanup_plan["detected_events"] = detected_events
-            breath_cleanup_plan["room_tone_exclusions"] = room_tone_exclusions
-
-        allocator = SourceRoomToneAllocator(
-            source_audio=source_audio,
-            mono=mono,
-            words=words,
-            sample_rate=sample_rate,
-            **allocator_kwargs,
+        raw_detected_events = (
+            list(breath_evidence["events"]) if breath_evidence is not None else []
         )
-        try:
-            _allocate_semantic_pause_room_tone(
-                allocator=allocator,
-                joins=joins,
-                source_intervals=source_intervals,
-            )
-        except PausePlanError as error:
-            if breath_cleanup != "replace" or breath_evidence is None:
-                raise
-            warning = (
-                "Respiro-en breath cleanup was skipped because verified clean "
-                "room tone could not satisfy the existing semantic pauses; "
-                f"preserving the valid MFA edit: {error}"
-            )
-            warnings.warn(warning, RuntimeWarning, stacklevel=2)
-            breath_cleanup_plan["status"] = "breath_cleanup_skipped_no_clean_room_tone"
-            breath_cleanup_plan["error"] = warning
-            breath_cleanup_plan["enhancement_candidate_rejections"] = (
-                allocator.rejection_ledger
-            )
-            breath_cleanup_plan["events"] = [
-                {
-                    **dict(event),
-                    "event_index": event_index,
-                    "editable_intersection": [],
-                    "protected_phone_intersections": [],
-                    "replacements": [],
-                    "status": "breath_cleanup_skipped_no_clean_room_tone",
-                }
-                for event_index, event in enumerate(
-                    breath_cleanup_plan["detected_events"]
-                )
-            ]
-            breath_cleanup_plan["room_tone_exclusions"] = []
-            breath_evidence = None
-            allocator = SourceRoomToneAllocator(
-                source_audio=source_audio,
-                mono=mono,
-                words=words,
-                sample_rate=sample_rate,
-            )
-            _allocate_semantic_pause_room_tone(
-                allocator=allocator,
-                joins=joins,
-                source_intervals=source_intervals,
-            )
-        if breath_cleanup == "replace" and breath_evidence is not None:
-            breath_replacements, event_records = plan_breath_replacements(
-                events=list(breath_evidence["events"]),
+        detected_events = [
+            {
+                **dict(event),
+                "local_noise_floor_db": _local_source_noise_floor_db(
+                    source_audio,
+                    sample_rate=sample_rate,
+                    reference_sample=(
+                        int(event["start_sample"]) + int(event["end_sample"])
+                    )
+                    // 2,
+                ),
+            }
+            for event in raw_detected_events
+        ]
+        detector_exclusions = breath_room_tone_exclusions(
+            detected_events,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+        )
+        _initialize_pause_content(joins)
+        artifact_events = _internal_gap_nuisance_evidence(
+            joins=joins,
+            source_audio=source_audio,
+            sample_rate=sample_rate,
+            detected_events=detected_events,
+        )
+        artifact_exclusions = [
+            {
+                "start_sample": int(event["start_sample"]),
+                "end_sample": int(event["end_sample"]),
+                "reason": "deterministic_nonstationary_artifact",
+                "join_id": str(event["join_id"]),
+            }
+            for event in artifact_events
+        ]
+        room_tone_exclusions = [
+            *baseline_exclusions,
+            *detector_exclusions,
+            *artifact_exclusions,
+        ]
+        clean_ambience_bank = _build_verified_ambience_bank(
+            source_audio=source_audio,
+            sample_rate=sample_rate,
+            total_samples=total_samples,
+            verified_spans=verified_ambience_spans,
+            exclusions=room_tone_exclusions,
+            detector_status=detector_status,
+            detector_error=detector_error,
+        )
+        ambience_usage_counts: dict[str, int] = {}
+        room_tone_allocations = _allocate_semantic_pause_room_tone(
+            ambience_bank=clean_ambience_bank,
+            joins=joins,
+            source_intervals=source_intervals,
+            source_audio=source_audio,
+            candidate_usage_counts=ambience_usage_counts,
+        )
+        if artifact_events:
+            artifact_replacements, artifact_records = plan_breath_replacements(
+                events=artifact_events,
                 editable_non_speech=editable_non_speech,
                 protected_speech_mask=protected_speech_mask,
-                allocator=allocator,
+                ambience_bank=clean_ambience_bank,
                 sample_rate=sample_rate,
                 total_samples=total_samples,
+                guard_ms=0.0,
+                transition_ms=BREATH_TRANSITION_MS,
+                candidate_usage_counts=ambience_usage_counts,
             )
-            breath_cleanup_plan["events"] = event_records
+            replacement_id_map: dict[str, str] = {}
+            for replacement_index, replacement in enumerate(artifact_replacements):
+                old_id = str(replacement["replacement_id"])
+                new_id = f"artifact_replacement_{replacement_index:04d}"
+                replacement_id_map[old_id] = new_id
+                replacement["replacement_id"] = new_id
+                replacement["event_type"] = "deterministic_nonstationary_artifact"
+                replacement["status"] = "artifact_replaced_with_verified_clean_ambience"
+            for record in artifact_records:
+                record["event_type"] = "deterministic_nonstationary_artifact"
+                record["replacements"] = [
+                    replacement_id_map.get(str(value), str(value))
+                    for value in record.get("replacements", [])
+                ]
+                if record["replacements"]:
+                    record["status"] = "artifact_replaced_with_verified_clean_ambience"
+            artifact_cleanup_plan = {
+                "status": (
+                    "complete"
+                    if artifact_records
+                    and all(record.get("replacements") for record in artifact_records)
+                    else "clean_ambience_unavailable"
+                ),
+                "events": artifact_records,
+                "replacements": artifact_replacements,
+            }
+        else:
+            artifact_cleanup_plan = {
+                "status": "no_artifacts_detected",
+                "events": [],
+                "replacements": [],
+            }
+        if breath_cleanup == "replace" and breath_evidence is not None:
+            breath_fragments, covered_event_records = (
+                _subtract_artifact_replacements_from_breath_events(
+                    events=detected_events,
+                    artifact_replacements=artifact_replacements,
+                )
+            )
+            breath_replacements, event_records = plan_breath_replacements(
+                events=breath_fragments,
+                editable_non_speech=editable_non_speech,
+                protected_speech_mask=protected_speech_mask,
+                ambience_bank=clean_ambience_bank,
+                sample_rate=sample_rate,
+                total_samples=total_samples,
+                candidate_usage_counts=ambience_usage_counts,
+            )
+            breath_cleanup_plan["events"] = _aggregate_breath_fragment_records(
+                source_events=detected_events,
+                fragment_records=event_records,
+                covered_records=covered_event_records,
+            )
             breath_cleanup_plan["replacements"] = breath_replacements
             breath_cleanup_plan["status"] = "complete"
-        breath_cleanup_plan["room_tone_candidate_rejections"] = (
-            allocator.rejection_ledger
+        all_nuisance_replacements = sorted(
+            [*breath_replacements, *artifact_replacements],
+            key=lambda item: (
+                int(item["target_start_sample"]),
+                int(item["target_end_sample"]),
+            ),
         )
-        breath_cleanup_plan["room_tone_allocations"] = allocator.allocation_ledger
+        for join in joins:
+            pause_content = join.get("pause_content")
+            quiet = join.get("verified_quiet_interval")
+            if not isinstance(pause_content, dict) or not isinstance(quiet, dict):
+                continue
+            gap_start = int(quiet["start_sample"])
+            gap_end = int(quiet["end_sample"])
+            replacements = [
+                replacement
+                for replacement in all_nuisance_replacements
+                if _intervals_overlap(
+                    gap_start,
+                    gap_end,
+                    int(replacement["target_start_sample"]),
+                    int(replacement["target_end_sample"]),
+                )
+            ]
+            pause_content["nuisance_replacements"] = [
+                {
+                    "replacement_id": replacement["replacement_id"],
+                    "target_start_sample": replacement["target_start_sample"],
+                    "target_end_sample": replacement["target_end_sample"],
+                    "candidate_ids": list(replacement.get("candidate_ids", [])),
+                    "source_trace": list(replacement.get("source_trace", [])),
+                    "crossfades": list(replacement.get("equal_power_crossfades", [])),
+                    "status": replacement["status"],
+                }
+                for replacement in replacements
+            ]
+            if replacements:
+                covered = _subtract_sample_intervals(
+                    [(gap_start, gap_end)],
+                    [
+                        (
+                            int(replacement["target_start_sample"]),
+                            int(replacement["target_end_sample"]),
+                        )
+                        for replacement in replacements
+                    ],
+                )
+                pause_content["original_gap_content"] = (
+                    "replaced_with_verified_clean_ambience"
+                    if not covered
+                    else "partially_replaced_with_verified_clean_ambience"
+                )
+                pause_content["original_content_preserved"] = bool(covered)
+                pause_content["original_content_replaced"] = True
+            elif pause_content["nuisance_mask_intersections"]:
+                pause_content["status"] = "clean_ambience_unavailable"
+        breath_cleanup_plan["detector_evidence"] = breath_evidence
+        breath_cleanup_plan["detected_events"] = detected_events
+        breath_cleanup_plan["room_tone_exclusions"] = room_tone_exclusions
+        breath_cleanup_plan["room_tone_candidate_rejections"] = list(
+            clean_ambience_bank["rejected_candidates"]
+        )
+        breath_cleanup_plan["room_tone_allocations"] = room_tone_allocations
+        clean_ambience_bank["usage_policy"] = (
+            "rank stationarity, local noise-floor match, and duration first; "
+            "then prefer the least-used candidate; never repeat a candidate "
+            "within one pause bed; allow fully traced reuse across distinct pauses"
+        )
+        clean_ambience_bank["usage_ledger"] = [
+            {
+                "candidate_id": str(candidate["candidate_id"]),
+                "use_count": int(
+                    ambience_usage_counts.get(str(candidate["candidate_id"]), 0)
+                ),
+                "reused_across_distinct_pauses": int(
+                    ambience_usage_counts.get(str(candidate["candidate_id"]), 0)
+                )
+                > 1,
+            }
+            for candidate in clean_ambience_bank["accepted_candidates"]
+        ]
         output_segments = _build_output_segments(
             source_intervals=source_intervals,
             boundaries=boundaries,
             joins=joins,
-            breath_replacements=breath_replacements,
+            breath_replacements=all_nuisance_replacements,
+        )
+        _plan_ambience_edge_transitions(
+            segments=output_segments,
+            joins=joins,
+            source_audio=source_audio,
+            sample_rate=sample_rate,
+        )
+        _finalize_pause_output_provenance(
+            joins=joins,
+            segments=output_segments,
         )
 
     expected_frames = (
@@ -3959,7 +4890,8 @@ def build_final_boundary_plan(
             "minimum_verified_quiet_ms": MINIMUM_VERIFIED_QUIET_MS,
             "quiet_fade_ms": QUIET_FADE_MS,
             "mfa_zero_crossing_snap_ms": MFA_ZERO_CROSSING_SNAP_MS,
-            "room_tone_fade_ms": ROOM_TONE_FADE_MS,
+            "ambience_crossfade_ms": DEFAULT_AMBIENCE_CROSSFADE_MS,
+            "ambience_thresholds": dict(clean_ambience_bank.get("thresholds", {})),
             "pause_targets_ms": PAUSE_TARGETS_MS,
             "pause_policy": pause_policy,
             "breath_cleanup": breath_cleanup,
@@ -3998,7 +4930,9 @@ def build_final_boundary_plan(
         "editable_non_speech": editable_non_speech,
         "mfa_non_silence_source_spans": mfa_non_silence_source_spans,
         "room_tone_mfa_source_spans": room_tone_mfa_source_spans,
+        "clean_ambience_bank": clean_ambience_bank,
         "breath_cleanup": breath_cleanup_plan,
+        "artifact_cleanup": artifact_cleanup_plan,
         "output_segments": output_segments,
         "expected_output_frame_count": expected_frames,
         "alignment_context_count": len(jobs),
@@ -4064,6 +4998,25 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
     protected_mask = boundary_plan.get("protected_speech_mask", [])
     if not isinstance(protected_mask, list):
         raise FinalRenderError("boundary plan has a malformed protected-speech mask")
+    ambience_bank = boundary_plan.get("clean_ambience_bank")
+    ambience_required = any(
+        segment.get("kind") == "ambience" or bool(segment.get("sample_replacements"))
+        for segment in segments
+    )
+    if not isinstance(ambience_bank, dict):
+        if ambience_required:
+            raise FinalRenderError("boundary plan has no clean ambience bank")
+        ambience_bank = {"accepted_candidates": []}
+    accepted_candidates = ambience_bank.get("accepted_candidates", [])
+    if not isinstance(accepted_candidates, list):
+        raise FinalRenderError("clean ambience bank is malformed")
+    accepted_by_id = {
+        str(candidate.get("candidate_id")): candidate
+        for candidate in accepted_candidates
+        if candidate.get("accepted") is True
+    }
+    if len(accepted_by_id) != len(accepted_candidates):
+        raise FinalRenderError("clean ambience bank candidate IDs are invalid")
     boundary_ids: set[str] = set()
     for boundary in boundaries:
         boundary_id = str(boundary.get("boundary_id"))
@@ -4121,6 +5074,7 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                     )
     cursor = 0
     replacement_ids: set[str] = set()
+    actual_ambience_usage_counts: dict[str, int] = {}
     room_tone_exclusions = boundary_plan.get("breath_cleanup", {}).get(
         "room_tone_exclusions",
         [],
@@ -4128,28 +5082,158 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
     for expected_index, segment in enumerate(segments):
         if segment.get("segment_index") != expected_index:
             raise FinalRenderError("output trace segment indices are not immutable")
-        if segment.get("kind") not in {"source", "room_tone"}:
+        if segment.get("kind") not in {"source", "ambience"}:
             raise FinalRenderError("output trace contains an untraceable segment")
-        source_start = int(segment["source_start_sample"])
-        source_end = int(segment["source_end_sample"])
         output_start = int(segment["output_start_sample"])
         output_end = int(segment["output_end_sample"])
-        if (
-            output_start != cursor
-            or source_end - source_start != output_end - output_start
-        ):
+        if output_start != cursor or output_end <= output_start:
             raise FinalRenderError("output trace geometry is inconsistent")
-        if segment.get("kind") == "room_tone":
-            for exclusion in room_tone_exclusions:
-                if _intervals_overlap(
-                    source_start,
-                    source_end,
-                    int(exclusion["start_sample"]),
-                    int(exclusion["end_sample"]),
+        if segment.get("kind") == "ambience":
+            trace = segment.get("source_trace")
+            if not isinstance(trace, list) or not trace:
+                raise FinalRenderError("ambience segment has no source trace")
+            if bool(segment.get("source_reuse")):
+                raise FinalRenderError("ambience segment repeats canonical source")
+            previous_trace_end = output_start
+            local_candidate_ids: set[str] = set()
+            for trace_index, contribution in enumerate(trace):
+                candidate_id = str(contribution.get("candidate_id", ""))
+                if candidate_id not in accepted_by_id:
+                    raise FinalRenderError(
+                        "ambience segment references a rejected bank candidate"
+                    )
+                if candidate_id in local_candidate_ids:
+                    raise FinalRenderError(
+                        "ambience segment tiles one candidate more than once"
+                    )
+                local_candidate_ids.add(candidate_id)
+                actual_ambience_usage_counts[candidate_id] = (
+                    actual_ambience_usage_counts.get(candidate_id, 0) + 1
+                )
+                source_start = int(contribution["source_start_sample"])
+                source_end = int(contribution["source_end_sample"])
+                accepted_candidate = accepted_by_id[candidate_id]
+                if not (
+                    int(accepted_candidate["source_start_sample"])
+                    <= source_start
+                    < source_end
+                    <= int(accepted_candidate["source_end_sample"])
                 ):
                     raise FinalRenderError(
-                        "semantic pause uses forbidden room-tone source"
+                        "ambience trace leaves its accepted bank candidate"
                     )
+                trace_start = int(contribution["output_start_sample"])
+                trace_end = int(contribution["output_end_sample"])
+                if not (
+                    0
+                    <= source_start
+                    < source_end
+                    <= int(boundary_plan["source_frame_count"])
+                    and output_start <= trace_start < trace_end <= output_end
+                    and source_end - source_start == trace_end - trace_start
+                ):
+                    raise FinalRenderError("ambience source trace geometry is invalid")
+                if trace_index == 0 and trace_start != output_start:
+                    raise FinalRenderError(
+                        "ambience trace does not start at its segment"
+                    )
+                if trace_start > previous_trace_end:
+                    raise FinalRenderError("ambience trace contains an unplanned hole")
+                previous_trace_end = trace_end
+                for exclusion in room_tone_exclusions:
+                    if _intervals_overlap(
+                        source_start,
+                        source_end,
+                        int(exclusion["start_sample"]),
+                        int(exclusion["end_sample"]),
+                    ):
+                        raise FinalRenderError(
+                            "semantic pause uses forbidden ambience source"
+                        )
+                for protected in protected_mask:
+                    if _intervals_overlap(
+                        source_start,
+                        source_end,
+                        int(protected["start_sample"]),
+                        int(protected["end_sample"]),
+                    ):
+                        raise FinalRenderError(
+                            "semantic pause ambience overlaps retained MFA speech"
+                        )
+            if previous_trace_end != output_end:
+                raise FinalRenderError("ambience trace does not fill its segment")
+            crossfades = segment.get("equal_power_crossfades", [])
+            if len(crossfades) != len(trace) - 1:
+                raise FinalRenderError("ambience crossfade ledger is incomplete")
+            for left, right, crossfade in zip(trace, trace[1:], crossfades):
+                if (
+                    crossfade.get("curve") != "equal_power"
+                    or int(crossfade["output_start_sample"])
+                    != int(right["output_start_sample"])
+                    or int(crossfade["output_end_sample"])
+                    != int(left["output_end_sample"])
+                ):
+                    raise FinalRenderError("ambience crossfade geometry is invalid")
+            edge_envelopes = segment.get("edge_gain_envelopes", [])
+            if not isinstance(edge_envelopes, list) or len(edge_envelopes) > 2:
+                raise FinalRenderError("ambience edge fade ledger is malformed")
+            edge_sides: set[str] = set()
+            for envelope in edge_envelopes:
+                side = str(envelope.get("side"))
+                curve = str(envelope.get("curve"))
+                edge_start = int(envelope["output_start_sample"])
+                edge_end = int(envelope["output_end_sample"])
+                if (
+                    side in edge_sides
+                    or side not in {"left", "right"}
+                    or curve != f"equal_power_fade_{'in' if side == 'left' else 'out'}"
+                    or envelope.get("verified_ambience") is not True
+                    or not output_start <= edge_start < edge_end <= output_end
+                    or (side == "left" and edge_start != output_start)
+                    or (side == "right" and edge_end != output_end)
+                ):
+                    raise FinalRenderError("ambience edge fade geometry is invalid")
+                edge_sides.add(side)
+            outer_transitions = segment.get("outer_transitions", [])
+            if not isinstance(outer_transitions, list) or len(outer_transitions) != 2:
+                raise FinalRenderError("ambience outer-transition ledger is incomplete")
+            transition_by_side = {
+                str(record.get("side")): record for record in outer_transitions
+            }
+            if set(transition_by_side) != {"left", "right"}:
+                raise FinalRenderError("ambience outer-transition sides are invalid")
+            envelope_by_side = {
+                str(envelope["side"]): envelope for envelope in edge_envelopes
+            }
+            for side, record in transition_by_side.items():
+                applied = record.get("status") == "ambience_edge_taper_applied"
+                transition = record.get("ambience_transition_interval")
+                envelope = envelope_by_side.get(side)
+                if applied != (envelope is not None) or (
+                    applied
+                    and (
+                        not isinstance(transition, dict)
+                        or int(transition["output_start_sample"])
+                        != int(envelope["output_start_sample"])
+                        or int(transition["output_end_sample"])
+                        != int(envelope["output_end_sample"])
+                        or str(transition["curve"]) != str(envelope["curve"])
+                    )
+                ):
+                    raise FinalRenderError(
+                        "ambience outer-transition decision is inconsistent"
+                    )
+                if float(record["planned_maximum_sample_discontinuity"]) < 0.0:
+                    raise FinalRenderError(
+                        "ambience seam discontinuity cannot be negative"
+                    )
+            cursor = output_end
+            continue
+
+        source_start = int(segment["source_start_sample"])
+        source_end = int(segment["source_end_sample"])
+        if source_end - source_start != output_end - output_start:
+            raise FinalRenderError("source output trace geometry is inconsistent")
         gain_envelopes = segment.get("gain_envelopes", [])
         for envelope in gain_envelopes:
             for protected in protected_mask:
@@ -4179,18 +5263,45 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
             ):
                 raise FinalRenderError("breath replacement target leaves its segment")
             previous_replacement_end = target_end
-            replacement_ranges = replacement.get("replacement_room_tone_source_ranges")
-            if not isinstance(replacement_ranges, list) or not replacement_ranges:
-                raise FinalRenderError("breath replacement has no room-tone source")
-            replacement_length = sum(
-                int(item["source_end_sample"]) - int(item["source_start_sample"])
-                for item in replacement_ranges
-            )
+            replacement_ranges = replacement.get("source_trace")
+            assembly = replacement.get("ambience_assembly")
+            if (
+                not isinstance(replacement_ranges, list)
+                or not replacement_ranges
+                or not isinstance(assembly, dict)
+                or assembly.get("status") != "complete"
+            ):
+                raise FinalRenderError("breath replacement has no ambience trace")
+            replacement_length = int(assembly["planned_output_samples"])
             if replacement_length != target_end - target_start:
                 raise FinalRenderError("breath replacement changes output duration")
+            local_candidate_ids: set[str] = set()
             for source_range in replacement_ranges:
+                candidate_id = str(source_range.get("candidate_id", ""))
+                if candidate_id not in accepted_by_id:
+                    raise FinalRenderError(
+                        "breath replacement references a rejected ambience candidate"
+                    )
+                if candidate_id in local_candidate_ids:
+                    raise FinalRenderError(
+                        "nuisance replacement tiles one candidate more than once"
+                    )
+                local_candidate_ids.add(candidate_id)
+                actual_ambience_usage_counts[candidate_id] = (
+                    actual_ambience_usage_counts.get(candidate_id, 0) + 1
+                )
                 replacement_start = int(source_range["source_start_sample"])
                 replacement_end = int(source_range["source_end_sample"])
+                accepted_candidate = accepted_by_id[candidate_id]
+                if not (
+                    int(accepted_candidate["source_start_sample"])
+                    <= replacement_start
+                    < replacement_end
+                    <= int(accepted_candidate["source_end_sample"])
+                ):
+                    raise FinalRenderError(
+                        "nuisance replacement leaves its accepted bank candidate"
+                    )
                 if not (
                     0
                     <= replacement_start
@@ -4210,6 +5321,26 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                         raise FinalRenderError(
                             "breath replacement uses forbidden room-tone source"
                         )
+                for protected in protected_mask:
+                    if _intervals_overlap(
+                        replacement_start,
+                        replacement_end,
+                        int(protected["start_sample"]),
+                        int(protected["end_sample"]),
+                    ):
+                        raise FinalRenderError(
+                            "breath replacement source overlaps retained MFA speech"
+                        )
+            replacement_crossfades = replacement.get("equal_power_crossfades", [])
+            if len(replacement_crossfades) != len(replacement_ranges) - 1:
+                raise FinalRenderError(
+                    "breath replacement crossfade ledger is incomplete"
+                )
+            for transition in replacement_crossfades:
+                if transition.get("curve") != "equal_power":
+                    raise FinalRenderError(
+                        "breath replacement ambience crossfade is not equal-power"
+                    )
             for protected in protected_mask:
                 if _intervals_overlap(
                     target_start,
@@ -4235,19 +5366,19 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                         raise FinalRenderError(
                             "breath transition overlaps a retained MFA phone"
                         )
-            for envelope in gain_envelopes:
-                if _intervals_overlap(
-                    target_start,
-                    target_end,
-                    int(envelope["source_start_sample"]),
-                    int(envelope["source_end_sample"]),
-                ):
-                    raise FinalRenderError(
-                        "breath replacement overlaps an existing source fade"
-                    )
         cursor = output_end
     if cursor != int(boundary_plan["expected_output_frame_count"]):
         raise FinalRenderError("output trace does not match planned frame count")
+    usage_ledger = ambience_bank.get("usage_ledger", [])
+    if usage_ledger:
+        expected_usage = {
+            str(item["candidate_id"]): int(item["use_count"]) for item in usage_ledger
+        }
+        if expected_usage != {
+            candidate_id: actual_ambience_usage_counts.get(candidate_id, 0)
+            for candidate_id in expected_usage
+        }:
+            raise FinalRenderError("clean ambience usage ledger is inconsistent")
 
 
 def _apply_source_gain_envelopes(
@@ -4272,6 +5403,88 @@ def _apply_source_gain_envelopes(
     return rendered
 
 
+def _render_ambience_source_trace(
+    *,
+    canonical_source: np.ndarray,
+    source_trace: Sequence[dict[str, Any]],
+    expected_samples: int,
+    output_coordinate_base: int = 0,
+) -> np.ndarray:
+    """Assemble distinct clean candidates with ambience-only equal-power joins."""
+
+    if expected_samples <= 0 or not source_trace:
+        raise FinalRenderError("ambience trace has no output capacity")
+    first = source_trace[0]
+    first_start = int(first["source_start_sample"])
+    first_end = int(first["source_end_sample"])
+    rendered = np.array(
+        canonical_source[first_start:first_end],
+        dtype=np.float32,
+        copy=True,
+    )
+    current_output_end = int(first["output_end_sample"]) - output_coordinate_base
+    if int(first["output_start_sample"]) != output_coordinate_base:
+        raise FinalRenderError("ambience trace starts at the wrong output coordinate")
+    for item in source_trace[1:]:
+        source_start = int(item["source_start_sample"])
+        source_end = int(item["source_end_sample"])
+        output_start = int(item["output_start_sample"]) - output_coordinate_base
+        output_end = int(item["output_end_sample"]) - output_coordinate_base
+        overlap = current_output_end - output_start
+        chunk = np.array(
+            canonical_source[source_start:source_end],
+            dtype=np.float32,
+            copy=True,
+        )
+        if not 0 < overlap <= min(len(rendered), len(chunk)):
+            raise FinalRenderError("ambience trace has invalid overlap geometry")
+        theta = np.linspace(
+            0.0,
+            np.pi / 2.0,
+            overlap,
+            endpoint=True,
+            dtype=np.float32,
+        )[:, None]
+        blended = rendered[-overlap:] * np.cos(theta) + chunk[:overlap] * np.sin(theta)
+        rendered = np.concatenate(
+            [rendered[:-overlap], blended, chunk[overlap:]],
+            axis=0,
+        )
+        current_output_end = output_end
+    if len(rendered) != expected_samples or current_output_end != expected_samples:
+        raise FinalRenderError("ambience trace rendered the wrong duration")
+    return rendered
+
+
+def _apply_ambience_edge_gain_envelopes(
+    rendered: np.ndarray,
+    *,
+    output_start_sample: int,
+    envelopes: Sequence[dict[str, Any]],
+) -> np.ndarray:
+    output = np.array(rendered, dtype=np.float32, copy=True)
+    for envelope in envelopes:
+        start = int(envelope["output_start_sample"]) - output_start_sample
+        end = int(envelope["output_end_sample"]) - output_start_sample
+        if not 0 <= start < end <= len(output):
+            raise FinalRenderError("ambience edge fade leaves its output segment")
+        theta = np.linspace(
+            0.0,
+            np.pi / 2.0,
+            end - start,
+            endpoint=True,
+            dtype=np.float32,
+        )[:, None]
+        if envelope["curve"] == "equal_power_fade_in":
+            gain = np.sin(theta)
+        elif envelope["curve"] == "equal_power_fade_out":
+            gain = np.cos(theta)
+        else:
+            raise FinalRenderError("ambience edge fade has an unknown curve")
+        output[start:end] *= gain
+    return output
+
+
 def _apply_breath_replacements(
     rendered: np.ndarray,
     *,
@@ -4288,45 +5501,30 @@ def _apply_breath_replacements(
         local_end = target_end - source_start
         if not 0 <= local_start < local_end <= len(output):
             raise FinalRenderError("breath replacement leaves its source chunk")
-        replacement_parts = [
-            canonical_source[
-                int(source_range["source_start_sample"]) : int(
-                    source_range["source_end_sample"]
-                )
-            ]
-            for source_range in replacement["replacement_room_tone_source_ranges"]
-        ]
-        room_tone = np.concatenate(replacement_parts, axis=0)
-        if len(room_tone) != local_end - local_start:
-            raise FinalRenderError("breath replacement room tone has wrong duration")
+        room_tone = _render_ambience_source_trace(
+            canonical_source=canonical_source,
+            source_trace=replacement["source_trace"],
+            expected_samples=local_end - local_start,
+        )
         original = canonical_chunk[local_start:local_end]
         replacement_audio = np.array(room_tone, dtype=np.float32, copy=True)
         transition = int(replacement.get("transition_samples", 0))
         if transition:
             if transition * 2 > len(replacement_audio):
                 raise FinalRenderError("breath transition is longer than its target")
-            fade_in = np.linspace(
+            theta = np.linspace(
                 0.0,
-                1.0,
+                np.pi / 2.0,
                 transition,
                 endpoint=True,
                 dtype=np.float32,
             )[:, None]
-            fade_out = np.linspace(
-                1.0,
-                0.0,
-                transition,
-                endpoint=True,
-                dtype=np.float32,
-            )[:, None]
-            replacement_audio[:transition] = (
-                original[:transition] * (1.0 - fade_in)
-                + room_tone[:transition] * fade_in
-            )
-            replacement_audio[-transition:] = (
-                original[-transition:] * (1.0 - fade_out)
-                + room_tone[-transition:] * fade_out
-            )
+            replacement_audio[:transition] = original[:transition] * np.cos(
+                theta
+            ) + room_tone[:transition] * np.sin(theta)
+            replacement_audio[-transition:] = room_tone[-transition:] * np.cos(
+                theta
+            ) + original[-transition:] * np.sin(theta)
         output[local_start:local_end] = replacement_audio
     return output
 
@@ -4368,36 +5566,45 @@ def render_boundary_plan(
 
     parts: list[np.ndarray] = []
     for segment in boundary_plan["output_segments"]:
+        if segment["kind"] == "ambience":
+            rendered = _render_ambience_source_trace(
+                canonical_source=source_audio,
+                source_trace=segment["source_trace"],
+                expected_samples=(
+                    int(segment["output_end_sample"])
+                    - int(segment["output_start_sample"])
+                ),
+                output_coordinate_base=int(segment["output_start_sample"]),
+            )
+            rendered = _apply_ambience_edge_gain_envelopes(
+                rendered,
+                output_start_sample=int(segment["output_start_sample"]),
+                envelopes=segment.get("edge_gain_envelopes", []),
+            )
+            parts.append(rendered)
+            continue
         source_start = int(segment["source_start_sample"])
         source_end = int(segment["source_end_sample"])
         if not 0 <= source_start < source_end <= len(source_audio):
             raise FinalRenderError("output trace references invalid source samples")
         chunk = source_audio[source_start:source_end]
         if segment["kind"] == "source":
-            rendered = _apply_source_gain_envelopes(
-                chunk,
-                source_start=source_start,
-                envelopes=segment.get("gain_envelopes", []),
-            )
             rendered = _apply_breath_replacements(
-                rendered,
+                np.asarray(chunk, dtype=np.float32),
                 canonical_chunk=chunk,
                 canonical_source=source_audio,
                 source_start=source_start,
                 replacements=segment.get("sample_replacements", []),
             )
-        else:
-            rendered = np.array(chunk, dtype=np.float32, copy=True)
-            fade_in = int(segment.get("fade_in_samples", 0))
-            fade_out = int(segment.get("fade_out_samples", 0))
-            if fade_in:
-                rendered[:fade_in] *= np.linspace(0.0, 1.0, fade_in, dtype=np.float32)[
-                    :, None
-                ]
-            if fade_out:
-                rendered[-fade_out:] *= np.linspace(
-                    1.0, 0.0, fade_out, dtype=np.float32
-                )[:, None]
+            # Source-edge gain is applied last and only inside MFA-confirmed
+            # non-speech.  If a nuisance replacement reaches the same quiet
+            # edge, the authoritative edge taper still meets inserted
+            # ambience at zero without touching retained phones.
+            rendered = _apply_source_gain_envelopes(
+                rendered,
+                source_start=source_start,
+                envelopes=segment.get("gain_envelopes", []),
+            )
         parts.append(rendered)
     rendered_audio = np.concatenate(parts, axis=0)
     if len(rendered_audio) != int(boundary_plan["expected_output_frame_count"]):
@@ -4888,6 +6095,30 @@ def render_final_cut(
         "breath_min_duration_ms": breath_min_duration_ms,
         "respiro_upstream_commit": RESPIRO_UPSTREAM_COMMIT,
         "respiro_checkpoint_sha256": RESPIRO_CHECKPOINT_SHA256,
+        "clean_ambience_bank_status": boundary_plan["clean_ambience_bank"]["status"],
+        "clean_ambience_candidates": len(
+            boundary_plan["clean_ambience_bank"].get("accepted_candidates", [])
+        ),
+        "ambience_candidates_rejected": len(
+            boundary_plan["clean_ambience_bank"].get("rejected_candidates", [])
+        ),
+        "pauses_rendered_with_clean_ambience": sum(
+            join.get("pause_content", {}).get("status") == "verified_clean_ambience"
+            for join in boundary_plan["joins"]
+        ),
+        "original_gaps_preserved": sum(
+            str(join.get("pause_content", {}).get("original_gap_content", ""))
+            == "preserved_verified_clean"
+            for join in boundary_plan["joins"]
+        ),
+        "original_gaps_replaced": sum(
+            bool(join.get("pause_content", {}).get("original_content_replaced"))
+            for join in boundary_plan["joins"]
+        ),
+        "pauses_clean_ambience_unavailable": sum(
+            join.get("pause_content", {}).get("status") == "clean_ambience_unavailable"
+            for join in boundary_plan["joins"]
+        ),
         "breath_cleanup_status": boundary_plan["breath_cleanup"]["status"],
         "breaths_detected": len(
             boundary_plan["breath_cleanup"].get("detected_events", [])
@@ -4896,7 +6127,11 @@ def render_final_cut(
             boundary_plan["breath_cleanup"].get("replacements", [])
         ),
         "breaths_replaced": sum(
-            event.get("status") == "breath_replaced_with_verified_room_tone"
+            event.get("status")
+            in {
+                "breath_replaced_with_verified_room_tone",
+                "breath_replaced_with_verified_clean_ambience",
+            }
             for event in boundary_plan["breath_cleanup"].get("events", [])
         ),
         "breaths_skipped_phone_overlap": sum(
@@ -5025,8 +6260,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=BREATH_CLEANUP_MODES,
         default="replace",
         help=(
-            "Optional Respiro-en cleanup planned inside MFA-confirmed "
-            "non-speech (default: replace)."
+            "Respiro-en cleanup and ambience screening inside MFA-confirmed "
+            "non-speech; off suppresses unverified inserted ambience "
+            "(default: replace)."
         ),
     )
     parser.add_argument(

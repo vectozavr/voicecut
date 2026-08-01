@@ -44,16 +44,8 @@ def _validate_output_segments(
         if not isinstance(raw_segment, dict):
             raise BreathDebugError("boundary plan contains a malformed output segment")
         kind = str(raw_segment.get("kind", ""))
-        if kind not in {"source", "room_tone"}:
+        if kind not in {"source", "ambience"}:
             raise BreathDebugError(f"unsupported output segment kind: {kind!r}")
-        source_start = _integer(
-            raw_segment.get("source_start_sample"),
-            field=f"output_segments[{index}].source_start_sample",
-        )
-        source_end = _integer(
-            raw_segment.get("source_end_sample"),
-            field=f"output_segments[{index}].source_end_sample",
-        )
         output_start = _integer(
             raw_segment.get("output_start_sample"),
             field=f"output_segments[{index}].output_start_sample",
@@ -62,8 +54,6 @@ def _validate_output_segments(
             raw_segment.get("output_end_sample"),
             field=f"output_segments[{index}].output_end_sample",
         )
-        if not 0 <= source_start < source_end <= source_frames:
-            raise BreathDebugError("output segment leaves the canonical source")
         if (
             output_start != output_cursor
             or not output_start < output_end <= output_frames
@@ -71,8 +61,36 @@ def _validate_output_segments(
             raise BreathDebugError(
                 "output segments are not contiguous final-output traces"
             )
-        if source_end - source_start != output_end - output_start:
-            raise BreathDebugError("output segment changes source duration")
+        if kind == "source":
+            source_start = _integer(
+                raw_segment.get("source_start_sample"),
+                field=f"output_segments[{index}].source_start_sample",
+            )
+            source_end = _integer(
+                raw_segment.get("source_end_sample"),
+                field=f"output_segments[{index}].source_end_sample",
+            )
+            if not 0 <= source_start < source_end <= source_frames:
+                raise BreathDebugError("output segment leaves the canonical source")
+            if source_end - source_start != output_end - output_start:
+                raise BreathDebugError("output segment changes source duration")
+        else:
+            trace = raw_segment.get("source_trace")
+            if not isinstance(trace, list) or not trace:
+                raise BreathDebugError("ambience output segment has no source trace")
+            for contribution in trace:
+                source_start = _integer(
+                    contribution.get("source_start_sample"),
+                    field="ambience source start",
+                )
+                source_end = _integer(
+                    contribution.get("source_end_sample"),
+                    field="ambience source end",
+                )
+                if not 0 <= source_start < source_end <= source_frames:
+                    raise BreathDebugError(
+                        "ambience output segment leaves the canonical source"
+                    )
         validated.append(raw_segment)
         output_cursor = output_end
     if output_cursor != output_frames:
@@ -258,12 +276,14 @@ def _write_probability_plot(
                 label=str(crop.get("crop_id", "probability")),
             )
         axis.axhline(threshold, color="black", linestyle="--", linewidth=0.8)
+        event_kind = str(event.get("debug_event_kind", "breath"))
+        event_label = "detected breath" if event_kind == "breath" else "artifact window"
         axis.axvspan(
             int(event["start_sample"]) / source_sample_rate,
             int(event["end_sample"]) / source_sample_rate,
             color="tab:orange",
             alpha=0.22,
-            label="detected breath",
+            label=event_label,
         )
         phone_color_index = 0
         phone_colors = ("tab:red", "tab:purple", "tab:brown", "tab:pink")
@@ -289,12 +309,107 @@ def _write_probability_plot(
         axis.set_ylim(0.0, 1.05)
         axis.set_xlabel("Canonical source time (seconds)")
         axis.set_ylabel("Breath probability")
-        axis.set_title("Respiro-en frame probabilities and protected MFA phones")
+        axis.set_title(
+            "Respiro-en probabilities, nuisance window, and protected MFA phones"
+        )
         axis.grid(alpha=0.2)
         axis.legend(loc="upper right", fontsize=7)
         figure.savefig(path, dpi=150)
     finally:
         plt.close(figure)
+
+
+def _write_waveform_join_plot(
+    *,
+    path: Path,
+    audio: np.ndarray,
+    rendered_audio: np.ndarray,
+    output_mappings: Sequence[dict[str, Any]],
+    sample_rate: int,
+    excerpt_start: int,
+    event_start: int,
+    event_end: int,
+    replacements: Sequence[dict[str, Any]],
+) -> dict[str, float]:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as error:  # pragma: no cover - depends on optional runtime
+        raise BreathDebugError(f"matplotlib is unavailable: {error}") from error
+
+    source_array = np.asarray(audio, dtype=np.float64)
+    channel_index = int(np.argmax(np.max(np.abs(source_array), axis=0)))
+    signed_source = source_array[:, channel_index]
+    timeline = (excerpt_start + np.arange(len(signed_source))) / sample_rate
+    figure, (source_axis, output_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(10.0, 5.5),
+        constrained_layout=True,
+    )
+    try:
+        source_axis.plot(timeline, signed_source, linewidth=0.7, color="tab:blue")
+        source_axis.axvspan(
+            event_start / sample_rate,
+            event_end / sample_rate,
+            color="tab:orange",
+            alpha=0.2,
+            label="nuisance event",
+        )
+        labels: set[str] = set()
+        for replacement in replacements:
+            label = "replacement" if "replacement" not in labels else None
+            if label:
+                labels.add(label)
+            source_axis.axvspan(
+                int(replacement["target_start_sample"]) / sample_rate,
+                int(replacement["target_end_sample"]) / sample_rate,
+                color="tab:green",
+                alpha=0.18,
+                label=label,
+            )
+        source_axis.set_xlabel("Canonical source time (seconds)")
+        source_axis.set_ylabel("Signed amplitude")
+        source_axis.set_title("Canonical nuisance window and planned replacement")
+        source_axis.grid(alpha=0.2)
+        source_axis.legend(loc="upper right", fontsize=7)
+        rendered_discontinuities: list[float] = []
+        for mapping in output_mappings:
+            output_start = int(mapping["output_excerpt_start_sample"])
+            output_end = int(mapping["output_excerpt_end_sample"])
+            rendered = np.asarray(
+                rendered_audio[output_start:output_end, channel_index],
+                dtype=np.float64,
+            )
+            output_axis.plot(
+                np.arange(output_start, output_end) / sample_rate,
+                rendered,
+                linewidth=0.7,
+            )
+            if len(rendered) > 1:
+                rendered_discontinuities.append(
+                    float(np.max(np.abs(np.diff(rendered))))
+                )
+        output_axis.set_xlabel("Final output time (seconds)")
+        output_axis.set_ylabel("Signed amplitude")
+        output_axis.set_title("Retained final-output mappings")
+        output_axis.grid(alpha=0.2)
+        figure.savefig(path, dpi=150)
+    finally:
+        plt.close(figure)
+    return {
+        "canonical_maximum_sample_discontinuity": (
+            float(np.max(np.abs(np.diff(source_array, axis=0))))
+            if len(source_array) > 1
+            else 0.0
+        ),
+        "rendered_maximum_sample_discontinuity": max(
+            rendered_discontinuities,
+            default=0.0,
+        ),
+    }
 
 
 def _retained_output_mappings(
@@ -363,7 +478,10 @@ def _write_replacement_excerpts(
         replacement = replacement_by_id.get(replacement_id)
         if replacement is None:
             raise BreathDebugError(f"event references unknown {replacement_id}")
-        raw_ranges = replacement.get("replacement_room_tone_source_ranges")
+        raw_ranges = replacement.get(
+            "source_trace",
+            replacement.get("replacement_room_tone_source_ranges"),
+        )
         if not isinstance(raw_ranges, list) or not raw_ranges:
             raise BreathDebugError(f"{replacement_id} has no room-tone source ranges")
         parts: list[np.ndarray] = []
@@ -383,8 +501,15 @@ def _write_replacement_excerpts(
                 {
                     "source_start_sample": start,
                     "source_end_sample": end,
-                    "excerpt_start_sample": excerpt_cursor,
-                    "excerpt_end_sample": excerpt_cursor + end - start,
+                    "excerpt_start_sample": int(
+                        raw_range.get("output_start_sample", excerpt_cursor)
+                    ),
+                    "excerpt_end_sample": int(
+                        raw_range.get(
+                            "output_end_sample",
+                            excerpt_cursor + end - start,
+                        )
+                    ),
                 }
             )
             excerpt_cursor += end - start
@@ -394,9 +519,31 @@ def _write_replacement_excerpts(
             else f"replacement_room_tone_{index:03d}.wav"
         )
         path = event_dir / filename
+        assembled = np.array(parts[0], dtype=np.float32, copy=True)
+        for range_record, part in zip(ranges[1:], parts[1:]):
+            overlap = len(assembled) - int(range_record["excerpt_start_sample"])
+            if overlap <= 0:
+                assembled = np.concatenate([assembled, part], axis=0)
+                continue
+            if overlap > min(len(assembled), len(part)):
+                raise BreathDebugError("replacement ambience overlap is invalid")
+            theta = np.linspace(
+                0.0,
+                np.pi / 2.0,
+                overlap,
+                endpoint=True,
+                dtype=np.float32,
+            )[:, None]
+            blended = assembled[-overlap:] * np.cos(theta) + part[:overlap] * np.sin(
+                theta
+            )
+            assembled = np.concatenate(
+                [assembled[:-overlap], blended, part[overlap:]],
+                axis=0,
+            )
         _write_audio_excerpt(
             path=path,
-            audio=np.concatenate(parts, axis=0),
+            audio=assembled,
             sample_rate=sample_rate,
             full_audio_frames=len(canonical_audio),
         )
@@ -454,6 +601,8 @@ def write_breath_debug_artifacts(
         "excerpt_context_ms": excerpt_context_ms,
         "status": "failed",
         "detected_event_count": 0,
+        "breath_event_count": 0,
+        "artifact_event_count": 0,
         "event_diagnostics_written": 0,
         "event_diagnostics_failed": 0,
         "probability_plot_failures": 0,
@@ -510,13 +659,33 @@ def write_breath_debug_artifacts(
         breath_cleanup = plan.get("breath_cleanup", {})
         if not isinstance(breath_cleanup, dict):
             raise BreathDebugError("frozen plan has malformed breath-cleanup evidence")
-        events = _detected_events(breath_cleanup)
+        breath_events = [
+            {**event, "debug_event_kind": "breath"}
+            for event in _detected_events(breath_cleanup)
+        ]
+        artifact_cleanup = plan.get("artifact_cleanup", {})
+        if not isinstance(artifact_cleanup, dict):
+            artifact_cleanup = {}
+        raw_artifact_events = artifact_cleanup.get("events", [])
+        artifact_events = (
+            [
+                {**dict(event), "debug_event_kind": "artifact"}
+                for event in raw_artifact_events
+                if isinstance(event, dict)
+            ]
+            if isinstance(raw_artifact_events, list)
+            else []
+        )
+        events = [*breath_events, *artifact_events]
         detector_evidence = breath_cleanup.get("detector_evidence", {})
         if not isinstance(detector_evidence, dict):
             detector_evidence = {}
         replacements = breath_cleanup.get("replacements", [])
         if not isinstance(replacements, list):
             replacements = []
+        artifact_replacements = artifact_cleanup.get("replacements", [])
+        if isinstance(artifact_replacements, list):
+            replacements = [*replacements, *artifact_replacements]
         replacement_by_id = {
             str(replacement["replacement_id"]): replacement
             for replacement in replacements
@@ -535,12 +704,15 @@ def write_breath_debug_artifacts(
         manifest["canonical_audio_sha256"] = sha256_file(canonical_audio_path)
         manifest["rendered_final_audio_sha256"] = sha256_file(rendered_audio_path)
         manifest["detected_event_count"] = len(events)
+        manifest["breath_event_count"] = len(breath_events)
+        manifest["artifact_event_count"] = len(artifact_events)
 
         for fallback_index, event in enumerate(events):
             event_index = event.get("event_index", fallback_index)
             if type(event_index) is not int:
                 event_index = fallback_index
-            event_dir = output_dir / f"event_{event_index:04d}"
+            event_kind = str(event.get("debug_event_kind", "breath"))
+            event_dir = output_dir / f"{event_kind}_event_{event_index:04d}"
             event_dir.mkdir(parents=True, exist_ok=True)
             record: dict[str, Any] = {
                 "event_index": event_index,
@@ -661,6 +833,25 @@ def write_breath_debug_artifacts(
                 )
                 record["replacement_room_tone_excerpts"] = replacement_records
                 manifest["replacement_excerpt_count"] += len(replacement_records)
+                event_replacements = [
+                    replacement_by_id[replacement_id]
+                    for replacement_id in _replacement_ids(event)
+                    if replacement_id in replacement_by_id
+                ]
+                waveform_plot_path = event_dir / "waveform_join_plot.png"
+                waveform_metrics = _write_waveform_join_plot(
+                    path=waveform_plot_path,
+                    audio=canonical_audio[excerpt_start:excerpt_end],
+                    rendered_audio=rendered_audio,
+                    output_mappings=mappings,
+                    sample_rate=canonical_rate,
+                    excerpt_start=excerpt_start,
+                    event_start=event_start,
+                    event_end=event_end,
+                    replacements=event_replacements,
+                )
+                record["waveform_join_plot"] = str(waveform_plot_path.resolve())
+                record["waveform_discontinuity_metrics"] = waveform_metrics
                 record["status"] = (
                     "complete" if not record["errors"] else "complete_with_plot_failure"
                 )

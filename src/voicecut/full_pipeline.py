@@ -1193,7 +1193,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("off", "replace"),
         default="replace",
         help=(
-            "Optional Respiro-en cleanup inside MFA-confirmed non-speech "
+            "Respiro-en cleanup and ambience screening inside MFA-confirmed "
+            "non-speech; off suppresses unverified inserted ambience "
             "(default: replace)."
         ),
     )

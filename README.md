@@ -134,7 +134,8 @@ voicecut recording.wav \
   --planner-backend gemini
 ```
 
-Breath replacement is enabled by default. Disable it for a direct comparison:
+Breath replacement and breath-screened ambience sourcing are enabled by default.
+Disable them for a direct-cut comparison:
 
 ```bash
 voicecut recording.wav \
@@ -142,6 +143,11 @@ voicecut recording.wav \
   --planner-backend gemini \
   --breath-cleanup off
 ```
+
+With `--breath-cleanup off`, VoiceCut does not use unscreened source material
+for inserted pauses; requested ambience insertions are therefore skipped rather
+than filled from a potentially breath-containing candidate. Existing retained
+gaps remain untouched.
 
 The local-backend transport is also available for later evaluation:
 
@@ -537,7 +543,7 @@ Important options:
 | `--mfa-cache-root PATH` | Persistent MFA model/cache directory passed as `MFA_ROOT_DIR`; defaults to `.voicecut-cache/runtime/mfa` |
 | `--mfa-micromamba PATH` | micromamba executable used to run the pinned MFA prefix |
 | `--mfa-num-jobs N` | Parallel jobs inside the one batched `mfa align_hf` invocation |
-| `--breath-cleanup off\|replace` | Optional Respiro-en cleanup; defaults to `replace` |
+| `--breath-cleanup off\|replace` | Respiro-en breath cleanup and ambience screening; `off` also suppresses inserted ambience rather than using unscreened room tone; defaults to `replace` |
 | `--breath-threshold FLOAT` | Frame probability threshold; conservative default `0.5` |
 | `--breath-min-duration-ms N` | Minimum consecutive positive duration; default `80` ms |
 | `--respiro-cache-root PATH` | Verified pinned Respiro-en implementation/model cache |

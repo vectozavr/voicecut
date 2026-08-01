@@ -1110,6 +1110,55 @@ def test_debug_flag_does_not_reintroduce_staged_production_wavs(
     assert not list(output_dir.rglob("*aligned.wav"))
 
 
+def test_every_inserted_pause_references_only_accepted_ambience_bank_candidates(
+    tmp_path: Path,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    words = read_json(plan_path)["words"]
+    completeness, mfa = _grounded_evidence(words=words, audio_path=audio_path)
+    output_dir = tmp_path / "verified-ambience"
+
+    manifest = render_final_cut(
+        audio_path=audio_path,
+        plan_path=plan_path,
+        output_dir=output_dir,
+        pause_plan_path=pause_plan_path,
+        alignment_python=tmp_path / "model-must-not-run",
+        alignment_payload=completeness,
+        mfa_payload=mfa,
+        breath_cleanup="replace",
+        breath_payload={**_breath_detector_payload(), "events": []},
+        max_acoustic_retries=0,
+    )
+
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    accepted_ids = {
+        candidate["candidate_id"]
+        for candidate in boundary_plan["clean_ambience_bank"]["accepted_candidates"]
+    }
+    ambience_segments = [
+        segment
+        for segment in boundary_plan["output_segments"]
+        if segment["kind"] == "ambience"
+    ]
+    assert ambience_segments
+    for segment in ambience_segments:
+        assert segment["source_reuse"] is False
+        assert segment["source_trace"]
+        assert {
+            contribution["candidate_id"] for contribution in segment["source_trace"]
+        } <= accepted_ids
+        assert all(
+            crossfade["curve"] == "equal_power"
+            for crossfade in segment["equal_power_crossfades"]
+        )
+    join = next(
+        item for item in boundary_plan["joins"] if item["inserted_pause_samples"]
+    )
+    assert join["pause_content"]["status"] == "verified_clean_ambience"
+    assert join["pause_content"]["source_to_output_sample_mapping"]
+
+
 def test_final_render_rejects_stale_grounding_ledger_before_audio_work(
     tmp_path: Path,
 ) -> None:
@@ -1567,8 +1616,8 @@ def test_breath_cleanup_replaces_only_mfa_confirmed_non_speech_once(
 
     assert manifest["breath_cleanup_status"] == "complete"
     assert manifest["breaths_detected"] == 2
-    assert manifest["breaths_replaced"] == 1
-    assert manifest["breaths_skipped_phone_overlap"] == 1
+    assert manifest["breaths_replaced"] == 2
+    assert manifest["breaths_skipped_phone_overlap"] == 0
     assert render_hashes == [
         (
             manifest["final_boundary_plan_sha256"],
@@ -1583,8 +1632,8 @@ def test_breath_cleanup_replaces_only_mfa_confirmed_non_speech_once(
     false_s_event = next(
         event for event in cleanup["events"] if event["start_sample"] == 450
     )
-    assert false_s_event["status"] == "breath_cleanup_skipped_phone_overlap"
-    assert false_s_event["replacements"] == []
+    assert false_s_event["status"] == ("breath_replaced_with_verified_clean_ambience")
+    assert len(false_s_event["replacements"]) == 1
     assert false_s_event["protected_phone_intersections"]
     assert {
         interval["phone"] for interval in false_s_event["protected_phone_intersections"]
@@ -1603,9 +1652,12 @@ def test_breath_cleanup_replaces_only_mfa_confirmed_non_speech_once(
     real_breath = next(
         event for event in cleanup["events"] if event["start_sample"] == 650
     )
-    assert real_breath["status"] == "breath_replaced_with_verified_room_tone"
+    assert real_breath["status"] == ("breath_replaced_with_verified_clean_ambience")
     assert len(real_breath["replacements"]) == 1
-    replacement = cleanup["replacements"][0]
+    false_tail_replacement = cleanup["replacements"][0]
+    assert false_tail_replacement["target_start_sample"] == 510
+    assert false_tail_replacement["target_end_sample"] == 560
+    replacement = cleanup["replacements"][1]
     assert replacement["target_start_sample"] == 620
     assert replacement["target_end_sample"] == 810
     assert replacement["target_duration_samples"] == 190
@@ -1679,8 +1731,13 @@ def test_breath_cleanup_replaces_only_mfa_confirmed_non_speech_once(
         always_2d=True,
     )
     assert np.array_equal(
-        rendered_audio[false_tail_output_start : false_tail_output_start + 80],
-        source_audio[450:530],
+        rendered_audio[false_tail_output_start : false_tail_output_start + 50],
+        source_audio[450:500],
+    )
+    editable_tail_output_start = false_tail_output_start + 60
+    assert not np.array_equal(
+        rendered_audio[editable_tail_output_start : editable_tail_output_start + 50],
+        source_audio[510:560],
     )
 
     production_wavs = sorted(
@@ -1770,3 +1827,479 @@ def test_breath_detector_failure_preserves_valid_boundary_plan(
         if "completeness_contexts" not in path.parts
     )
     assert production_wavs == [Path(manifest["final_cut_wav"])]
+
+
+def test_all_retained_fricative_and_suffix_phones_remain_bit_identical(
+    tmp_path: Path,
+) -> None:
+    source = np.linspace(-0.2, 0.2, 1_200, dtype=np.float32)[:, None]
+    audio_path = tmp_path / "fricatives.wav"
+    sf.write(audio_path, source, SAMPLE_RATE, subtype="FLOAT")
+    protected = [
+        {
+            "source_interval_index": 0,
+            "source_word_ids": [index],
+            "phone": phone,
+            "phone_start_sample": start,
+            "phone_end_sample": end,
+            "start_sample": start,
+            "end_sample": end,
+        }
+        for index, (phone, start, end) in enumerate(
+            [
+                ("S", 100, 180),
+                ("Z", 240, 320),
+                ("F", 380, 460),
+                ("TH", 520, 600),
+                ("SH", 660, 740),
+                ("SH AH N", 800, 920),
+            ]
+        )
+    ]
+    boundary_plan = {
+        "planner": "authoritative_single_pass_boundary_plan_v2",
+        "status": "safe",
+        "alignment_backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL_ID,
+        "mfa_fine_tune": True,
+        "source_audio_sha256": sha256_file(audio_path),
+        "source_sample_rate": SAMPLE_RATE,
+        "source_channel_count": 1,
+        "source_frame_count": len(source),
+        "boundaries": [
+            {
+                "boundary_id": "source_start",
+                "safety_status": "safe",
+                "selected_source_sample": 0,
+                "protected_speech_intervals": [],
+                "fade_intervals": [],
+            },
+            {
+                "boundary_id": "source_end",
+                "safety_status": "safe",
+                "selected_source_sample": len(source),
+                "protected_speech_intervals": [],
+                "fade_intervals": [],
+            },
+        ],
+        "joins": [],
+        "protected_speech_mask": protected,
+        "clean_ambience_bank": {
+            "schema_version": 1,
+            "status": "clean_ambience_unavailable",
+            "sample_rate": SAMPLE_RATE,
+            "accepted_candidates": [],
+            "rejected_candidates": [],
+        },
+        "breath_cleanup": {"room_tone_exclusions": []},
+        "output_segments": [
+            {
+                "segment_index": 0,
+                "kind": "source",
+                "source_start_sample": 0,
+                "source_end_sample": len(source),
+                "output_start_sample": 0,
+                "output_end_sample": len(source),
+                "gain_envelopes": [],
+                "sample_replacements": [],
+            }
+        ],
+        "expected_output_frame_count": len(source),
+    }
+    plan_path = tmp_path / "fricative_boundary_plan.json"
+    output_path = tmp_path / "fricative_final.wav"
+    write_json(plan_path, boundary_plan)
+
+    final_render_module.render_boundary_plan(
+        audio_path=audio_path,
+        boundary_plan_path=plan_path,
+        output_path=output_path,
+    )
+
+    rendered, _ = sf.read(output_path, dtype="float32", always_2d=True)
+    for interval in protected:
+        start = int(interval["phone_start_sample"])
+        end = int(interval["phone_end_sample"])
+        assert np.array_equal(rendered[start:end], source[start:end])
+
+
+def test_transient_in_existing_mfa_pause_is_planned_for_equal_duration_replacement() -> (
+    None
+):
+    sample_rate = 16_000
+    timeline = np.arange(2 * sample_rate, dtype=np.float32) / sample_rate
+    source = (0.0005 * np.sin(2.0 * np.pi * 83.0 * timeline))[:, None]
+    source[sample_rate // 2, 0] = 0.15
+    joins = [
+        {
+            "join_id": "internal_thought_gap_0000",
+            "join_kind": "internal_thought_pause",
+            "pause_content": {
+                "nuisance_mask_intersections": [],
+            },
+            "verified_quiet_interval": {
+                "start_sample": 0,
+                "end_sample": sample_rate,
+            },
+        }
+    ]
+
+    events = final_render_module._internal_gap_nuisance_evidence(
+        joins=joins,
+        source_audio=source,
+        sample_rate=sample_rate,
+        detected_events=[],
+    )
+
+    assert len(events) == 1
+    assert events[0]["event_type"] == "deterministic_nonstationary_artifact"
+    assert {reason["code"] for reason in events[0]["rejection_reasons"]} & {
+        "excessive_crest_factor",
+        "sample_discontinuity",
+        "sudden_rms_burst",
+    }
+    bank = {
+        "schema_version": 1,
+        "status": "complete",
+        "sample_rate": sample_rate,
+        "accepted_candidates": [
+            {
+                "candidate_id": "clean_tail",
+                "source_start_sample": sample_rate,
+                "source_end_sample": 2 * sample_rate,
+                "duration_samples": sample_rate,
+                "stationarity_score": 0.0,
+                "noise_level_delta_db": 0.0,
+                "accepted": True,
+            }
+        ],
+    }
+    replacements, records = final_render_module.plan_breath_replacements(
+        events=events,
+        editable_non_speech=[{"start_sample": 0, "end_sample": sample_rate}],
+        protected_speech_mask=[],
+        ambience_bank=bank,
+        sample_rate=sample_rate,
+        total_samples=len(source),
+        guard_ms=0.0,
+        transition_ms=10.0,
+    )
+    assert records[0]["status"] == ("breath_replaced_with_verified_clean_ambience")
+    assert len(replacements) == 1
+    assert replacements[0]["target_duration_samples"] == sample_rate
+    assert replacements[0]["replacement_duration_samples"] == sample_rate
+    assert replacements[0]["candidate_ids"] == ["clean_tail"]
+
+
+def test_artifact_replacement_owns_samples_before_breath_cleanup() -> None:
+    fragments, covered = (
+        final_render_module._subtract_artifact_replacements_from_breath_events(
+            events=[{"start_sample": 100, "end_sample": 300}],
+            artifact_replacements=[
+                {
+                    "replacement_id": "artifact_0",
+                    "target_start_sample": 150,
+                    "target_end_sample": 220,
+                }
+            ],
+        )
+    )
+
+    assert [(item["start_sample"], item["end_sample"]) for item in fragments] == [
+        (100, 150),
+        (220, 300),
+    ]
+    assert covered == []
+    assert all(
+        max(int(item["start_sample"]), 150) >= min(int(item["end_sample"]), 220)
+        for item in fragments
+    )
+
+    fragments, covered = (
+        final_render_module._subtract_artifact_replacements_from_breath_events(
+            events=[{"start_sample": 100, "end_sample": 300}],
+            artifact_replacements=[
+                {
+                    "replacement_id": "artifact_1",
+                    "target_start_sample": 100,
+                    "target_end_sample": 300,
+                }
+            ],
+        )
+    )
+    assert fragments == []
+    assert covered[0]["status"] == ("breath_cleanup_covered_by_artifact_replacement")
+
+    aggregated = final_render_module._aggregate_breath_fragment_records(
+        source_events=[
+            {"start_sample": 100, "end_sample": 300},
+            {"start_sample": 400, "end_sample": 500},
+        ],
+        fragment_records=[
+            {
+                "source_event_index": 0,
+                "fragment_index": 0,
+                "replacements": ["breath_0"],
+                "editable_intersection": [],
+                "protected_phone_intersections": [],
+                "status": "breath_replaced_with_verified_clean_ambience",
+            },
+            {
+                "source_event_index": 0,
+                "fragment_index": 1,
+                "replacements": ["breath_1"],
+                "editable_intersection": [],
+                "protected_phone_intersections": [],
+                "status": "breath_replaced_with_verified_clean_ambience",
+            },
+        ],
+        covered_records=[
+            {
+                "event_index": 1,
+                "source_event_index": 1,
+                "replacements": ["artifact_1"],
+                "status": "breath_cleanup_covered_by_artifact_replacement",
+            }
+        ],
+    )
+    assert [record["event_index"] for record in aggregated] == [0, 1]
+    assert aggregated[0]["replacements"] == ["breath_0", "breath_1"]
+    assert aggregated[1]["status"] == ("breath_cleanup_covered_by_artifact_replacement")
+
+
+def test_ambience_outer_tapers_are_planned_only_with_verified_source_handles() -> None:
+    source = np.full((1_000, 1), 0.01, dtype=np.float32)
+    segments = [
+        {
+            "kind": "source",
+            "source_start_sample": 0,
+            "source_end_sample": 200,
+            "gain_envelopes": [
+                {
+                    "curve": "fade_out",
+                    "verified_quiet": True,
+                    "source_start_sample": 190,
+                    "source_end_sample": 200,
+                }
+            ],
+        },
+        {
+            "kind": "ambience",
+            "join_id": "join",
+            "output_start_sample": 200,
+            "output_end_sample": 400,
+            "source_trace": [
+                {
+                    "source_start_sample": 500,
+                    "source_end_sample": 700,
+                }
+            ],
+        },
+        {
+            "kind": "source",
+            "source_start_sample": 800,
+            "source_end_sample": 1_000,
+            "gain_envelopes": [
+                {
+                    "curve": "fade_in",
+                    "verified_quiet": True,
+                    "source_start_sample": 800,
+                    "source_end_sample": 810,
+                }
+            ],
+        },
+    ]
+    joins = [{"join_id": "join", "pause_content": {}}]
+
+    final_render_module._plan_ambience_edge_transitions(
+        segments=segments,
+        joins=joins,
+        source_audio=source,
+        sample_rate=1_000,
+    )
+    ambience = segments[1]
+    assert {item["side"] for item in ambience["edge_gain_envelopes"]} == {
+        "left",
+        "right",
+    }
+    rendered = final_render_module._apply_ambience_edge_gain_envelopes(
+        source[500:700],
+        output_start_sample=200,
+        envelopes=ambience["edge_gain_envelopes"],
+    )
+    assert rendered[0, 0] == 0.0
+    assert rendered[-1, 0] == pytest.approx(0.0, abs=1.0e-8)
+    assert joins[0]["pause_content"]["maximum_sample_discontinuity"] == 0.0
+
+
+def test_artifact_detection_includes_gap_edges() -> None:
+    sample_rate = 16_000
+    source = np.full((sample_rate, 1), 0.0005, dtype=np.float32)
+    source[0, 0] = 0.2
+    joins = [
+        {
+            "join_id": "edge-gap",
+            "join_kind": "internal_thought_pause",
+            "pause_content": {"nuisance_mask_intersections": []},
+            "verified_quiet_interval": {
+                "start_sample": 0,
+                "end_sample": sample_rate,
+            },
+        }
+    ]
+
+    events = final_render_module._internal_gap_nuisance_evidence(
+        joins=joins,
+        source_audio=source,
+        sample_rate=sample_rate,
+        detected_events=[],
+    )
+
+    assert len(events) == 1
+    assert events[0]["analysis_start_sample"] == 0
+
+
+def test_short_gap_is_still_checked_for_clicks() -> None:
+    sample_rate = 16_000
+    frame_count = round(0.05 * sample_rate)
+    source = np.full((frame_count, 1), 0.0005, dtype=np.float32)
+    source[frame_count // 2, 0] = 0.2
+    joins = [
+        {
+            "join_id": "short-gap",
+            "join_kind": "internal_thought_pause",
+            "pause_content": {"nuisance_mask_intersections": []},
+            "verified_quiet_interval": {
+                "start_sample": 0,
+                "end_sample": frame_count,
+            },
+        }
+    ]
+
+    events = final_render_module._internal_gap_nuisance_evidence(
+        joins=joins,
+        source_audio=source,
+        sample_rate=sample_rate,
+        detected_events=[],
+    )
+
+    assert len(events) == 1
+    assert joins[0]["pause_content"]["original_gap_content"] == "nuisance_detected"
+
+
+def test_render_rejects_ambience_trace_outside_its_accepted_candidate(
+    tmp_path: Path,
+) -> None:
+    source = np.full((1_000, 1), 0.001, dtype=np.float32)
+    audio_path = tmp_path / "source.wav"
+    sf.write(audio_path, source, SAMPLE_RATE, subtype="FLOAT")
+    plan = {
+        "planner": "authoritative_single_pass_boundary_plan_v2",
+        "status": "safe",
+        "alignment_backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL_ID,
+        "mfa_fine_tune": True,
+        "source_audio_sha256": sha256_file(audio_path),
+        "source_sample_rate": SAMPLE_RATE,
+        "source_channel_count": 1,
+        "source_frame_count": len(source),
+        "boundaries": [
+            {
+                "boundary_id": "start",
+                "safety_status": "safe",
+                "selected_source_sample": 0,
+                "protected_speech_intervals": [],
+                "fade_intervals": [],
+            },
+            {
+                "boundary_id": "end",
+                "safety_status": "safe",
+                "selected_source_sample": 200,
+                "protected_speech_intervals": [],
+                "fade_intervals": [],
+            },
+        ],
+        "joins": [],
+        "protected_speech_mask": [],
+        "clean_ambience_bank": {
+            "accepted_candidates": [
+                {
+                    "candidate_id": "accepted",
+                    "source_start_sample": 500,
+                    "source_end_sample": 600,
+                    "accepted": True,
+                }
+            ]
+        },
+        "breath_cleanup": {"room_tone_exclusions": []},
+        "output_segments": [
+            {
+                "segment_index": 0,
+                "kind": "source",
+                "source_start_sample": 0,
+                "source_end_sample": 100,
+                "output_start_sample": 0,
+                "output_end_sample": 100,
+                "gain_envelopes": [],
+                "sample_replacements": [],
+            },
+            {
+                "segment_index": 1,
+                "kind": "ambience",
+                "join_id": "forged",
+                "output_start_sample": 100,
+                "output_end_sample": 150,
+                "source_trace": [
+                    {
+                        "candidate_id": "accepted",
+                        "source_start_sample": 700,
+                        "source_end_sample": 750,
+                        "output_start_sample": 100,
+                        "output_end_sample": 150,
+                    }
+                ],
+                "equal_power_crossfades": [],
+                "edge_gain_envelopes": [],
+                "outer_transitions": [
+                    {
+                        "side": "left",
+                        "status": "not_applied_no_verified_source_handle",
+                        "ambience_transition_interval": None,
+                        "planned_maximum_sample_discontinuity": 0.0,
+                    },
+                    {
+                        "side": "right",
+                        "status": "not_applied_no_verified_source_handle",
+                        "ambience_transition_interval": None,
+                        "planned_maximum_sample_discontinuity": 0.0,
+                    },
+                ],
+                "source_reuse": False,
+            },
+            {
+                "segment_index": 2,
+                "kind": "source",
+                "source_start_sample": 100,
+                "source_end_sample": 200,
+                "output_start_sample": 150,
+                "output_end_sample": 250,
+                "gain_envelopes": [],
+                "sample_replacements": [],
+            },
+        ],
+        "expected_output_frame_count": 250,
+    }
+    plan_path = tmp_path / "forged_plan.json"
+    write_json(plan_path, plan)
+
+    with pytest.raises(
+        FinalRenderError,
+        match="ambience trace leaves its accepted bank candidate",
+    ):
+        final_render_module.render_boundary_plan(
+            audio_path=audio_path,
+            boundary_plan_path=plan_path,
+            output_path=tmp_path / "must_not_render.wav",
+        )

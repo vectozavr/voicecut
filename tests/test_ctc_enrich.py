@@ -216,6 +216,106 @@ def test_low_confidence_insertion_does_not_change_words() -> None:
     assert report["atoms_expanded"] == 0
 
 
+def test_collapsed_whisper_suffix_is_pruned_when_ctc_ends_on_supported_prefix() -> None:
+    transcript = {
+        "atoms": [
+            {
+                "atom_index": 678,
+                "start": 1982.17,
+                "end": 1983.61,
+                "text": "Pruning and fine tuning are a little bit more.",
+                "words": [
+                    _word("Pruning", 1982.17, 1982.51),
+                    _word("and", 1982.51, 1982.73),
+                    _word("fine", 1982.73, 1982.99),
+                    _word("tuning", 1982.99, 1983.25),
+                    _word("are", 1983.25, 1983.59),
+                    _word("a", 1983.59, 1983.59),
+                    _word("little", 1983.59, 1983.59),
+                    _word("bit", 1983.59, 1983.59),
+                    _word("more.", 1983.59, 1983.59),
+                ],
+            }
+        ]
+    }
+    alignment = {
+        "segments": [
+            {
+                "phrase_index": 678,
+                "greedy_ctc_words": [
+                    _word("brooning", 1982.23, 1982.58),
+                    _word("and", 1982.64, 1982.72),
+                    _word("fint", 1982.78, 1983.02),
+                    _word("uning", 1983.14, 1983.37),
+                ],
+                "acoustic_insertions": [],
+            }
+        ]
+    }
+
+    enriched, report = enrich_transcript(
+        transcript=transcript,
+        alignment=alignment,
+    )
+
+    atom = enriched["atoms"][0]
+    assert atom["text"] == "Pruning and fine tuning"
+    assert [word["word"] for word in atom["words"]] == [
+        "Pruning",
+        "and",
+        "fine",
+        "tuning",
+    ]
+    assert atom["ctc_enrichment"]["status"] == ("pruned_whisper_hallucinated_suffix")
+    assert report["hallucinated_suffixes_pruned"] == 1
+    assert report["pruned_suffixes"][0]["pruned_words"] == [
+        "are",
+        "a",
+        "little",
+        "bit",
+        "more.",
+    ]
+
+
+def test_ctc_prefix_does_not_prune_ordinarily_timed_whisper_suffix() -> None:
+    transcript = {
+        "atoms": [
+            {
+                "atom_index": 1,
+                "start": 0.0,
+                "end": 2.0,
+                "text": "keep this real suffix",
+                "words": [
+                    _word("keep", 0.1, 0.4),
+                    _word("this", 0.5, 0.8),
+                    _word("real", 0.9, 1.2),
+                    _word("suffix", 1.3, 1.7),
+                ],
+            }
+        ]
+    }
+    alignment = {
+        "segments": [
+            {
+                "phrase_index": 1,
+                "greedy_ctc_words": [
+                    _word("keep", 0.1, 0.4),
+                    _word("this", 0.5, 0.8),
+                ],
+                "acoustic_insertions": [],
+            }
+        ]
+    }
+
+    enriched, report = enrich_transcript(
+        transcript=transcript,
+        alignment=alignment,
+    )
+
+    assert enriched["atoms"][0]["text"] == "keep this real suffix"
+    assert report["hallucinated_suffixes_pruned"] == 0
+
+
 def test_alignment_input_uses_complete_atom_text_and_times() -> None:
     transcript = {
         "atoms": [

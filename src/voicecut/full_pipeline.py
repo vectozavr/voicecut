@@ -32,6 +32,7 @@ from .breath_detection import (
     RESPIRO_UPSTREAM_COMMIT,
 )
 from .common import read_json, sha256_file, write_json
+from .ctc_enrich import SOURCE_DECODE_STRATEGY
 from .media import (
     AUDIO_OUTPUT_EXTENSIONS,
     MediaError,
@@ -175,8 +176,7 @@ def _enriched_transcript_is_current(path: Path, audio_sha256: str) -> bool:
     return (
         value is not None
         and value.get("audio_sha256") == audio_sha256
-        and value.get("source_decode_strategy")
-        == "whisper_primary_plus_gated_raw_ctc_insertions_v1"
+        and value.get("source_decode_strategy") == SOURCE_DECODE_STRATEGY
     )
 
 
@@ -1095,6 +1095,12 @@ def run_full_pipeline(
         "publication_manifest": str(publication_path),
         "final_cut_wav": str(final_wav),
         "duration_seconds": final_manifest["duration_seconds"],
+        "delivery_status": final_manifest.get("delivery_status", "complete"),
+        "preserved_problem_intervals": len(
+            (final_manifest.get("delivery_fallback") or {}).get(
+                "preserved_intervals", []
+            )
+        ),
     }
     write_json(work_dir / "pipeline_run.json", result)
     work_lock.close()
@@ -1264,6 +1270,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("\nVOICECUT COMPLETE")
     print(f"output: {result['output']}")
     print(f"duration: {result['duration_seconds']:.3f} s")
+    print(f"delivery status: {result['delivery_status']}")
+    if result["preserved_problem_intervals"]:
+        print(
+            "warning: preserved original source context at "
+            f"{result['preserved_problem_intervals']} unresolved cut(s)"
+        )
     print(f"planner: {result['planner_backend']} / {result['planner_model']}")
     print(f"cache: {result['work_dir']}")
     print(json.dumps(result, ensure_ascii=False, indent=2))

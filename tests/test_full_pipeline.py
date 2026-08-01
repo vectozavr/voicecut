@@ -143,7 +143,7 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
                 {
                     "audio_sha256": audio_sha,
                     "source_decode_strategy": (
-                        "whisper_primary_plus_gated_raw_ctc_insertions_v1"
+                        "whisper_primary_plus_gated_raw_ctc_insertions_v2"
                     ),
                 },
             )
@@ -446,7 +446,7 @@ def test_full_pipeline_routes_video_input_to_video_publication(
                 {
                     "audio_sha256": audio_sha,
                     "source_decode_strategy": (
-                        "whisper_primary_plus_gated_raw_ctc_insertions_v1"
+                        "whisper_primary_plus_gated_raw_ctc_insertions_v2"
                     ),
                 },
             )

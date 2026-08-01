@@ -210,6 +210,61 @@ def test_pause_planner_retries_malformed_json_once(tmp_path: Path) -> None:
     assert (output_dir / "pause_plan_attempt_2.raw.json").is_file()
 
 
+def test_pause_planner_batches_long_narration_with_global_indices(
+    tmp_path: Path,
+) -> None:
+    thought_count = 81
+    plan_path = tmp_path / "long_streaming_plan.json"
+    write_json(
+        plan_path,
+        {
+            "status": "complete",
+            "committed": [
+                {
+                    "canonical_text": f"Thought {index}.",
+                    "source_ranges": [
+                        {"start_word_id": index, "end_word_id": index + 1}
+                    ],
+                }
+                for index in range(thought_count)
+            ],
+        },
+    )
+
+    responses = []
+    for start, end in ((0, 39), (39, 78), (78, 80)):
+        responses.append(
+            json.dumps(
+                {
+                    "transitions": [
+                        {
+                            "after_thought_index": index,
+                            "before_thought_index": index + 1,
+                            "pause_type": "short",
+                        }
+                        for index in range(start, end)
+                    ]
+                }
+            )
+        )
+    backend = FakePauseBackend(responses)
+    output_dir = tmp_path / "pause_output"
+    pause_plan = create_pause_plan(
+        plan_path=plan_path,
+        output_dir=output_dir,
+        backend=backend,
+    )
+
+    assert pause_plan["batch_count"] == 3
+    assert pause_plan["transition_count"] == 80
+    assert [item["after_thought_index"] for item in pause_plan["transitions"]] == list(
+        range(80)
+    )
+    assert len(backend.prompts) == 3
+    assert "thought 39:" in backend.prompts[1]
+    assert (output_dir / "pause_plan_batch_003_attempt_1.raw.json").is_file()
+
+
 def test_quiet_insertion_requires_real_low_energy() -> None:
     sample_rate = 1000
     quiet_audio = np.zeros(1000, dtype=np.float32)

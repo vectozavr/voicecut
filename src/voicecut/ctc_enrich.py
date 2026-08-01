@@ -26,6 +26,10 @@ from .common import read_json, sha256_file, write_json
 MIN_RETRY_CONFIDENCE = 0.75
 MIN_CONTEXTUAL_SUBSTITUTION_SCORE = 0.65
 MAX_CONTEXTUAL_SUBSTITUTION_WORDS = 3
+MIN_HALLUCINATED_SUFFIX_WORDS = 2
+MIN_HALLUCINATED_SUFFIX_ZERO_DURATION_WORDS = 2
+MIN_CTC_TRAILING_EMPTY_SECONDS = 0.10
+SOURCE_DECODE_STRATEGY = "whisper_primary_plus_gated_raw_ctc_insertions_v2"
 
 
 class CtcEnrichmentError(RuntimeError):
@@ -194,6 +198,68 @@ def _enriched_greedy_words(
     return enriched
 
 
+def _hallucinated_whisper_suffix_start(
+    *,
+    atom: dict[str, Any],
+    segment: dict[str, Any],
+) -> int | None:
+    """Return a safely unsupported trailing Whisper word index, if proven.
+
+    This is deliberately narrower than generic transcript voting. It only
+    catches the characteristic tiny-atom failure where Whisper emits several
+    trailing words at a collapsed timestamp, while raw CTC ends on an ordered
+    prefix and leaves real waveform time after its last supported word.
+    """
+
+    whisper_words = atom.get("words")
+    greedy_words = segment.get("greedy_ctc_words")
+    if (
+        not isinstance(whisper_words, list)
+        or not whisper_words
+        or not isinstance(greedy_words, list)
+        or len(greedy_words) < 2
+        or _validated_hidden_retries(segment)
+    ):
+        return None
+    expected_words = normalized_words(str(atom.get("text", "")))
+    if len(expected_words) != len(whisper_words):
+        return None
+    matches = align_expected_to_greedy(str(atom.get("text", "")), greedy_words)
+    if len(matches) < max(2, len(greedy_words) - 1):
+        return None
+    final_match = matches[-1]
+    if int(final_match["greedy_index"]) != len(greedy_words) - 1:
+        return None
+    prefix_end = int(final_match["expected_index"]) + 1
+    suffix = whisper_words[prefix_end:]
+    if len(suffix) < MIN_HALLUCINATED_SUFFIX_WORDS:
+        return None
+    zero_duration = 0
+    for word in suffix:
+        if not isinstance(word, dict):
+            return None
+        start = word.get("start")
+        end = word.get("end")
+        if type(start) not in {int, float} or type(end) not in {int, float}:
+            return None
+        if float(end) - float(start) <= 1e-4:
+            zero_duration += 1
+    if zero_duration < max(
+        MIN_HALLUCINATED_SUFFIX_ZERO_DURATION_WORDS,
+        len(suffix) // 2,
+    ):
+        return None
+    greedy_end = greedy_words[-1].get("end")
+    atom_end = atom.get("end")
+    if (
+        type(greedy_end) not in {int, float}
+        or type(atom_end) not in {int, float}
+        or float(atom_end) - float(greedy_end) < MIN_CTC_TRAILING_EMPTY_SECONDS
+    ):
+        return None
+    return prefix_end
+
+
 def enrich_transcript(
     *,
     transcript: dict[str, Any],
@@ -221,6 +287,7 @@ def enrich_transcript(
     enriched = copy.deepcopy(transcript)
     output_atoms = enriched["atoms"]
     recovered: list[dict[str, Any]] = []
+    pruned_suffixes: list[dict[str, Any]] = []
     for position, atom in enumerate(output_atoms):
         if not isinstance(atom, dict) or type(atom.get("atom_index")) is not int:
             raise CtcEnrichmentError(f"source atom {position} is malformed")
@@ -229,6 +296,45 @@ def enrich_transcript(
         if segment is None:
             raise CtcEnrichmentError(f"CTC alignment omitted source atom {atom_index}")
         retries = _validated_hidden_retries(segment)
+        suffix_start = _hallucinated_whisper_suffix_start(
+            atom=atom,
+            segment=segment,
+        )
+        if suffix_start is not None:
+            original_text = str(atom.get("text", ""))
+            original_words = copy.deepcopy(atom.get("words", []))
+            retained_words = original_words[:suffix_start]
+            atom["original_whisper_text"] = original_text
+            atom["original_whisper_words"] = original_words
+            atom["words"] = retained_words
+            atom["text"] = " ".join(str(word["word"]) for word in retained_words)
+            atom["segments"] = [
+                {
+                    "start": float(retained_words[0]["start"]),
+                    "end": float(retained_words[-1]["end"]),
+                    "text": atom["text"],
+                    "words": copy.deepcopy(retained_words),
+                    "decode_strategy": "ctc_gated_whisper_suffix_pruning_v1",
+                }
+            ]
+            atom["ctc_enrichment"] = {
+                "status": "pruned_whisper_hallucinated_suffix",
+                "hidden_retries": [],
+                "original_word_count": len(original_words),
+                "retained_word_count": len(retained_words),
+                "pruned_words": copy.deepcopy(original_words[suffix_start:]),
+            }
+            pruned_suffixes.append(
+                {
+                    "atom_index": atom_index,
+                    "original_whisper_text": original_text,
+                    "retained_text": atom["text"],
+                    "pruned_words": [
+                        str(word["word"]) for word in original_words[suffix_start:]
+                    ],
+                }
+            )
+            continue
         if not retries:
             atom["ctc_enrichment"] = {
                 "status": "unchanged_no_hidden_retry",
@@ -273,9 +379,7 @@ def enrich_transcript(
         )
 
     enriched["engine"] = "mlx_whisper_with_raw_ctc_hidden_retry_recovery"
-    enriched["source_decode_strategy"] = (
-        "whisper_primary_plus_gated_raw_ctc_insertions_v1"
-    )
+    enriched["source_decode_strategy"] = SOURCE_DECODE_STRATEGY
     enriched["ctc_enrichment"] = {
         "schema_version": 1,
         "alignment": str(alignment_path.resolve()) if alignment_path else None,
@@ -287,10 +391,12 @@ def enrich_transcript(
         "minimum_retry_confidence": MIN_RETRY_CONFIDENCE,
         "atoms_examined": len(output_atoms),
         "atoms_expanded": len(recovered),
+        "hallucinated_suffixes_pruned": len(pruned_suffixes),
         "hidden_retries_recovered": sum(
             len(item["hidden_retries"]) for item in recovered
         ),
         "recovered": recovered,
+        "pruned_suffixes": pruned_suffixes,
     }
     report = {
         "schema_version": 1,
@@ -403,6 +509,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print("\nCTC HIDDEN-RETRY ENRICHMENT COMPLETE")
     print(f"atoms examined: {report['atoms_examined']}")
     print(f"atoms expanded: {report['atoms_expanded']}")
+    print(f"hallucinated suffixes pruned: {report['hallucinated_suffixes_pruned']}")
     print(f"hidden retries recovered: {report['hidden_retries_recovered']}")
     print(f"enriched transcript: {enriched_path}")
     print(f"report: {report_path}")

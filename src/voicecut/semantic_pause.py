@@ -45,6 +45,7 @@ EOF_MIN_EXTENSION_MS = 180.0
 EOF_TRAILING_SILENCE_MS = 300.0
 ROOM_TONE_WORD_GUARD_MS = 40.0
 ROOM_TONE_FADE_MS = 5.0
+PAUSE_PLANNER_MAX_THOUGHTS_PER_BATCH = 40
 
 
 class PausePlanError(RuntimeError):
@@ -150,11 +151,17 @@ def _load_committed_thoughts(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return thoughts
 
 
-def _pause_prompt(thoughts: Sequence[dict[str, Any]]) -> str:
+def _pause_prompt(
+    thoughts: Sequence[dict[str, Any]],
+    *,
+    start_thought_index: int = 0,
+) -> str:
     readable = "\n".join(
-        f"thought {index}: {thought['canonical_text']}"
+        f"thought {start_thought_index + index}: {thought['canonical_text']}"
         for index, thought in enumerate(thoughts)
     )
+    first_transition = start_thought_index
+    last_transition = start_thought_index + len(thoughts) - 2
     return f"""Classify every transition between adjacent committed narration
 thoughts. The thoughts are already final and source-grounded. This is only a
 pause-classification task.
@@ -177,7 +184,12 @@ There is a stronger topic, paragraph, or presentation-section transition.
 
 Rules:
 - Return exactly {len(thoughts) - 1} transitions.
-- Transition i must be after_thought_index=i and before_thought_index=i+1.
+- Return the transitions from {first_transition} -> {first_transition + 1}
+  through {last_transition} -> {last_transition + 1}.
+- Keep the original global thought indices shown below.
+- `after_thought_index` is the earlier thought; `before_thought_index` is the
+  later thought. For thoughts 0 followed by 1, the only valid indices are
+  `"after_thought_index": 0, "before_thought_index": 1`. Never reverse them.
 - Keep transitions ordered.
 - Do not modify or reproduce any narration in the JSON.
 - Do not return milliseconds, explanations, source ranges, or extra fields.
@@ -212,6 +224,7 @@ def validate_pause_response(
     raw: str,
     *,
     thought_count: int,
+    start_thought_index: int = 0,
 ) -> list[dict[str, Any]]:
     """Validate exact coverage, ordering, indices, keys, and pause labels."""
 
@@ -249,9 +262,12 @@ def validate_pause_response(
             raise PausePlanValidationError(
                 f"transition {index} indices must be integers"
             )
-        if after != index or before != index + 1:
+        expected_after = start_thought_index + index
+        expected_before = expected_after + 1
+        if after != expected_after or before != expected_before:
             raise PausePlanValidationError(
-                f"transition {index} must use indices {index} -> {index + 1}"
+                f"transition {index} must use indices "
+                f"{expected_after} -> {expected_before}"
             )
         if pause_type not in PAUSE_TYPES:
             raise PausePlanValidationError(
@@ -259,6 +275,26 @@ def validate_pause_response(
             )
         validated.append(dict(transition))
     return validated
+
+
+def _pause_batches(
+    thoughts: Sequence[dict[str, Any]],
+    *,
+    maximum_thoughts: int = PAUSE_PLANNER_MAX_THOUGHTS_PER_BATCH,
+) -> list[tuple[int, Sequence[dict[str, Any]]]]:
+    """Split long plans without losing a transition at a batch boundary."""
+
+    if maximum_thoughts < 2:
+        raise ValueError("pause-planner batches require at least two thoughts")
+    if len(thoughts) <= maximum_thoughts:
+        return [(0, thoughts)]
+    batches: list[tuple[int, Sequence[dict[str, Any]]]] = []
+    start = 0
+    while start < len(thoughts) - 1:
+        end = min(len(thoughts), start + maximum_thoughts)
+        batches.append((start, thoughts[start:end]))
+        start = end - 1
+    return batches
 
 
 def create_pause_plan(
@@ -282,9 +318,9 @@ def create_pause_plan(
     if not isinstance(plan, dict):
         raise PausePlanError("streaming plan root must be an object")
     thoughts = _load_committed_thoughts(plan)
-    prompt = _pause_prompt(thoughts)
     schema = pause_response_schema()
     attempts: list[dict[str, Any]] = []
+    batches = _pause_batches(thoughts)
 
     if len(thoughts) == 1:
         transitions: list[dict[str, Any]] = []
@@ -298,68 +334,92 @@ def create_pause_plan(
             }
         )
     else:
-        request_prompt = prompt
-        last_raw = ""
-        last_error = ""
         transitions = []
-        for attempt in range(1, 3):
-            raw = ""
-            try:
-                raw = backend.generate(
-                    request_prompt,
-                    response_schema=schema,
-                    request_id=f"pause-plan-attempt-{attempt}",
-                )
-                transitions = validate_pause_response(
-                    raw,
-                    thought_count=len(thoughts),
-                )
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "raw_response": raw,
-                        "validation_error": None,
-                    }
-                )
-                (output_dir / f"pause_plan_attempt_{attempt}.raw.json").write_text(
-                    raw,
-                    encoding="utf-8",
-                )
-                break
-            except Exception as error:
-                last_raw = raw
-                last_error = f"{type(error).__name__}: {error}"
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "raw_response": raw,
-                        "validation_error": last_error,
-                    }
-                )
-                (output_dir / f"pause_plan_attempt_{attempt}.raw.txt").write_text(
-                    raw,
-                    encoding="utf-8",
-                )
-                if attempt == 1:
-                    request_prompt = _retry_prompt(
-                        prompt,
-                        invalid_raw=last_raw,
-                        validation_error=last_error,
-                    )
-        else:
-            failure = {
-                "schema_version": 1,
-                "streaming_plan": str(plan_path),
-                "streaming_plan_sha256": sha256_file(plan_path),
-                "validation_error": last_error,
-                "raw_response": last_raw,
-                "attempts": attempts,
-            }
-            write_json(output_dir / "pause_plan_failure.json", failure)
-            raise PausePlanError(
-                f"{backend.backend_name} pause planner failed after one retry: "
-                f"{last_error}; raw responses were saved in {output_dir}"
+        for batch_index, (start_index, batch_thoughts) in enumerate(batches, 1):
+            prompt = _pause_prompt(
+                batch_thoughts,
+                start_thought_index=start_index,
             )
+            request_prompt = prompt
+            last_raw = ""
+            last_error = ""
+            batch_transitions: list[dict[str, Any]] = []
+            for attempt in range(1, 3):
+                raw = ""
+                prefix = (
+                    "pause_plan"
+                    if len(batches) == 1
+                    else f"pause_plan_batch_{batch_index:03d}"
+                )
+                try:
+                    raw = backend.generate(
+                        request_prompt,
+                        response_schema=schema,
+                        request_id=(
+                            f"pause-plan-batch-{batch_index}-attempt-{attempt}"
+                        ),
+                    )
+                    batch_transitions = validate_pause_response(
+                        raw,
+                        thought_count=len(batch_thoughts),
+                        start_thought_index=start_index,
+                    )
+                    attempts.append(
+                        {
+                            "batch": batch_index,
+                            "start_thought_index": start_index,
+                            "attempt": attempt,
+                            "raw_response": raw,
+                            "validation_error": None,
+                        }
+                    )
+                    (output_dir / f"{prefix}_attempt_{attempt}.raw.json").write_text(
+                        raw,
+                        encoding="utf-8",
+                    )
+                    break
+                except Exception as error:
+                    last_raw = raw
+                    last_error = f"{type(error).__name__}: {error}"
+                    attempts.append(
+                        {
+                            "batch": batch_index,
+                            "start_thought_index": start_index,
+                            "attempt": attempt,
+                            "raw_response": raw,
+                            "validation_error": last_error,
+                        }
+                    )
+                    (output_dir / f"{prefix}_attempt_{attempt}.raw.txt").write_text(
+                        raw,
+                        encoding="utf-8",
+                    )
+                    if attempt == 1:
+                        request_prompt = _retry_prompt(
+                            prompt,
+                            invalid_raw=last_raw,
+                            validation_error=last_error,
+                        )
+            else:
+                failure = {
+                    "schema_version": 1,
+                    "streaming_plan": str(plan_path),
+                    "streaming_plan_sha256": sha256_file(plan_path),
+                    "failed_batch": batch_index,
+                    "validation_error": last_error,
+                    "raw_response": last_raw,
+                    "attempts": attempts,
+                }
+                write_json(output_dir / "pause_plan_failure.json", failure)
+                raise PausePlanError(
+                    f"{backend.backend_name} pause planner batch {batch_index} "
+                    f"failed after one retry: {last_error}; raw responses were "
+                    f"saved in {output_dir}"
+                )
+            transitions.extend(batch_transitions)
+
+        if len(transitions) != len(thoughts) - 1:
+            raise AssertionError("pause-planner batches did not cover every transition")
 
     pause_plan = {
         "schema_version": 1,
@@ -370,6 +430,7 @@ def create_pause_plan(
         "streaming_plan_sha256": sha256_file(plan_path),
         "thought_count": len(thoughts),
         "transition_count": len(transitions),
+        "batch_count": len(batches),
         "transitions": transitions,
         "attempts": attempts,
     }

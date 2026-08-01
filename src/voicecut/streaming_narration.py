@@ -332,9 +332,14 @@ def _first_unsupported_token(
     source_tokens: Sequence[str],
 ) -> str:
     source_cursor = 0
-    for canonical_token in canonical_tokens:
+    for canonical_index, canonical_token in enumerate(canonical_tokens):
         found = False
-        for source_start in range(source_cursor, len(source_tokens)):
+        source_starts = (
+            range(source_cursor, len(source_tokens))
+            if canonical_index > 0
+            else range(source_cursor, min(source_cursor + 1, len(source_tokens)))
+        )
+        for source_start in source_starts:
             for source_count in (1, 2):
                 source_end = source_start + source_count
                 if source_end > len(source_tokens):
@@ -1432,6 +1437,7 @@ def repair_plan_for_acoustic_safety(
     repairable_statuses = {
         "unsafe_dense_boundary",
         "weak_retained_word_alignment",
+        "mfa_word_mapping_failed",
     }
     unsafe = [
         boundary
@@ -1636,6 +1642,252 @@ def repair_plan_for_acoustic_safety(
     for record in repair_records:
         print(f"thought {record['thought_index']}: {record['revised_canonical_text']}")
     return repaired
+
+
+def build_conservative_delivery_plan(
+    *,
+    plan_path: Path,
+    boundary_plan_path: Path,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Preserve source context across unresolved cuts instead of guessing.
+
+    This is a delivery fallback, not another acoustic resolver.  It removes an
+    unsafe physical discontinuity by retaining the omitted source words around
+    it.  The resulting extra speech is represented explicitly in canonical
+    text and revalidated by the normal bidirectional grounding validator.
+    """
+
+    plan_path = plan_path.resolve()
+    boundary_plan_path = boundary_plan_path.resolve()
+    output_dir = output_dir.resolve()
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise RuntimeError(f"delivery fallback output must be empty: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plan = read_json(plan_path)
+    boundary_plan = read_json(boundary_plan_path)
+    if not isinstance(plan, dict) or plan.get("status") != "complete":
+        raise StreamingPlanError("delivery fallback requires a complete plan")
+    if not isinstance(boundary_plan, dict) or boundary_plan.get("status") != "unsafe":
+        raise StreamingPlanError("delivery fallback requires an unsafe boundary plan")
+    words = _words_from_complete_plan(plan)
+    committed_value = plan.get("committed")
+    intervals = boundary_plan.get("source_intervals")
+    boundaries = boundary_plan.get("boundaries")
+    if not isinstance(committed_value, list) or not committed_value:
+        raise StreamingPlanError("delivery fallback has no committed thoughts")
+    if not isinstance(intervals, list) or not intervals:
+        raise StreamingPlanError("delivery fallback has no source intervals")
+    if not isinstance(boundaries, list):
+        raise StreamingPlanError("delivery fallback has no boundary ledger")
+
+    committed = json.loads(json.dumps(committed_value))
+    selected_by_thought: dict[int, set[int]] = {}
+    for thought_index, thought in enumerate(committed):
+        selected_by_thought[thought_index] = {
+            word_id
+            for source_range in thought["source_ranges"]
+            for word_id in range(
+                int(source_range["start_word_id"]),
+                int(source_range["end_word_id"]),
+            )
+        }
+
+    additions: list[dict[str, Any]] = []
+    impacted_thoughts: set[int] = set()
+    handled_intervals: set[tuple[int, int, int]] = set()
+    unsafe_statuses = {
+        "unsafe_dense_boundary",
+        "weak_retained_word_alignment",
+        "completeness_alignment_failed",
+        "mfa_alignment_failed",
+        "mfa_runtime_failed",
+        "mfa_word_mapping_failed",
+        "invalid_source_interval",
+    }
+    for boundary in boundaries:
+        if not isinstance(boundary, dict) or boundary.get("safety_status") not in (
+            unsafe_statuses
+        ):
+            continue
+        parts = str(boundary.get("boundary_id", "")).split("_")
+        if len(parts) != 3 or parts[0] != "range" or not parts[1].isdigit():
+            continue
+        interval_index = int(parts[1])
+        edge = parts[2]
+        if not 0 <= interval_index < len(intervals) or edge not in {"start", "end"}:
+            continue
+        interval = intervals[interval_index]
+        originals = interval.get("merged_original_ranges")
+        if not isinstance(originals, list) or not originals:
+            continue
+        if edge == "start":
+            end_word_id = int(interval["start_word_id"])
+            if interval_index == 0:
+                start_word_id = 0
+                thought_index = int(originals[0]["thought_index"])
+            else:
+                previous = intervals[interval_index - 1]
+                previous_originals = previous.get("merged_original_ranges")
+                if not isinstance(previous_originals, list) or not previous_originals:
+                    continue
+                start_word_id = int(previous["end_word_id"])
+                thought_index = int(previous_originals[-1]["thought_index"])
+        else:
+            start_word_id = int(interval["end_word_id"])
+            thought_index = int(originals[-1]["thought_index"])
+            end_word_id = (
+                int(intervals[interval_index + 1]["start_word_id"])
+                if interval_index + 1 < len(intervals)
+                else len(words)
+            )
+        key = (thought_index, start_word_id, end_word_id)
+        if start_word_id >= end_word_id or key in handled_intervals:
+            continue
+        handled_intervals.add(key)
+        selected_by_thought[thought_index].update(range(start_word_id, end_word_id))
+        impacted_thoughts.add(thought_index)
+        additions.append(
+            {
+                "boundary_id": boundary.get("boundary_id"),
+                "original_safety_status": boundary.get("safety_status"),
+                "thought_index": thought_index,
+                "start_word_id": start_word_id,
+                "end_word_id": end_word_id,
+                "preserved_source_text": _word_text(words[start_word_id:end_word_id]),
+            }
+        )
+    if not additions:
+        raise StreamingPlanError(
+            "unsafe boundary cannot be removed by preserving adjacent source context"
+        )
+
+    raw_thoughts: list[dict[str, Any]] = []
+    for thought_index, thought in enumerate(committed):
+        if thought_index not in impacted_thoughts:
+            raw_thoughts.append(
+                {
+                    "canonical_text": thought["canonical_text"],
+                    "source_ranges": [
+                        {
+                            "first_word_id": int(source_range["start_word_id"]),
+                            "last_word_id": int(source_range["end_word_id"]) - 1,
+                            "first_word": words[
+                                int(source_range["start_word_id"])
+                            ].text,
+                            "last_word": words[
+                                int(source_range["end_word_id"]) - 1
+                            ].text,
+                            "canonical_text": source_range["canonical_text"],
+                        }
+                        for source_range in thought["source_ranges"]
+                    ],
+                }
+            )
+            continue
+        ordered_ids = sorted(selected_by_thought[thought_index])
+        spans: list[tuple[int, int]] = []
+        span_start = ordered_ids[0]
+        prior = ordered_ids[0]
+        for word_id in ordered_ids[1:]:
+            if word_id != prior + 1:
+                spans.append((span_start, prior + 1))
+                span_start = word_id
+            prior = word_id
+        spans.append((span_start, prior + 1))
+        raw_ranges = []
+        for start_word_id, end_word_id in spans:
+            canonical = _word_text(words[start_word_id:end_word_id])
+            raw_ranges.append(
+                {
+                    "first_word_id": start_word_id,
+                    "last_word_id": end_word_id - 1,
+                    "first_word": words[start_word_id].text,
+                    "last_word": words[end_word_id - 1].text,
+                    "canonical_text": canonical,
+                }
+            )
+        raw_thoughts.append(
+            {
+                "canonical_text": " ".join(
+                    source_range["canonical_text"] for source_range in raw_ranges
+                ),
+                "source_ranges": raw_ranges,
+            }
+        )
+
+    decision = validate_decision(
+        json.dumps(
+            {
+                "finalized": raw_thoughts,
+                "pending_start_word_id": None,
+                "pending_reason": "Conservative delivery plan is complete.",
+            },
+            ensure_ascii=False,
+        ),
+        pending_words=words,
+        final_pass=True,
+        committed_source_end=0,
+    )
+    serialized = _serialize_decision(decision)
+    fallback_committed = serialized["finalized"]
+    for thought_index, thought in enumerate(fallback_committed):
+        thought["committed_iteration"] = committed[thought_index].get(
+            "committed_iteration"
+        )
+        thought["grounding_validation"]["thought_index"] = thought_index
+
+    selected_ranges = _flatten_ranges(fallback_committed)
+    committed_word_ids = [
+        word_id
+        for source_range in selected_ranges
+        for word_id in range(
+            int(source_range["start_word_id"]),
+            int(source_range["end_word_id"]),
+        )
+    ]
+    fallback = json.loads(json.dumps(plan))
+    fallback_record = {
+        "status": "complete_with_preserved_source_context",
+        "reason": "unresolved acoustic cuts were removed without guessing coordinates",
+        "parent_plan": str(plan_path),
+        "parent_plan_sha256": sha256_file(plan_path),
+        "unsafe_boundary_plan": str(boundary_plan_path),
+        "unsafe_boundary_plan_sha256": sha256_file(boundary_plan_path),
+        "preserved_intervals": additions,
+    }
+    fallback.update(
+        {
+            "status": "complete",
+            "grounding_validation": str(output_dir / "grounding_validation.json"),
+            "committed": fallback_committed,
+            "committed_words": committed_word_ids,
+            "pending_words": [],
+            "next_unread_word": len(words),
+            "selected_source_ranges": selected_ranges,
+            "selected_source_text": _word_text(
+                [words[word_id] for word_id in committed_word_ids]
+            ),
+            "reconstructed_narration": " ".join(
+                str(thought["canonical_text"]) for thought in fallback_committed
+            ).strip(),
+            "delivery_fallback": fallback_record,
+        }
+    )
+    grounding = _grounding_validation_document(
+        committed_thoughts=fallback_committed,
+        iterations=(
+            fallback.get("iterations", [])
+            if isinstance(fallback.get("iterations"), list)
+            else []
+        ),
+        status="complete",
+    )
+    grounding["delivery_fallback"] = fallback_record
+    write_json(output_dir / "grounding_validation.json", grounding)
+    write_json(output_dir / "delivery_fallback.json", fallback_record)
+    write_json(output_dir / "streaming_plan.json", fallback)
+    return fallback
 
 
 def _take_new_words(

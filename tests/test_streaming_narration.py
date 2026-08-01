@@ -12,6 +12,7 @@ from voicecut.streaming_narration import (
     SourceGroundingValidationError,
     StreamingPlanError,
     TranscriptWord,
+    build_conservative_delivery_plan,
     load_transcript_words,
     repair_plan_for_acoustic_safety,
     run_streaming_planner,
@@ -108,6 +109,95 @@ def transcript_with_word_groups(
 
 
 class StreamingNarrationTests(unittest.TestCase):
+    def test_conservative_delivery_preserves_audio_across_unsafe_cut(self) -> None:
+        words = [
+            {"id": 0, "text": "Alpha", "start": 0.0, "end": 0.2},
+            {"id": 1, "text": "wrong", "start": 0.2, "end": 0.4},
+            {"id": 2, "text": "Beta", "start": 0.4, "end": 0.6},
+        ]
+        plan = {
+            "status": "complete",
+            "words": words,
+            "committed": [
+                {
+                    "canonical_text": "Alpha",
+                    "source_ranges": [
+                        {
+                            "start_word_id": 0,
+                            "end_word_id": 1,
+                            "first_word_id": 0,
+                            "last_word_id": 0,
+                            "first_word": "Alpha",
+                            "last_word": "Alpha",
+                            "canonical_text": "Alpha",
+                        }
+                    ],
+                },
+                {
+                    "canonical_text": "Beta",
+                    "source_ranges": [
+                        {
+                            "start_word_id": 2,
+                            "end_word_id": 3,
+                            "first_word_id": 2,
+                            "last_word_id": 2,
+                            "first_word": "Beta",
+                            "last_word": "Beta",
+                            "canonical_text": "Beta",
+                        }
+                    ],
+                },
+            ],
+        }
+        unsafe = {
+            "status": "unsafe",
+            "source_intervals": [
+                {
+                    "start_word_id": 0,
+                    "end_word_id": 1,
+                    "merged_original_ranges": [{"thought_index": 0}],
+                },
+                {
+                    "start_word_id": 2,
+                    "end_word_id": 3,
+                    "merged_original_ranges": [{"thought_index": 1}],
+                },
+            ],
+            "boundaries": [
+                {
+                    "boundary_id": "range_0000_end",
+                    "safety_status": "mfa_word_mapping_failed",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "streaming_plan.json"
+            unsafe_path = root / "unsafe_boundary_plan.json"
+            write_json(plan_path, plan)
+            write_json(unsafe_path, unsafe)
+
+            fallback = build_conservative_delivery_plan(
+                plan_path=plan_path,
+                boundary_plan_path=unsafe_path,
+                output_dir=root / "fallback",
+            )
+
+            first = fallback["committed"][0]
+            self.assertEqual(first["canonical_text"], "Alpha wrong")
+            self.assertEqual(
+                first["source_ranges"][0]["end_word_id"],
+                2,
+            )
+            self.assertEqual(
+                fallback["delivery_fallback"]["status"],
+                "complete_with_preserved_source_context",
+            )
+            grounding = read_json(root / "fallback" / "grounding_validation.json")
+            self.assertEqual(grounding["status"], "valid")
+            self.assertEqual(grounding["unsupported_tokens"], [])
+            self.assertEqual(grounding["unrepresented_source_tokens"], [])
+
     def test_acoustic_repair_reselects_thought_without_reusing_unsafe_cut(
         self,
     ) -> None:
@@ -800,6 +890,45 @@ class StreamingNarrationTests(unittest.TestCase):
         self.assertEqual(
             validation["canonical_tokens"],
             validation["supported_tokens"],
+        )
+
+    def test_grounding_reports_a_skipped_range_prefix_instead_of_plural_tail(
+        self,
+    ) -> None:
+        words = [
+            TranscriptWord(index, text, float(index), index + 0.2)
+            for index, text in enumerate(
+                ["more.", "ask", "complimentary", "questions."]
+            )
+        ]
+        invalid = response(
+            finalized=[
+                thought(
+                    "ask complementary questions.",
+                    (
+                        0,
+                        3,
+                        "more.",
+                        "questions.",
+                        "ask complementary questions.",
+                    ),
+                )
+            ],
+            pending_start_word_id=None,
+        )
+
+        with self.assertRaises(SourceGroundingValidationError) as caught:
+            validate_decision(
+                invalid,
+                pending_words=words,
+                final_pass=True,
+                committed_source_end=0,
+            )
+
+        self.assertIn('Unsupported canonical token "ask"', str(caught.exception))
+        self.assertEqual(
+            caught.exception.report["unsupported_canonical_token"],
+            "ask",
         )
 
     def test_grounding_rejects_unrepresented_audio_inside_selected_range(

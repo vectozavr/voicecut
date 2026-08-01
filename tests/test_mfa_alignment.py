@@ -82,6 +82,31 @@ def _prepare(
     )
 
 
+def test_zero_duration_whisper_anchor_is_valid_mfa_crop_metadata(
+    tmp_path: Path,
+) -> None:
+    paths = _prepare(
+        tmp_path,
+        words=[
+            _word(0, "turns", 0.80, 0.90),
+            _word(1, "out", 0.90, 0.90),
+            _word(2, "that", 0.90, 0.90),
+        ],
+    )
+
+    assert (paths.speaker_corpus / "context_000.lab").read_text().strip() == (
+        "turns out that"
+    )
+
+
+def test_reversed_whisper_anchor_remains_invalid_for_mfa(tmp_path: Path) -> None:
+    with pytest.raises(MFAAlignmentError, match="invalid anchor timestamps"):
+        _prepare(
+            tmp_path,
+            words=[_word(0, "word", 0.90, 0.80)],
+        )
+
+
 def _write_mfa_json(
     paths: MFABatchPaths,
     *,
@@ -105,6 +130,62 @@ def _write_mfa_json(
         encoding="utf-8",
     )
     return output_path
+
+
+def test_parse_preserves_success_when_another_batch_context_is_missing(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_source(audio_path)
+    paths = prepare_mfa_batch(
+        audio_path=audio_path,
+        contexts=[
+            {
+                "context_id": "context_000",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [_word(0, "valid", 0.8, 1.2)],
+                "boundary_ids": ["gap_000"],
+            },
+            {
+                "context_id": "context_001",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [_word(1, "missing", 1.3, 1.7)],
+                "boundary_ids": ["gap_001"],
+            },
+        ],
+        work_dir=tmp_path / "work",
+    )
+    _write_mfa_json(
+        paths,
+        word_entries=[
+            [0.0, 0.20, "<eps>"],
+            [0.20, 0.70, "valid"],
+            [0.70, 2.0, "<eps>"],
+        ],
+        phone_entries=[
+            [0.0, 0.20, "sil"],
+            [0.20, 0.45, "V"],
+            [0.45, 0.70, "D"],
+            [0.70, 2.0, "sil"],
+        ],
+    )
+
+    result = parse_mfa_batch(paths)
+
+    assert [context["context_id"] for context in result["contexts"]] == ["context_000"]
+    assert result["context_errors"] == [
+        {
+            "context_id": "context_001",
+            "code": "mfa_word_mapping_failed",
+            "error": (
+                "MFAAlignmentError: mfa_word_mapping_failed: expected exactly one "
+                "MFA JSON for context_001, found 0"
+            ),
+            "boundary_ids": ["gap_001"],
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -210,6 +291,40 @@ def test_prepare_and_parse_mock_oov_output_with_reversible_tokens(
     ]
     assert source_word_alignment(context, 20)["mfa_tokens"] == ["voicecut"]
     assert source_word_alignment(context, 22)["mfa_tokens"] == ["re", "render"]
+
+
+def test_parse_maps_mfa_split_possessive_clitic_to_one_source_word(
+    tmp_path: Path,
+) -> None:
+    paths = _prepare(
+        tmp_path,
+        words=[_word(23, "model's", 0.7, 1.2)],
+    )
+    _write_mfa_json(
+        paths,
+        word_entries=[
+            [0.0, 0.20, "<eps>"],
+            [0.20, 0.55, "model"],
+            [0.55, 0.70, "'s"],
+            [0.70, 2.0, "<eps>"],
+        ],
+        phone_entries=[
+            [0.0, 0.20, "sil"],
+            [0.20, 0.35, "M"],
+            [0.35, 0.55, "AH0"],
+            [0.55, 0.70, "Z"],
+            [0.70, 2.0, "sil"],
+        ],
+    )
+
+    result = parse_mfa_batch(paths)
+
+    assert result["context_errors"] == []
+    mapped = result["contexts"][0]["words"][0]
+    assert mapped["source_word_ids"] == [23]
+    assert mapped["mfa_token"] == "model's"
+    assert mapped["mfa_word_tier_labels"] == ["model", "'s"]
+    assert [phone["phone"] for phone in mapped["phones"]] == ["M", "AH0", "Z"]
 
 
 def test_parse_mfa_json_maps_repeated_words_sequentially_and_preserves_phones(
@@ -380,7 +495,7 @@ def test_one_source_word_can_aggregate_several_mfa_tokens(tmp_path: Path) -> Non
     ]
 
 
-def test_parse_rejects_final_mapped_word_without_non_silence_phone(
+def test_parse_reports_final_mapped_word_without_non_silence_phone(
     tmp_path: Path,
 ) -> None:
     paths = _prepare(
@@ -407,11 +522,14 @@ def test_parse_rejects_final_mapped_word_without_non_silence_phone(
         ],
     )
 
-    with pytest.raises(
-        MFAAlignmentError,
-        match="mapped word 'missing' has no non-silence phone",
-    ):
-        parse_mfa_batch(paths)
+    result = parse_mfa_batch(paths)
+
+    assert result["contexts"] == []
+    assert result["context_errors"][0]["context_id"] == "context_000"
+    assert (
+        "mapped word 'missing' has no non-silence phone"
+        in result["context_errors"][0]["error"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -431,7 +549,7 @@ def test_parse_rejects_final_mapped_word_without_non_silence_phone(
     ],
     ids=["overlapping-phone-tier", "phone-outside-word"],
 )
-def test_parse_rejects_overlapping_or_invalid_phone_geometry(
+def test_parse_reports_overlapping_or_invalid_phone_geometry(
     tmp_path: Path,
     phone_entries: list[list[Any]],
 ) -> None:
@@ -446,8 +564,17 @@ def test_parse_rejects_overlapping_or_invalid_phone_geometry(
         phone_entries=phone_entries,
     )
 
-    with pytest.raises(MFAAlignmentError, match="mfa_word_mapping_failed"):
-        parse_mfa_batch(paths)
+    result = parse_mfa_batch(paths)
+
+    assert result["contexts"] == []
+    assert result["context_errors"] == [
+        {
+            "context_id": "context_000",
+            "code": "mfa_word_mapping_failed",
+            "error": result["context_errors"][0]["error"],
+            "boundary_ids": ["gap_000"],
+        }
+    ]
 
 
 def test_ambiguous_many_source_words_to_one_token_fails_closed(tmp_path: Path) -> None:

@@ -366,6 +366,20 @@ def _context_geometry(
             math.ceil(float(following["end"]) * SAMPLE_RATE),
         )
         context_end += 1
+    first_word_start = math.floor(float(words[context_start]["start"]) * SAMPLE_RATE)
+    previous_word_end = (
+        math.ceil(float(words[context_start - 1]["end"]) * SAMPLE_RATE)
+        if context_start > 0
+        else 0
+    )
+    crop_start = min(crop_start, max(previous_word_end, first_word_start - 400))
+    last_word_end = math.ceil(float(words[context_end - 1]["end"]) * SAMPLE_RATE)
+    next_word_start = (
+        math.floor(float(words[context_end]["start"]) * SAMPLE_RATE)
+        if context_end < len(words)
+        else total_samples
+    )
+    crop_end = max(crop_end, min(next_word_start, last_word_end + 400))
     return range(context_start, context_end), (crop_start, crop_end)
 
 
@@ -1155,6 +1169,102 @@ def test_final_render_fails_closed_on_alignment_failure(
     assert boundary_plan["status"] == "unsafe"
     assert boundary_plan["alignment_failures"] == 3
     assert boundary_plan["alignment_backend"] == "mfa"
+
+
+def test_final_render_preserves_local_source_context_after_retry_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    words = read_json(plan_path)["words"]
+    initial_completeness, _ = _grounded_evidence(
+        words=words,
+        audio_path=audio_path,
+    )
+    fallback_completeness = _completeness_payload(
+        words=words,
+        contexts=[(range(3), None), (range(3), None)],
+    )
+    acoustic_intervals = {
+        0: (0.10, 0.62),
+        1: (0.72, 0.95),
+        2: (1.20, 1.52),
+    }
+    fallback_mfa = _mfa_payload(
+        words=words,
+        selected_word_ids={0, 1, 2},
+        source_audio_sha256=sha256_file(audio_path),
+        contexts=[
+            (
+                "eof_tail",
+                *_context_geometry(
+                    words,
+                    role_word_ids=(2,),
+                    total_samples=2300,
+                ),
+                acoustic_intervals,
+            ),
+            (
+                "internal_thought_gap_0000",
+                *_context_geometry(
+                    words,
+                    role_word_ids=(1, 2),
+                    total_samples=2300,
+                ),
+                acoustic_intervals,
+            ),
+        ],
+    )
+    invalid_mfa = {
+        "schema_version": 1,
+        "backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "model_id": MFA_MODEL_ID,
+        "fine_tune": True,
+        "sample_rate": SAMPLE_RATE,
+        "source_audio_sha256": sha256_file(audio_path),
+        "contexts": [],
+    }
+    render_calls = 0
+    original_render = final_render_module.render_boundary_plan
+
+    def count_render(**kwargs: Any) -> dict[str, Any]:
+        nonlocal render_calls
+        render_calls += 1
+        return original_render(**kwargs)
+
+    monkeypatch.setattr(final_render_module, "render_boundary_plan", count_render)
+    output_dir = tmp_path / "conservative_delivery"
+
+    with pytest.warns(RuntimeWarning, match="conservative source preservation"):
+        manifest = render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_plan_path,
+            alignment_python=tmp_path / "model-must-not-run",
+            alignment_payloads=[initial_completeness, fallback_completeness],
+            mfa_payloads=[invalid_mfa, fallback_mfa],
+            max_acoustic_retries=0,
+        )
+
+    assert render_calls == 1
+    assert manifest["status"] == "complete"
+    assert manifest["delivery_status"] == ("complete_with_preserved_source_context")
+    assert Path(manifest["final_cut_wav"]).is_file()
+    assert manifest["unresolved_boundaries"] == 0
+    fallback = manifest["delivery_fallback"]
+    assert fallback["preserved_intervals"]
+    assert fallback["preserved_intervals"][0]["start_word_id"] == 1
+    assert fallback["preserved_intervals"][0]["end_word_id"] == 2
+    effective_plan = read_json(Path(manifest["effective_streaming_plan"]))
+    assert "omitted" in effective_plan["committed"][0]["canonical_text"].lower()
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert boundary_plan["status"] == "safe"
+    assert boundary_plan["delivery_status"] == (
+        "complete_with_preserved_source_context"
+    )
+    assert len(boundary_plan["source_intervals"]) == 1
 
 
 def test_final_render_accepts_dense_mfa_phone_boundary_without_silence(

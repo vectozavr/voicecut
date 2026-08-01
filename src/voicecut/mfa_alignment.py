@@ -270,7 +270,13 @@ def _coerce_source_word(value: MFASourceWord | Mapping[str, Any]) -> MFASourceWo
             "mfa_word_mapping_failed",
             f"source word {result.word_id} has empty text",
         )
-    if result.start_seconds < 0.0 or result.end_seconds <= result.start_seconds:
+    # Whisper timestamps are approximate crop anchors, not alignment
+    # geometry. Long-form decoding can legitimately assign several sequential
+    # tokens the same zero-duration anchor. MFA maps those tokens by ordered
+    # occurrence and supplies their authoritative word/phone intervals.
+    # Preserve touching anchors verbatim; reject only negative or reversed
+    # values rather than inventing duration by clamping timestamps.
+    if result.start_seconds < 0.0 or result.end_seconds < result.start_seconds:
         raise MFAAlignmentError(
             "mfa_word_mapping_failed",
             f"source word {result.word_id} has invalid anchor timestamps",
@@ -835,6 +841,78 @@ def _word_phones(
     return selected
 
 
+def _mapped_word_records(
+    *,
+    context_id: str,
+    lexical_words: Sequence[Mapping[str, Any]],
+    mappings: Sequence[MFATokenMapping],
+    phone_intervals: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Map ordered MFA words, including MFA's split contraction clitics.
+
+    MFA can export a transcript token such as ``model's`` as two word-tier
+    intervals, ``model`` and ``'s``. The mapping remains deterministic because
+    both streams are ordered; consume the shortest consecutive output sequence
+    whose concatenated label normalizes to the requested input token.
+    """
+
+    mapped_words: list[dict[str, Any]] = []
+    output_index = 0
+    for mapping_index, mapping in enumerate(mappings):
+        matched: list[Mapping[str, Any]] | None = None
+        for end_index in range(
+            output_index + 1,
+            min(len(lexical_words), output_index + 3) + 1,
+        ):
+            candidate = "".join(
+                str(interval["label"])
+                for interval in lexical_words[output_index:end_index]
+            )
+            normalized = normalize_mfa_token(candidate)
+            if normalized == (mapping.token,):
+                matched = list(lexical_words[output_index:end_index])
+                output_index = end_index
+                break
+        if matched is None:
+            actual = [
+                str(interval["label"])
+                for interval in lexical_words[output_index : output_index + 3]
+            ]
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                f"context {context_id} token {mapping_index} expected "
+                f"{mapping.token!r}, MFA returned {actual!r}",
+            )
+        combined = dict(matched[0])
+        combined["label"] = mapping.token
+        for prefix in ("relative_", ""):
+            combined[f"{prefix}end_seconds"] = matched[-1][f"{prefix}end_seconds"]
+        combined["end_sample"] = matched[-1]["end_sample"]
+        record = dict(combined)
+        record.pop("label")
+        record.update(
+            {
+                "source_word_ids": list(mapping.source_word_ids),
+                "source_text": mapping.source_text,
+                "mfa_token": mapping.token,
+                "mfa_word_tier_labels": [
+                    str(interval["label"]) for interval in matched
+                ],
+                "phones": _word_phones(combined, phone_intervals),
+            }
+        )
+        mapped_words.append(record)
+    if output_index != len(lexical_words):
+        remaining = [
+            str(interval["label"]) for interval in lexical_words[output_index:]
+        ]
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            f"context {context_id} returned unmapped MFA words {remaining!r}",
+        )
+    return mapped_words
+
+
 def _find_output_json(paths: MFABatchPaths, context_id: str) -> Path:
     expected = paths.speaker_output / f"{context_id}.json"
     if expected.is_file():
@@ -848,8 +926,102 @@ def _find_output_json(paths: MFABatchPaths, context_id: str) -> Path:
     return candidates[0]
 
 
+def _parse_mfa_context(
+    *,
+    paths: MFABatchPaths,
+    raw_context: Mapping[str, Any],
+    sample_rate: int,
+) -> dict[str, Any]:
+    context_id = str(raw_context["context_id"])
+    crop_start = float(raw_context["crop_source_start_seconds"])
+    crop_end = float(raw_context["crop_source_end_seconds"])
+    crop_duration = crop_end - crop_start
+    output_path = _find_output_json(paths, context_id)
+    payload = read_json(output_path)
+    if not isinstance(payload, Mapping):
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            f"MFA output for {context_id} is not an object",
+        )
+    output_end = _finite_number(payload.get("end"), field="MFA JSON end")
+    if abs(output_end - crop_duration) > 0.05:
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            f"MFA output duration mismatch for {context_id}: "
+            f"{output_end:.6f} vs {crop_duration:.6f}",
+        )
+
+    word_intervals = _parse_intervals(
+        _tier_entries(payload, "words"),
+        tier_name="word",
+        crop_start_seconds=crop_start,
+        crop_duration_seconds=crop_duration,
+        sample_rate=sample_rate,
+    )
+    phone_intervals = _parse_intervals(
+        _tier_entries(payload, "phones"),
+        tier_name="phone",
+        crop_start_seconds=crop_start,
+        crop_duration_seconds=crop_duration,
+        sample_rate=sample_rate,
+    )
+    lexical_words = [
+        interval
+        for interval in word_intervals
+        if not _is_mfa_silence_word(str(interval["label"]))
+    ]
+    raw_mappings = raw_context.get("token_mappings")
+    if not isinstance(raw_mappings, list):
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            f"context {context_id} has no token mapping",
+        )
+    mappings = tuple(_coerce_token_mapping(item) for item in raw_mappings)
+    mapped_words = _mapped_word_records(
+        context_id=context_id,
+        lexical_words=lexical_words,
+        mappings=mappings,
+        phone_intervals=phone_intervals,
+    )
+
+    all_phones: list[dict[str, Any]] = []
+    for phone in phone_intervals:
+        record = dict(phone)
+        record["phone"] = record.pop("label")
+        record["is_silence"] = is_mfa_silence_phone(str(record["phone"]))
+        if not record["is_silence"] and float(record["end_seconds"]) <= float(
+            record["start_seconds"]
+        ):
+            raise MFAAlignmentError(
+                "mfa_word_mapping_failed",
+                f"non-silence phone {record['phone']!r} has zero duration",
+            )
+        all_phones.append(record)
+    return {
+        "context_id": context_id,
+        "crop_source_start_seconds": crop_start,
+        "crop_source_end_seconds": crop_end,
+        "crop_source_start_sample": int(raw_context["crop_source_start_sample"]),
+        "crop_source_end_sample": int(raw_context["crop_source_end_sample"]),
+        "ordered_source_word_ids": list(raw_context["ordered_source_word_ids"]),
+        "original_source_words": list(raw_context["original_source_words"]),
+        "boundary_ids": list(raw_context["boundary_ids"]),
+        "words": mapped_words,
+        "phones": all_phones,
+        "mfa_output_json": str(output_path),
+    }
+
+
 def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
-    """Parse MFA JSON tiers into absolute source word and phone evidence."""
+    """Parse every usable MFA context without discarding partial success.
+
+    MFA reports per-utterance alignment failures by omitting their exported
+    JSON files while still exiting successfully for the batch. A long
+    recording can therefore contain hundreds of valid contexts and a handful
+    of failures. Preserve the valid evidence and attach a fail-closed error to
+    each missing or malformed context; the boundary planner decides which
+    contexts are production-required and which are optional enhancements.
+    """
 
     batch = read_json(paths.metadata / "batch.json")
     if not isinstance(batch, Mapping):
@@ -866,118 +1038,38 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
         )
 
     parsed_contexts: list[dict[str, Any]] = []
+    context_errors: list[dict[str, Any]] = []
     for raw_context in raw_contexts:
         if not isinstance(raw_context, Mapping):
             raise MFAAlignmentError(
                 "mfa_word_mapping_failed", "invalid MFA context metadata"
             )
-        context_id = str(raw_context["context_id"])
-        crop_start = float(raw_context["crop_source_start_seconds"])
-        crop_end = float(raw_context["crop_source_end_seconds"])
-        crop_duration = crop_end - crop_start
-        output_path = _find_output_json(paths, context_id)
-        payload = read_json(output_path)
-        if not isinstance(payload, Mapping):
+        context_id = str(raw_context.get("context_id", ""))
+        if not context_id:
             raise MFAAlignmentError(
-                "mfa_word_mapping_failed",
-                f"MFA output for {context_id} is not an object",
+                "mfa_word_mapping_failed", "MFA context metadata has no context ID"
             )
-        output_end = _finite_number(payload.get("end"), field="MFA JSON end")
-        if abs(output_end - crop_duration) > 0.05:
-            raise MFAAlignmentError(
-                "mfa_word_mapping_failed",
-                f"MFA output duration mismatch for {context_id}: "
-                f"{output_end:.6f} vs {crop_duration:.6f}",
-            )
-
-        raw_words = _tier_entries(payload, "words")
-        raw_phones = _tier_entries(payload, "phones")
-        word_intervals = _parse_intervals(
-            raw_words,
-            tier_name="word",
-            crop_start_seconds=crop_start,
-            crop_duration_seconds=crop_duration,
-            sample_rate=sample_rate,
-        )
-        phone_intervals = _parse_intervals(
-            raw_phones,
-            tier_name="phone",
-            crop_start_seconds=crop_start,
-            crop_duration_seconds=crop_duration,
-            sample_rate=sample_rate,
-        )
-        lexical_words = [
-            interval
-            for interval in word_intervals
-            if not _is_mfa_silence_word(str(interval["label"]))
-        ]
-        raw_mappings = raw_context.get("token_mappings")
-        if not isinstance(raw_mappings, list):
-            raise MFAAlignmentError(
-                "mfa_word_mapping_failed",
-                f"context {context_id} has no token mapping",
-            )
-        mappings = tuple(_coerce_token_mapping(item) for item in raw_mappings)
-        if len(lexical_words) != len(mappings):
-            raise MFAAlignmentError(
-                "mfa_word_mapping_failed",
-                f"context {context_id} expected {len(mappings)} aligned words, "
-                f"MFA returned {len(lexical_words)}",
-            )
-
-        mapped_words: list[dict[str, Any]] = []
-        for index, (interval, mapping) in enumerate(
-            zip(lexical_words, mappings, strict=True)
-        ):
-            output_token = _normalized_output_token(str(interval["label"]))
-            if output_token != mapping.token:
-                raise MFAAlignmentError(
-                    "mfa_word_mapping_failed",
-                    f"context {context_id} token {index} expected "
-                    f"{mapping.token!r}, MFA returned {output_token!r}",
+        try:
+            parsed_contexts.append(
+                _parse_mfa_context(
+                    paths=paths,
+                    raw_context=raw_context,
+                    sample_rate=sample_rate,
                 )
-            record = dict(interval)
-            record.pop("label")
-            record.update(
+            )
+        except (MFAAlignmentError, OSError, TypeError, ValueError) as error:
+            context_errors.append(
                 {
-                    "source_word_ids": list(mapping.source_word_ids),
-                    "source_text": mapping.source_text,
-                    "mfa_token": mapping.token,
-                    "phones": _word_phones(interval, phone_intervals),
+                    "context_id": context_id,
+                    "code": (
+                        error.code
+                        if isinstance(error, MFAAlignmentError)
+                        else "mfa_word_mapping_failed"
+                    ),
+                    "error": f"{type(error).__name__}: {error}",
+                    "boundary_ids": list(raw_context.get("boundary_ids", [])),
                 }
             )
-            mapped_words.append(record)
-
-        all_phones: list[dict[str, Any]] = []
-        for phone in phone_intervals:
-            record = dict(phone)
-            record["phone"] = record.pop("label")
-            record["is_silence"] = is_mfa_silence_phone(str(record["phone"]))
-            if not record["is_silence"] and float(record["end_seconds"]) <= float(
-                record["start_seconds"]
-            ):
-                raise MFAAlignmentError(
-                    "mfa_word_mapping_failed",
-                    f"non-silence phone {record['phone']!r} has zero duration",
-                )
-            all_phones.append(record)
-        parsed_contexts.append(
-            {
-                "context_id": context_id,
-                "crop_source_start_seconds": crop_start,
-                "crop_source_end_seconds": crop_end,
-                "crop_source_start_sample": int(
-                    raw_context["crop_source_start_sample"]
-                ),
-                "crop_source_end_sample": int(raw_context["crop_source_end_sample"]),
-                "ordered_source_word_ids": list(raw_context["ordered_source_word_ids"]),
-                "original_source_words": list(raw_context["original_source_words"]),
-                "boundary_ids": list(raw_context["boundary_ids"]),
-                "words": mapped_words,
-                "phones": all_phones,
-                "mfa_output_json": str(output_path),
-            }
-        )
 
     return {
         "schema_version": 1,
@@ -989,6 +1081,7 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
         "source_audio": batch.get("source_audio"),
         "source_audio_sha256": batch.get("source_audio_sha256"),
         "contexts": parsed_contexts,
+        "context_errors": context_errors,
     }
 
 

@@ -452,8 +452,13 @@ The final non-silence phone of the retained word on the left and the first
 non-silence phone of the retained word on the right define the protected speech
 edges and authoritative source sample coordinates. Missing or ambiguous word
 mapping, missing phones, invalid phone geometry, or an endpoint inside a
-retained phone fails closed as an MFA alignment error. VoiceCut never falls
-back to a Whisper timestamp.
+retained phone invalidates that cut. VoiceCut never falls back to a Whisper
+timestamp. After bounded semantic repair is exhausted, a locally unresolved
+cut is removed by conservatively preserving the original contiguous source
+context across it. The WAV is still delivered, with
+`delivery_status=complete_with_preserved_source_context` and the exact affected
+word intervals in the manifest; that small region may retain an abandoned
+attempt, but no guessed coordinate can clip speech.
 
 When MFA confirms a phone-free or silence-phone interval, waveform energy and
 zero crossings may choose a convenient splice only inside that interval. They
@@ -594,10 +599,14 @@ directory's `mfa_alignment/` artifacts and `final_boundary_plan.json` contain
 the batch contexts, mapped word/phone intervals, final coordinates, and safety
 statuses needed to diagnose a failed run.
 
-An MFA mapping or phone-geometry failure is intentionally fatal. VoiceCut does
-not automatically switch to WhisperX coordinates, Whisper timestamps, an RMS
-minimum, or another aligner. Use a fresh `--work-dir` after correcting the
-runtime, transcript, or input problem so the result is unambiguous.
+VoiceCut does not automatically switch to WhisperX coordinates, Whisper
+timestamps, an RMS minimum, or another aligner. A local MFA mapping or
+phone-geometry failure first receives bounded semantic repair; if it remains
+unresolved, VoiceCut preserves the original source context across that cut and
+publishes a clearly marked degraded result. A global MFA runtime failure, an
+ungrounded initial semantic plan, or a failure that cannot be removed without
+inventing coordinates remains fatal. Use a fresh `--work-dir` after correcting
+such a runtime, transcript, or input problem.
 
 ## Privacy
 
@@ -627,8 +636,10 @@ run manifests.
   slides, captions, or visual continuity.
 - Audio/video output is re-encoded in common delivery codecs; VoiceCut is not a
   lossless container remuxer.
-- A fail-closed alignment or grounding error requires a new run or a better
-  model; VoiceCut does not guess an unsafe boundary.
+- A locally unresolved cut preserves its original source context and is listed
+  in the final manifest instead of preventing publication. Global alignment or
+  initial grounding failures still require a corrected run; VoiceCut never
+  guesses an unsafe boundary.
 - This is an editor, not a denoiser, mastering suite, speech generator, or
   voice-cloning system.
 

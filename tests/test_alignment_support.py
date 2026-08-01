@@ -73,7 +73,7 @@ def test_support_gate_rejects_bad_familiar_without_rejecting_good_words() -> Non
     assert accepted_s["edge_character_scores"][-1] == 0.996
 
 
-def test_support_gate_reports_weak_initial_word_support() -> None:
+def test_support_gate_reports_weak_initial_word_support_with_nearby_retry() -> None:
     weak = _span(
         word_id=4,
         text="example",
@@ -81,6 +81,12 @@ def test_support_gate_reports_weak_initial_word_support() -> None:
         scores=[0.30, 0.40, 0.45, 0.95, 0.95, 0.95, 0.95],
     )
     context = [
+        _span(
+            word_id=2,
+            text="example",
+            word_score=0.95,
+            scores=[0.95] * 7,
+        ),
         weak,
         _span(
             word_id=5,
@@ -95,6 +101,40 @@ def test_support_gate_reports_weak_initial_word_support() -> None:
     assert support["status"] == "weak_initial_word_support"
     assert support["complete_character_coverage"] is True
     assert support["monotonic_character_timestamps"] is True
+    assert support["nearby_same_word_retry"] is True
+
+
+def test_weak_scores_without_retry_do_not_delete_unique_boundary_words() -> None:
+    tuning = _span(
+        word_id=4443,
+        text="tuning",
+        word_score=0.249,
+        scores=[0.0, 0.496, 0.997, 0.0, 0.0, 0.0],
+    )
+    ask = _span(
+        word_id=4449,
+        text="ask",
+        word_score=0.143,
+        scores=[0.416, 0.012, 0.0],
+    )
+    context = [
+        tuning,
+        ask,
+        _span(
+            word_id=4450,
+            text="complementary",
+            word_score=0.90,
+            scores=[0.90] * 13,
+        ),
+    ]
+
+    terminal = evaluate_retained_word_support(tuning, context, edge="terminal")
+    initial = evaluate_retained_word_support(ask, context, edge="initial")
+
+    assert terminal["nearby_same_word_retry"] is False
+    assert initial["nearby_same_word_retry"] is False
+    assert terminal["status"] == "supported_complete_word"
+    assert initial["status"] == "supported_complete_word"
 
 
 def test_single_weak_terminal_character_without_nearby_retry_is_not_a_veto() -> None:

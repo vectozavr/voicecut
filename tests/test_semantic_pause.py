@@ -13,6 +13,7 @@ from voicecut.semantic_pause import (
     PausePlanValidationError,
     _insert_audio_segments,
     create_pause_plan,
+    deterministic_pause_fallback,
     find_quiet_insertion_point,
     refine_eof_tail,
     render_semantic_pauses,
@@ -24,7 +25,7 @@ class FakePauseBackend:
     backend_name = "gemini"
     model = "fake-gemini"
 
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[str | Exception]) -> None:
         self.responses = list(responses)
         self.prompts: list[str] = []
 
@@ -37,7 +38,10 @@ class FakePauseBackend:
     ) -> str:
         del response_schema, request_id
         self.prompts.append(prompt)
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
     def close(self) -> None:
         return None
@@ -263,6 +267,149 @@ def test_pause_planner_batches_long_narration_with_global_indices(
     assert len(backend.prompts) == 3
     assert "thought 39:" in backend.prompts[1]
     assert (output_dir / "pause_plan_batch_003_attempt_1.raw.json").is_file()
+
+
+def test_deterministic_pause_fallback_uses_conservative_text_cues() -> None:
+    transitions, provenance = deterministic_pause_fallback(
+        [
+            {"canonical_text": "The result follows:"},
+            {"canonical_text": "this expression."},
+            {"canonical_text": "However, the values remain bounded."},
+            {"canonical_text": "Section two begins here."},
+            {"canonical_text": "This is a separate complete statement."},
+        ],
+        start_thought_index=12,
+    )
+
+    assert [item["pause_type"] for item in transitions] == [
+        "continuation",
+        "short",
+        "section",
+        "thought",
+    ]
+    assert [item["after_thought_index"] for item in transitions] == [12, 13, 14, 15]
+    assert [item["rule"] for item in provenance] == [
+        "previous_continuation_punctuation",
+        "next_thought_connective",
+        "explicit_section_cue",
+        "complete_sentence_default",
+    ]
+
+
+def _write_long_pause_fixture(tmp_path: Path, *, thought_count: int = 81) -> Path:
+    plan_path = tmp_path / "long_streaming_plan.json"
+    write_json(
+        plan_path,
+        {
+            "status": "complete",
+            "committed": [
+                {
+                    "canonical_text": f"Thought {index}.",
+                    "source_ranges": [
+                        {"start_word_id": index, "end_word_id": index + 1}
+                    ],
+                }
+                for index in range(thought_count)
+            ],
+        },
+    )
+    return plan_path
+
+
+def _pause_batch_response(start: int, end: int, pause_type: str) -> str:
+    return json.dumps(
+        {
+            "transitions": [
+                {
+                    "after_thought_index": index,
+                    "before_thought_index": index + 1,
+                    "pause_type": pause_type,
+                }
+                for index in range(start, end)
+            ]
+        }
+    )
+
+
+def test_pause_planner_falls_back_only_for_failed_long_batch(tmp_path: Path) -> None:
+    plan_path = _write_long_pause_fixture(tmp_path)
+    original_plan = plan_path.read_bytes()
+    backend = FakePauseBackend(
+        [
+            _pause_batch_response(0, 39, "short"),
+            TimeoutError("first API timeout"),
+            TimeoutError("retry API timeout"),
+            _pause_batch_response(78, 80, "section"),
+        ]
+    )
+    output_dir = tmp_path / "pause_output"
+
+    pause_plan = create_pause_plan(
+        plan_path=plan_path,
+        output_dir=output_dir,
+        backend=backend,
+    )
+
+    assert plan_path.read_bytes() == original_plan
+    assert pause_plan["transition_count"] == 80
+    assert pause_plan["degraded"] is True
+    assert pause_plan["degraded_batch_count"] == 1
+    assert [item["pause_type"] for item in pause_plan["transitions"][:39]] == [
+        "short"
+    ] * 39
+    assert [item["pause_type"] for item in pause_plan["transitions"][39:78]] == [
+        "thought"
+    ] * 39
+    assert [item["pause_type"] for item in pause_plan["transitions"][78:]] == [
+        "section"
+    ] * 2
+    degraded = pause_plan["degraded_batches"][0]
+    assert degraded["batch"] == 2
+    assert degraded["classification_source"] == "deterministic_pause_heuristics_v1"
+    assert degraded["model_error"] == "TimeoutError: retry API timeout"
+    assert len(degraded["transition_provenance"]) == 39
+    assert all(
+        item["rule"] == "complete_sentence_default"
+        for item in degraded["transition_provenance"]
+    )
+    assert len(backend.prompts) == 4
+    assert "VALIDATION ERROR" in backend.prompts[2]
+    assert (output_dir / "pause_plan_batch_002_fallback.json").is_file()
+    assert not (output_dir / "pause_plan_failure.json").exists()
+
+
+def test_pause_planner_falls_back_for_every_failed_long_batch(tmp_path: Path) -> None:
+    plan_path = _write_long_pause_fixture(tmp_path)
+    backend = FakePauseBackend(
+        [TimeoutError(f"API timeout {index}") for index in range(6)]
+    )
+    output_dir = tmp_path / "pause_output"
+
+    pause_plan = create_pause_plan(
+        plan_path=plan_path,
+        output_dir=output_dir,
+        backend=backend,
+    )
+
+    assert pause_plan["transition_count"] == 80
+    assert pause_plan["degraded"] is True
+    assert pause_plan["degraded_batch_count"] == 3
+    assert [item["batch"] for item in pause_plan["degraded_batches"]] == [1, 2, 3]
+    assert [item["after_thought_index"] for item in pause_plan["transitions"]] == list(
+        range(80)
+    )
+    assert {item["pause_type"] for item in pause_plan["transitions"]} == {"thought"}
+    assert len(pause_plan["attempts"]) == 6
+    assert all(
+        item["classification_source"] == "deterministic_pause_heuristics_v1"
+        for item in pause_plan["batch_provenance"]
+    )
+    for batch_index in range(1, 4):
+        assert (
+            output_dir / f"pause_plan_batch_{batch_index:03d}_fallback.json"
+        ).is_file()
+    assert (output_dir / "pause_plan.json").is_file()
+    assert not (output_dir / "pause_plan_failure.json").exists()
 
 
 def test_quiet_insertion_requires_real_low_energy() -> None:

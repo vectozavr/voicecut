@@ -67,6 +67,34 @@ def _fake_gemini_preflight(**_: object) -> PlannerRuntimeConfiguration:
     )
 
 
+def _write_fake_ctc_enrichment(output_dir: Path, *, audio_sha256: str) -> None:
+    report = {
+        "schema_version": 1,
+        "status": "complete",
+        "atoms_examined": 0,
+        "atoms_expanded": 0,
+        "atoms_skipped_no_lexical_content": 0,
+        "atoms_with_decode_failures": 0,
+        "hallucinated_suffixes_pruned": 0,
+        "hidden_retries_recovered": 0,
+        "recovered": [],
+        "pruned_suffixes": [],
+        "skipped_atoms": [],
+        "decode_failures": [],
+    }
+    write_json(
+        output_dir / "source_transcript_ctc_enriched.json",
+        {
+            "audio_sha256": audio_sha256,
+            "source_decode_strategy": (
+                "whisper_primary_plus_gated_raw_ctc_insertions_v2"
+            ),
+            "ctc_enrichment": report,
+        },
+    )
+    write_json(output_dir / "ctc_enrichment_report.json", report)
+
+
 def test_full_pipeline_runs_every_stage_and_then_uses_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -76,6 +104,35 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
     args = _args(tmp_path, source)
     calls: list[list[str]] = []
     publication_calls = 0
+    transcription_checkpoint = (
+        args.work_dir / "02_transcription/source_transcript.json.partial"
+    )
+    transcription_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    transcription_checkpoint_value = {
+        "schema_version": 1,
+        "checkpoint_kind": "transcription",
+        "completed_atoms": [0],
+    }
+    write_json(transcription_checkpoint, transcription_checkpoint_value)
+    (args.work_dir / "02_transcription/source_transcript.json").write_text(
+        '{"audio_sha256":',
+        encoding="utf-8",
+    )
+    ctc_checkpoint = args.work_dir / "03_ctc_enrichment/ctc_alignment.json.partial"
+    ctc_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    ctc_checkpoint_value = {
+        "schema_version": 1,
+        "checkpoint_kind": "ctc_alignment",
+        "completed_atoms": [0],
+    }
+    write_json(ctc_checkpoint, ctc_checkpoint_value)
+    (
+        args.work_dir / "03_ctc_enrichment/source_transcript_ctc_enriched.json"
+    ).write_text('{"audio_sha256":', encoding="utf-8")
+    (args.work_dir / "03_ctc_enrichment/ctc_enrichment_report.json").write_text(
+        '{"status":',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("GEMINI_API_KEY", "selected-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "unrelated-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "unrelated-secret")
@@ -132,21 +189,17 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
             output_dir = Path(command[command.index("--output-dir") + 1])
             write_json(output_dir / "analysis.json", {"audio_sha256": audio_sha})
         elif module == "voicecut.transcribe_mlx":
+            assert "--resume" in command
+            assert read_json(transcription_checkpoint) == transcription_checkpoint_value
             write_json(
                 Path(command[command.index("--output") + 1]),
                 {"audio_sha256": audio_sha},
             )
         elif module == "voicecut.ctc_enrich":
+            assert "--resume" in command
+            assert read_json(ctc_checkpoint) == ctc_checkpoint_value
             output_dir = Path(command[command.index("--output-dir") + 1])
-            write_json(
-                output_dir / "source_transcript_ctc_enriched.json",
-                {
-                    "audio_sha256": audio_sha,
-                    "source_decode_strategy": (
-                        "whisper_primary_plus_gated_raw_ctc_insertions_v2"
-                    ),
-                },
-            )
+            _write_fake_ctc_enrichment(output_dir, audio_sha256=audio_sha)
         elif module == "voicecut.streaming_narration":
             output_dir = Path(command[command.index("--output-dir") + 1])
             transcript = Path(command[command.index("--transcript") + 1])
@@ -231,6 +284,8 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
     )
     assert len(calls) == 5
     assert publication_calls == 1
+    assert read_json(transcription_checkpoint) == transcription_checkpoint_value
+    assert read_json(ctc_checkpoint) == ctc_checkpoint_value
     assert created["stages"] == {
         "media_input": "created",
         "analysis": "created",
@@ -265,6 +320,48 @@ def test_full_pipeline_runs_every_stage_and_then_uses_cache(
     def unexpected_media(*_: object, **__: object):
         raise AssertionError("cached media must not be decoded")
 
+    # A matching enriched transcript without its report is not a complete CTC
+    # cache entry: the absent report could conceal degraded passthrough status.
+    # Rerun only CTC, retain its validated checkpoint, then reuse downstream
+    # stages because the regenerated enriched transcript is byte-identical.
+    calls.clear()
+    (args.work_dir / "03_ctc_enrichment/ctc_enrichment_report.json").unlink()
+    resumed = run_full_pipeline(
+        args,
+        runner=fake_runner,
+        media_preparer=unexpected_media,
+        audio_publisher=unexpected_media,
+        planner_preflight=_fake_gemini_preflight,
+    )
+    assert [command[command.index("-m") + 1] for command in calls] == [
+        "voicecut.ctc_enrich"
+    ]
+    assert resumed["stages"]["hidden_retry_recovery"] == "created"
+    assert all(
+        status == "cached"
+        for stage, status in resumed["stages"].items()
+        if stage != "hidden_retry_recovery"
+    )
+    assert read_json(ctc_checkpoint) == ctc_checkpoint_value
+
+    report_path = args.work_dir / "03_ctc_enrichment/ctc_enrichment_report.json"
+    mismatched_report = read_json(report_path)
+    mismatched_report["status"] = "complete_with_degraded_evidence"
+    write_json(report_path, mismatched_report)
+    calls.clear()
+    cross_checked = run_full_pipeline(
+        args,
+        runner=fake_runner,
+        media_preparer=unexpected_media,
+        audio_publisher=unexpected_media,
+        planner_preflight=_fake_gemini_preflight,
+    )
+    assert [command[command.index("-m") + 1] for command in calls] == [
+        "voicecut.ctc_enrich"
+    ]
+    assert cross_checked["ctc_enrichment_status"] == "complete"
+    assert read_json(ctc_checkpoint) == ctc_checkpoint_value
+
     cached = run_full_pipeline(
         args,
         runner=unexpected_runner,
@@ -296,6 +393,207 @@ def test_public_parser_is_one_input_to_one_output(tmp_path: Path) -> None:
     assert parsed.alignment_python == Path(sys.executable)
     assert parsed.alignment_backend == "mfa"
     assert parsed.debug_artifacts is False
+
+
+def test_optional_ctc_process_failure_completes_with_whisper_passthrough(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.wav"
+    source.write_bytes(b"source media")
+    args = _args(tmp_path, source)
+
+    def fake_media_preparer(input_path: Path, output_dir: Path):
+        output_dir.mkdir(parents=True)
+        canonical = output_dir / "source_audio.wav"
+        canonical.write_bytes(b"canonical audio")
+        manifest = {
+            "status": "complete",
+            "source_media": str(input_path.resolve()),
+            "source_media_sha256": sha256_file(input_path),
+            "source_kind": "audio",
+            "canonical_audio": str(canonical.resolve()),
+            "canonical_audio_sha256": sha256_file(canonical),
+        }
+        write_json(output_dir / "media_input.json", manifest)
+        return manifest
+
+    def fake_runner(command: list[str], **_: object) -> None:
+        module = command[command.index("-m") + 1]
+        audio = args.work_dir / "00_media/source_audio.wav"
+        audio_sha = sha256_file(audio)
+        if module == "voicecut.analyze":
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            write_json(output_dir / "analysis.json", {"audio_sha256": audio_sha})
+            return
+        if module == "voicecut.transcribe_mlx":
+            write_json(
+                Path(command[command.index("--output") + 1]),
+                {
+                    "audio_sha256": audio_sha,
+                    "engine": "mlx_whisper",
+                    "atoms": [
+                        {
+                            "atom_index": 0,
+                            "start": 0.0,
+                            "end": 1.0,
+                            "text": "usable words",
+                            "words": [
+                                {
+                                    "word": "usable",
+                                    "start": 0.1,
+                                    "end": 0.4,
+                                },
+                                {
+                                    "word": "words",
+                                    "start": 0.5,
+                                    "end": 0.8,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+            return
+        if module == "voicecut.ctc_enrich":
+            raise subprocess.CalledProcessError(
+                71,
+                command,
+                stderr="RuntimeError: optional CTC runtime unavailable\n",
+            )
+        if module == "voicecut.streaming_narration":
+            transcript_path = Path(command[command.index("--transcript") + 1])
+            transcript = read_json(transcript_path)
+            report = read_json(transcript_path.parent / "ctc_enrichment_report.json")
+            assert transcript["engine"] == ("whisper_primary_ctc_degraded_passthrough")
+            assert report["status"] == "degraded_whisper_primary_passthrough"
+            assert transcript["atoms"][0]["words"][1]["word"] == "words"
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            write_json(
+                output_dir / "streaming_plan.json",
+                {
+                    "status": "complete",
+                    "backend": "gemini",
+                    "model": "gemini-3.6-flash",
+                    "transcript": str(transcript_path.resolve()),
+                    "transcript_sha256": sha256_file(transcript_path),
+                    "fallbacks": [
+                        {
+                            "iteration": 3,
+                            "status": "source_passthrough",
+                            "source_ranges": [{"start_word_id": 0, "end_word_id": 2}],
+                            "rejected_model_output_accepted": False,
+                        }
+                    ],
+                },
+            )
+            return
+        if module == "voicecut.final_render":
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            output_dir.mkdir(parents=True)
+            final_cut = output_dir / "final_cut.wav"
+            final_cut.write_bytes(b"rendered degraded audio")
+            boundary_plan = output_dir / "final_boundary_plan.json"
+            write_json(boundary_plan, {"status": "safe"})
+            plan = Path(command[command.index("--plan") + 1])
+            write_json(
+                output_dir / "final_render_manifest.json",
+                {
+                    "status": "complete",
+                    "renderer": "authoritative_single_pass_final_render_v3",
+                    "alignment_backend": "mfa",
+                    "mfa_version": "3.4.1",
+                    "mfa_model": "english_us_arpa",
+                    "mfa_fine_tune": True,
+                    "pause_policy": "semantic",
+                    "breath_cleanup_mode": "replace",
+                    "breath_threshold": 0.5,
+                    "breath_min_duration_ms": 80,
+                    "respiro_upstream_commit": (
+                        "70e01c60c2f582c41092730680f2894ab24d6467"
+                    ),
+                    "respiro_checkpoint_sha256": (
+                        "1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
+                    ),
+                    "source_audio_sha256": audio_sha,
+                    "streaming_plan": str(plan.resolve()),
+                    "streaming_plan_sha256": sha256_file(plan),
+                    "effective_streaming_plan": str(plan.resolve()),
+                    "effective_streaming_plan_sha256": sha256_file(plan),
+                    "pause_planner_backend": "gemini",
+                    "pause_planner_model": "gemini-3.6-flash",
+                    "delivery_status": "complete_with_preserved_source_context",
+                    "semantic_planner_request_failure_count": 1,
+                    "semantic_planner_fallback_count": 1,
+                    "pause_degraded_batch_count": 1,
+                    "final_cut_wav": str(final_cut.resolve()),
+                    "final_cut_wav_sha256": sha256_file(final_cut),
+                    "final_boundary_plan": str(boundary_plan.resolve()),
+                    "final_boundary_plan_sha256": sha256_file(boundary_plan),
+                    "duration_seconds": 1.0,
+                },
+            )
+            return
+        raise AssertionError(command)
+
+    def fake_audio_publisher(
+        final_wav: Path,
+        output_path: Path,
+        *,
+        manifest_path: Path,
+        overwrite: bool,
+    ) -> dict[str, object]:
+        assert final_wav.read_bytes() == b"rendered degraded audio"
+        assert overwrite is False
+        output_path.write_bytes(b"published degraded audio")
+        write_json(manifest_path, {"status": "complete"})
+        return {"status": "complete", "output_audio": str(output_path)}
+
+    result = run_full_pipeline(
+        args,
+        runner=fake_runner,
+        media_preparer=fake_media_preparer,
+        audio_publisher=fake_audio_publisher,
+        planner_preflight=_fake_gemini_preflight,
+    )
+
+    assert Path(result["output"]).read_bytes() == b"published degraded audio"
+    assert result["ctc_enrichment_status"] == ("degraded_whisper_primary_passthrough")
+    assert result["stages"]["hidden_retry_recovery"] == "created_degraded"
+    assert result["delivery_status"] == "complete_with_preserved_source_context"
+    assert result["semantic_fallback_windows"] == 1
+    assert result["pause_fallback_batches"] == 1
+    assert result["pipeline_warnings"] == [
+        {
+            "stage": "hidden_retry_recovery",
+            "status": "degraded_whisper_primary_passthrough",
+            "message": (
+                "Optional CTC retry evidence was unavailable for part or all "
+                "of the recording; VoiceCut continued with the primary "
+                "Whisper occurrences."
+            ),
+            "report": str(
+                (
+                    args.work_dir / "03_ctc_enrichment/ctc_enrichment_report.json"
+                ).resolve()
+            ),
+        },
+        {
+            "stage": "semantic_plan",
+            "status": "source_passthrough_used",
+            "message": (
+                "The planner exhausted its bounded retries in 1 window(s); "
+                "exact source audio was preserved locally."
+            ),
+        },
+        {
+            "stage": "semantic_pause_plan",
+            "status": "deterministic_pause_fallback",
+            "message": (
+                "Pause classification used deterministic rules for 1 failed "
+                "planner batch(es)."
+            ),
+        },
+    ]
 
 
 def test_public_parser_can_enable_renderer_debug_artifacts(tmp_path: Path) -> None:
@@ -441,15 +739,7 @@ def test_full_pipeline_routes_video_input_to_video_publication(
             )
         elif module == "voicecut.ctc_enrich":
             output_dir = Path(command[command.index("--output-dir") + 1])
-            write_json(
-                output_dir / "source_transcript_ctc_enriched.json",
-                {
-                    "audio_sha256": audio_sha,
-                    "source_decode_strategy": (
-                        "whisper_primary_plus_gated_raw_ctc_insertions_v2"
-                    ),
-                },
-            )
+            _write_fake_ctc_enrichment(output_dir, audio_sha256=audio_sha)
         elif module == "voicecut.streaming_narration":
             output_dir = Path(command[command.index("--output-dir") + 1])
             transcript = Path(command[command.index("--transcript") + 1])

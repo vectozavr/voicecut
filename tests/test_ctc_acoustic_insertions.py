@@ -538,6 +538,208 @@ class AcousticRetryOutputIntegrationTests(unittest.TestCase):
                 ):
                     align_ctc.main()
 
+    def test_one_crop_decode_failure_is_checkpointed_and_later_crops_continue(
+        self,
+    ) -> None:
+        requested = {
+            "segments": [
+                {
+                    "phrase_index": 10,
+                    "start": 1.0,
+                    "end": 2.0,
+                    "text": "first phrase",
+                },
+                {
+                    "phrase_index": 20,
+                    "start": 3.0,
+                    "end": 4.0,
+                    "text": "broken phrase",
+                },
+                {
+                    "phrase_index": 30,
+                    "start": 5.0,
+                    "end": 6.0,
+                    "text": "last phrase",
+                },
+            ],
+            "skipped_segments": [
+                {
+                    "phrase_index": 40,
+                    "input_start": 7.0,
+                    "input_end": 7.3,
+                    "reason": "no_lexical_content",
+                }
+            ],
+        }
+        first_words = [greedy_word("first", 1.1, 1.4)]
+        last_words = [greedy_word("last", 5.1, 5.4)]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            input_path = directory / "ctc_input.json"
+            output_path = directory / "ctc_output.json"
+            partial_path = directory / "ctc_output.json.partial"
+            audio_path = directory / "source.wav"
+            input_path.write_text(json.dumps(requested), encoding="utf-8")
+            audio_path.write_bytes(b"stable audio")
+            with (
+                mock.patch.object(
+                    align_ctc.librosa,
+                    "load",
+                    return_value=(np.zeros(16_000 * 8, dtype=np.float32), 16_000),
+                ),
+                mock.patch.object(
+                    align_ctc.whisperx,
+                    "load_align_model",
+                    return_value=(object(), {}),
+                ),
+                mock.patch.object(
+                    align_ctc,
+                    "decode_greedy_ctc_segment",
+                    side_effect=[
+                        first_words,
+                        RuntimeError("crop decoder failed"),
+                        last_words,
+                    ],
+                ) as raw_decode,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "align_ctc.py",
+                        "--audio",
+                        str(audio_path),
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--resume",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                align_ctc.main()
+
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw_decode.call_count, 3)
+        self.assertFalse(partial_path.exists())
+        self.assertEqual(
+            [segment["phrase_index"] for segment in output["segments"]],
+            [10, 20, 30],
+        )
+        failed = output["segments"][1]
+        self.assertEqual(failed["status"], "decode_failed")
+        self.assertEqual(failed["decode_error"]["type"], "RuntimeError")
+        self.assertEqual(failed["decode_error"]["message"], "crop decoder failed")
+        self.assertEqual(failed["greedy_ctc_words"], [])
+        self.assertEqual(
+            output["skipped_segments"],
+            requested["skipped_segments"],
+        )
+
+    def test_resume_accepts_a_checkpointed_decode_failure(self) -> None:
+        requested = {
+            "segments": [
+                {
+                    "phrase_index": 1,
+                    "start": 1.0,
+                    "end": 2.0,
+                    "text": "failed before",
+                },
+                {
+                    "phrase_index": 2,
+                    "start": 3.0,
+                    "end": 4.0,
+                    "text": "works now",
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            input_path = directory / "ctc_input.json"
+            output_path = directory / "ctc_output.json"
+            partial_path = directory / "ctc_output.json.partial"
+            audio_path = directory / "source.wav"
+            input_path.write_text(json.dumps(requested), encoding="utf-8")
+            audio_path.write_bytes(b"stable audio")
+            identity = align_ctc._checkpoint_identity(
+                audio_path=audio_path,
+                input_path=input_path,
+                language="en",
+                device="cpu",
+            )
+            partial_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": align_ctc.OUTPUT_SCHEMA_VERSION,
+                        "mode": align_ctc.OUTPUT_MODE,
+                        "complete": False,
+                        **identity,
+                        "segments": [
+                            {
+                                "phrase_index": 1,
+                                "input_start": 1.0,
+                                "input_end": 2.0,
+                                "input_text": "failed before",
+                                "greedy_ctc_words": [],
+                                "acoustic_insertions": [],
+                                "acoustic_expected_substitutions": [],
+                                "status": "decode_failed",
+                                "decode_error": {
+                                    "type": "RuntimeError",
+                                    "message": "old crop failure",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    align_ctc.librosa,
+                    "load",
+                    return_value=(np.zeros(16_000 * 5, dtype=np.float32), 16_000),
+                ),
+                mock.patch.object(
+                    align_ctc.whisperx,
+                    "load_align_model",
+                    return_value=(object(), {}),
+                ),
+                mock.patch.object(
+                    align_ctc,
+                    "decode_greedy_ctc_segment",
+                    return_value=[greedy_word("works", 3.1, 3.5)],
+                ) as raw_decode,
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "align_ctc.py",
+                        "--audio",
+                        str(audio_path),
+                        "--input",
+                        str(input_path),
+                        "--output",
+                        str(output_path),
+                        "--resume",
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                align_ctc.main()
+
+            output = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(raw_decode.call_count, 1)
+        self.assertEqual(output["segments"][0]["status"], "decode_failed")
+        self.assertEqual(
+            output["segments"][0]["decode_error"]["message"],
+            "old crop failure",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

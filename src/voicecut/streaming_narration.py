@@ -1170,6 +1170,250 @@ def _request_validated_decision(
     )
 
 
+def _exact_source_passthrough_thought(
+    words: Sequence[TranscriptWord],
+) -> FinalizedThought:
+    """Create a contiguous thought whose text is copied exactly from source.
+
+    This deliberately does not parse any model output.  Its grounding ledger
+    is constructed from the source-token ledger itself, so malformed or
+    unsupported model text can never leak into a delivery fallback.
+    """
+
+    if not words:
+        raise StreamingPlanError("source passthrough requires at least one word")
+    for left, right in zip(words, words[1:], strict=False):
+        if right.id != left.id + 1:
+            raise StreamingPlanError(
+                "source passthrough words must form one contiguous interval"
+            )
+
+    canonical_text = _word_text(words)
+    source_tokens, source_owners = _source_token_ledger(words)
+    token_support = tuple(
+        {
+            "canonical_token_index": token_index,
+            "canonical_token": token,
+            "source_token_indices": [token_index],
+            "source_word_ids": [source_owners[token_index]],
+            "source_tokens": [token],
+            "similarity": 1.0,
+        }
+        for token_index, token in enumerate(source_tokens)
+    )
+    source_range = SourceRange(
+        start_word_id=words[0].id,
+        end_word_id=words[-1].id + 1,
+        first_word_id=words[0].id,
+        last_word_id=words[-1].id,
+        first_word=words[0].text,
+        last_word=words[-1].text,
+        canonical_text=canonical_text,
+        canonical_token_count=len(source_tokens),
+        supported_token_count=len(source_tokens),
+        token_support=token_support,
+    )
+    return FinalizedThought(
+        canonical_text=canonical_text,
+        source_ranges=(source_range,),
+        grounding_validation={
+            "thought_index": 0,
+            "canonical_tokens": len(source_tokens),
+            "supported_tokens": len(source_tokens),
+            "unsupported_tokens": [],
+            "status": "valid",
+            "grounding_mode": "deterministic_exact_source_passthrough",
+            "source_ranges": [
+                {
+                    "range_index": 0,
+                    "first_word_id": words[0].id,
+                    "last_word_id": words[-1].id,
+                    "start_word_id": words[0].id,
+                    "end_word_id": words[-1].id + 1,
+                    "first_word": words[0].text,
+                    "last_word": words[-1].text,
+                    "canonical_text": canonical_text,
+                    "canonical_tokens": len(source_tokens),
+                    "supported_tokens": len(source_tokens),
+                    "source_tokens": len(source_tokens),
+                    "represented_source_tokens": len(source_tokens),
+                    "unrepresented_source_tokens": [],
+                    "unsupported_tokens": [],
+                    "status": "valid",
+                    "grounding_mode": "deterministic_exact_source_passthrough",
+                }
+            ],
+        },
+    )
+
+
+def _source_passthrough_decision(
+    *,
+    pending_words: Sequence[TranscriptWord],
+    final_pass: bool,
+    lookahead_start_word_id: int | None,
+    window_seconds: float,
+    iteration: int,
+    attempts: Sequence[dict[str, Any]],
+    trigger: str,
+    reason: str,
+    grounding_failure: dict[str, Any] | None,
+) -> tuple[PlannerDecision, list[dict[str, Any]], dict[str, Any]]:
+    """Preserve exact source while retaining one new look-ahead window."""
+
+    if not pending_words:
+        raise StreamingPlanError("source passthrough has no pending words")
+
+    if final_pass:
+        passthrough_words = list(pending_words)
+        pending_start_word_id = None
+        status = "eof_source_passthrough"
+        pending_reason = (
+            "The planner did not safely resolve the EOF input; every remaining "
+            "source word was preserved exactly."
+        )
+    else:
+        if lookahead_start_word_id is None:
+            raise StreamingPlanError(
+                "incremental source passthrough requires a look-ahead boundary"
+            )
+        older_words = [
+            word for word in pending_words if word.id < lookahead_start_word_id
+        ]
+        # Commit at most one ordinary window.  The complete newly read window
+        # remains pending so a later request can still resolve its final thought.
+        prefix_end = (
+            _take_new_words(older_words, 0, window_seconds=window_seconds)
+            if older_words
+            else 0
+        )
+        passthrough_words = older_words[:prefix_end]
+        pending_start_word_id = (
+            passthrough_words[-1].id + 1 if passthrough_words else pending_words[0].id
+        )
+        status = (
+            "source_passthrough"
+            if passthrough_words
+            else "source_passthrough_deferred_for_lookahead"
+        )
+        if trigger == "request_failure":
+            pending_reason = (
+                "The planner exhausted both attempts. A bounded older prefix was "
+                "preserved exactly while the newest look-ahead window remains pending."
+                if passthrough_words
+                else (
+                    "The planner exhausted both attempts in the first visible "
+                    "window; the complete window remains pending for additional "
+                    "look-ahead."
+                )
+            )
+        else:
+            pending_reason = (
+                "The planner repeatedly made no chronological progress. A bounded "
+                "older prefix was preserved exactly while the newest look-ahead "
+                "window remains pending."
+            )
+
+    finalized = (
+        (_exact_source_passthrough_thought(passthrough_words),)
+        if passthrough_words
+        else ()
+    )
+    decision = PlannerDecision(
+        finalized=finalized,
+        pending_start_word_id=pending_start_word_id,
+        pending_reason=pending_reason,
+    )
+    selected_ranges = (
+        [
+            {
+                "start_word_id": passthrough_words[0].id,
+                "end_word_id": passthrough_words[-1].id + 1,
+            }
+        ]
+        if passthrough_words
+        else []
+    )
+    remaining_words = (
+        []
+        if pending_start_word_id is None
+        else [word for word in pending_words if word.id >= pending_start_word_id]
+    )
+    fallback = {
+        "iteration": iteration,
+        "status": status,
+        "trigger": trigger,
+        "reason": reason,
+        "final_pass": final_pass,
+        "source_ranges": selected_ranges,
+        "passthrough_word_ids": [word.id for word in passthrough_words],
+        "remaining_pending_range": (
+            {
+                "start_word_id": remaining_words[0].id,
+                "end_word_id": remaining_words[-1].id + 1,
+            }
+            if remaining_words
+            else None
+        ),
+        "grounding_mode": "deterministic_exact_source_passthrough",
+        "rejected_model_output_accepted": False,
+        "grounding_failure": grounding_failure,
+    }
+    return decision, list(attempts), fallback
+
+
+def _passthrough_after_request_failure(
+    *,
+    pending_words: Sequence[TranscriptWord],
+    final_pass: bool,
+    lookahead_start_word_id: int | None,
+    window_seconds: float,
+    iteration: int,
+    output_dir: Path,
+) -> tuple[PlannerDecision, list[dict[str, Any]], dict[str, Any]]:
+    """Fail soft after two invalid or failed backend attempts."""
+
+    failure_path = output_dir / f"iteration_{iteration:04d}_failure.json"
+    failure = read_json(failure_path)
+    if not isinstance(failure, dict):
+        raise StreamingPlanError(
+            f"planner failure ledger is invalid for iteration {iteration}"
+        )
+    attempts = failure.get("attempts")
+    if not isinstance(attempts, list) or len(attempts) != 2:
+        raise StreamingPlanError(
+            f"planner failure ledger has no two-attempt record for iteration {iteration}"
+        )
+    grounding_failure = failure.get("grounding_failure")
+    return _source_passthrough_decision(
+        pending_words=pending_words,
+        final_pass=final_pass,
+        lookahead_start_word_id=lookahead_start_word_id,
+        window_seconds=window_seconds,
+        iteration=iteration,
+        attempts=attempts,
+        trigger="request_failure",
+        reason=str(failure.get("validation_error", "planner request failed")),
+        grounding_failure=(
+            grounding_failure if isinstance(grounding_failure, dict) else None
+        ),
+    )
+
+
+def _incremental_decision_makes_progress(
+    decision: PlannerDecision,
+    *,
+    pending_words: Sequence[TranscriptWord],
+) -> bool:
+    """Return whether a valid decision consumed any visible source prefix."""
+
+    if not pending_words or decision.pending_start_word_id is None:
+        raise StreamingPlanError("incremental progress check requires pending source")
+    return bool(decision.finalized) or (
+        decision.pending_start_word_id > pending_words[0].id
+    )
+
+
 def _words_from_complete_plan(plan: dict[str, Any]) -> list[TranscriptWord]:
     raw_words = plan.get("words")
     if not isinstance(raw_words, list) or not raw_words:
@@ -1918,6 +2162,18 @@ def _flatten_ranges(
     ]
 
 
+def _fallback_status(fallbacks: Sequence[dict[str, Any]]) -> str:
+    if any(
+        isinstance(fallback.get("source_ranges"), list)
+        and bool(fallback["source_ranges"])
+        for fallback in fallbacks
+    ):
+        return "source_passthrough_used"
+    if fallbacks:
+        return "planner_failure_recovered_without_source_passthrough"
+    return "not_used"
+
+
 def _grounding_validation_document(
     *,
     committed_thoughts: Sequence[dict[str, Any]],
@@ -1970,6 +2226,11 @@ def _grounding_validation_document(
     retries = sum(
         max(0, len(iteration.get("attempts", [])) - 1) for iteration in iterations
     )
+    fallbacks = [
+        json.loads(json.dumps(fallback))
+        for iteration in iterations
+        if isinstance((fallback := iteration.get("fallback")), dict)
+    ]
     return {
         "schema_version": 1,
         "validator": "strict_bidirectional_range_source_grounding_v2",
@@ -1988,6 +2249,14 @@ def _grounding_validation_document(
         "unsupported_tokens": unsupported,
         "unrepresented_source_tokens": unrepresented_source,
         "planner_retries": retries,
+        "fallback_status": _fallback_status(fallbacks),
+        "fallback_count": len(fallbacks),
+        "source_passthrough_count": sum(
+            isinstance(fallback.get("source_ranges"), list)
+            and bool(fallback["source_ranges"])
+            for fallback in fallbacks
+        ),
+        "fallbacks": fallbacks,
         "plan_accepted": (
             status == "complete"
             and not unsupported
@@ -2025,6 +2294,10 @@ def _print_iteration(debug: dict[str, Any], *, backend_name: str) -> None:
     label = "Gemini raw JSON" if backend_name == "gemini" else "Planner raw JSON"
     print(label)
     print(debug["raw_response"])
+    fallback = debug.get("fallback")
+    if isinstance(fallback, dict):
+        print("deterministic source fallback")
+        print(json.dumps(fallback, ensure_ascii=False, indent=2))
 
 
 def run_streaming_planner(
@@ -2060,6 +2333,8 @@ def run_streaming_planner(
     next_unread_word = 0
     committed_source_end = 0
     iterations: list[dict[str, Any]] = []
+    fallback_records: list[dict[str, Any]] = []
+    pending_no_progress_age = 0
     iteration = 0
 
     def current_plan(status: str) -> dict[str, Any]:
@@ -2088,6 +2363,14 @@ def run_streaming_planner(
             "reconstructed_narration": " ".join(
                 str(thought["canonical_text"]) for thought in committed_thoughts
             ).strip(),
+            "fallback_status": _fallback_status(fallback_records),
+            "fallback_event_count": len(fallback_records),
+            "source_passthrough_count": sum(
+                isinstance(fallback.get("source_ranges"), list)
+                and bool(fallback["source_ranges"])
+                for fallback in fallback_records
+            ),
+            "fallbacks": fallback_records,
             "iterations": iterations,
         }
 
@@ -2110,15 +2393,60 @@ def run_streaming_planner(
                 final_pass=False,
             )
             committed_before = _fingerprint(committed_thoughts)
-            decision, attempts = _request_validated_decision(
-                backend=backend,
-                prompt=prompt,
+            fallback: dict[str, Any] | None = None
+            request_failed = False
+            try:
+                decision, attempts = _request_validated_decision(
+                    backend=backend,
+                    prompt=prompt,
+                    pending_words=complete_pending_input,
+                    final_pass=False,
+                    committed_source_end=committed_source_end,
+                    iteration=iteration,
+                    output_dir=output_dir,
+                )
+            except StreamingPlanError:
+                request_failed = True
+                decision, attempts, fallback = _passthrough_after_request_failure(
+                    pending_words=complete_pending_input,
+                    final_pass=False,
+                    lookahead_start_word_id=new_words[0].id,
+                    window_seconds=window_seconds,
+                    iteration=iteration,
+                    output_dir=output_dir,
+                )
+                fallback_records.append(fallback)
+            if request_failed:
+                # The newest look-ahead has already been exposed once. Keep
+                # that age so another stalled iteration commits an old window
+                # instead of allowing pending input to grow indefinitely.
+                pending_no_progress_age = 1
+            elif _incremental_decision_makes_progress(
+                decision,
                 pending_words=complete_pending_input,
-                final_pass=False,
-                committed_source_end=committed_source_end,
-                iteration=iteration,
-                output_dir=output_dir,
-            )
+            ):
+                pending_no_progress_age = 0
+            else:
+                pending_no_progress_age += 1
+                if pending_no_progress_age >= 2:
+                    decision, attempts, fallback = _source_passthrough_decision(
+                        pending_words=complete_pending_input,
+                        final_pass=False,
+                        lookahead_start_word_id=new_words[0].id,
+                        window_seconds=window_seconds,
+                        iteration=iteration,
+                        attempts=attempts,
+                        trigger="valid_no_progress",
+                        reason=(
+                            "The planner returned a valid decision without "
+                            "consuming source input in two consecutive windows."
+                        ),
+                        grounding_failure=None,
+                    )
+                    fallback_records.append(fallback)
+                    # The retained look-ahead was visible in this iteration,
+                    # preserving the one-thought delay while bounding growth.
+                    pending_no_progress_age = 1
             if _fingerprint(committed_thoughts) != committed_before:
                 raise StreamingPlanError(
                     "committed source ranges changed during model request"
@@ -2170,6 +2498,8 @@ def run_streaming_planner(
                 "pending_reason": decision.pending_reason,
                 "raw_response": attempts[-1]["raw_response"],
                 "attempts": attempts,
+                "fallback": fallback,
+                "pending_no_progress_age": pending_no_progress_age,
                 "prompt": prompt,
                 "state": {
                     "committed_words": [word.id for word in committed_words],
@@ -2206,15 +2536,45 @@ def run_streaming_planner(
             final_pass=True,
         )
         committed_before = _fingerprint(committed_thoughts)
-        decision, attempts = _request_validated_decision(
-            backend=backend,
-            prompt=prompt,
-            pending_words=final_pending_input,
-            final_pass=True,
-            committed_source_end=committed_source_end,
-            iteration=iteration,
-            output_dir=output_dir,
-        )
+        fallback = None
+        request_failed = False
+        try:
+            decision, attempts = _request_validated_decision(
+                backend=backend,
+                prompt=prompt,
+                pending_words=final_pending_input,
+                final_pass=True,
+                committed_source_end=committed_source_end,
+                iteration=iteration,
+                output_dir=output_dir,
+            )
+        except StreamingPlanError:
+            request_failed = True
+            decision, attempts, fallback = _passthrough_after_request_failure(
+                pending_words=final_pending_input,
+                final_pass=True,
+                lookahead_start_word_id=None,
+                window_seconds=window_seconds,
+                iteration=iteration,
+                output_dir=output_dir,
+            )
+            fallback_records.append(fallback)
+        if not request_failed and not decision.finalized:
+            decision, attempts, fallback = _source_passthrough_decision(
+                pending_words=final_pending_input,
+                final_pass=True,
+                lookahead_start_word_id=None,
+                window_seconds=window_seconds,
+                iteration=iteration,
+                attempts=attempts,
+                trigger="valid_eof_no_progress",
+                reason=(
+                    "The planner returned a valid EOF response without finalizing "
+                    "any remaining source words."
+                ),
+                grounding_failure=None,
+            )
+            fallback_records.append(fallback)
         if _fingerprint(committed_thoughts) != committed_before:
             raise StreamingPlanError(
                 "committed source ranges changed during final model request"
@@ -2259,6 +2619,8 @@ def run_streaming_planner(
             "pending_reason": decision.pending_reason,
             "raw_response": attempts[-1]["raw_response"],
             "attempts": attempts,
+            "fallback": fallback,
+            "pending_no_progress_age": 0,
             "prompt": prompt,
             "state": {
                 "committed_words": [word.id for word in committed_words],

@@ -32,7 +32,11 @@ from .breath_detection import (
     RESPIRO_UPSTREAM_COMMIT,
 )
 from .common import read_json, sha256_file, write_json
-from .ctc_enrich import SOURCE_DECODE_STRATEGY
+from .ctc_enrich import (
+    PASSTHROUGH_STATUS,
+    SOURCE_DECODE_STRATEGY,
+    write_passthrough_enrichment,
+)
 from .media import (
     AUDIO_OUTPUT_EXTENSIONS,
     MediaError,
@@ -68,7 +72,7 @@ MFA_MODEL = MFA_MODEL_ID
 MFA_FINE_TUNE = True
 DEFAULT_MFA_MICROMAMBA = Path("micromamba")
 DEFAULT_MFA_NUM_JOBS = max(1, min(os.cpu_count() or 1, 4))
-PIPELINE_SCHEMA_VERSION = 7
+PIPELINE_SCHEMA_VERSION = 8
 
 
 def _preferred_python(relative_path: str) -> Path:
@@ -138,7 +142,14 @@ class _WorkDirectoryLock:
 def _read_object(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
-    value = read_json(path)
+    try:
+        value = read_json(path)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        # Stage outputs are cache artifacts.  A killed process can leave its
+        # final JSON truncated while its independently validated ``.partial``
+        # checkpoint is still resumable.  Treat only the final artifact as
+        # stale; the owning stage decides which checkpoints to preserve.
+        return None
     return value if isinstance(value, dict) else None
 
 
@@ -171,12 +182,28 @@ def _media_is_current(
     )
 
 
-def _enriched_transcript_is_current(path: Path, audio_sha256: str) -> bool:
-    value = _read_object(path)
+def _enrichment_artifacts_are_current(
+    transcript_path: Path,
+    report_path: Path,
+    audio_sha256: str,
+) -> bool:
+    value = _read_object(transcript_path)
+    report = _read_object(report_path)
+    evidence = value.get("ctc_enrichment") if value is not None else None
+    supported_statuses = {
+        "complete",
+        "complete_with_degraded_evidence",
+        PASSTHROUGH_STATUS,
+    }
     return (
         value is not None
         and value.get("audio_sha256") == audio_sha256
         and value.get("source_decode_strategy") == SOURCE_DECODE_STRATEGY
+        and isinstance(evidence, dict)
+        and report is not None
+        and report == evidence
+        and report.get("schema_version") == 1
+        and report.get("status") in supported_statuses
     )
 
 
@@ -762,6 +789,7 @@ def run_full_pipeline(
         configuration=configuration,
     )
     stages: dict[str, str] = {}
+    pipeline_warnings: list[dict[str, Any]] = []
 
     media_dir = work_dir / "00_media"
     media_manifest_path = media_dir / "media_input.json"
@@ -828,8 +856,13 @@ def run_full_pipeline(
     if _audio_artifact_is_current(transcript_path, audio_sha256):
         stages["transcription"] = "cached"
     else:
-        _reset_stage(transcript_dir, work_dir=work_dir)
+        # ``transcribe_mlx`` checkpoints every completed atom beside the final
+        # transcript.  Keep that checkpoint when a long run is resumed: the
+        # worker validates its input identity before trusting it.  Deleting the
+        # whole directory here made ``--resume`` ineffective after an
+        # interruption and forced hour-long recordings back to atom zero.
         transcript_dir.mkdir(parents=True, exist_ok=True)
+        transcript_path.unlink(missing_ok=True)
         _run(
             "02 WHISPER TRANSCRIPTION",
             [
@@ -863,30 +896,98 @@ def run_full_pipeline(
 
     enrichment_dir = work_dir / "03_ctc_enrichment"
     enriched_path = enrichment_dir / "source_transcript_ctc_enriched.json"
-    if _enriched_transcript_is_current(enriched_path, audio_sha256):
-        stages["hidden_retry_recovery"] = "cached"
-    else:
-        _reset_stage(enrichment_dir, work_dir=work_dir)
-        _run(
-            "03 ACOUSTIC HIDDEN-RETRY RECOVERY",
-            [
-                sys.executable,
-                "-m",
-                "voicecut.ctc_enrich",
-                "--audio",
-                str(audio),
-                "--transcript",
-                str(transcript_path),
-                "--output-dir",
-                str(enrichment_dir),
-            ],
-            runner=runner,
+    enrichment_report_path = enrichment_dir / "ctc_enrichment_report.json"
+    if _enrichment_artifacts_are_current(
+        enriched_path,
+        enrichment_report_path,
+        audio_sha256,
+    ):
+        enrichment_report = _read_object(enrichment_report_path)
+        assert enrichment_report is not None
+        enrichment_status = str(enrichment_report["status"])
+        stages["hidden_retry_recovery"] = (
+            "cached_degraded"
+            if enrichment_status
+            in {PASSTHROUGH_STATUS, "complete_with_degraded_evidence"}
+            else "cached"
         )
-        if not _enriched_transcript_is_current(enriched_path, audio_sha256):
-            raise FullPipelineError(
-                "CTC recovery did not produce a current enriched transcript"
+    else:
+        # CTC is optional evidence, and its worker has a validated resumable
+        # per-atom checkpoint.  Preserve that checkpoint across reruns.  If
+        # the optional subprocess itself crashes, publish an explicitly
+        # degraded Whisper-primary transcript instead of discarding an
+        # otherwise usable long recording.
+        enrichment_dir.mkdir(parents=True, exist_ok=True)
+        enriched_path.unlink(missing_ok=True)
+        enrichment_report_path.unlink(missing_ok=True)
+        try:
+            _run(
+                "03 ACOUSTIC HIDDEN-RETRY RECOVERY",
+                [
+                    sys.executable,
+                    "-m",
+                    "voicecut.ctc_enrich",
+                    "--audio",
+                    str(audio),
+                    "--transcript",
+                    str(transcript_path),
+                    "--output-dir",
+                    str(enrichment_dir),
+                    "--resume",
+                ],
+                runner=runner,
             )
-        stages["hidden_retry_recovery"] = "created"
+        except FullPipelineError as error:
+            try:
+                write_passthrough_enrichment(
+                    audio_path=audio,
+                    transcript_path=transcript_path,
+                    output_dir=enrichment_dir,
+                    reason=str(error),
+                )
+            except (OSError, RuntimeError, ValueError) as fallback_error:
+                raise FullPipelineError(
+                    "primary Whisper transcript is structurally invalid; "
+                    f"CTC passthrough was refused: {fallback_error}"
+                ) from None
+        if not _enrichment_artifacts_are_current(
+            enriched_path,
+            enrichment_report_path,
+            audio_sha256,
+        ):
+            raise FullPipelineError(
+                "CTC recovery did not produce a current enriched transcript "
+                "and matching enrichment report"
+            )
+        enrichment_report = _read_object(enrichment_report_path)
+        assert enrichment_report is not None
+        enrichment_status = str(enrichment_report["status"])
+        if enrichment_status in {
+            PASSTHROUGH_STATUS,
+            "complete_with_degraded_evidence",
+        }:
+            stages["hidden_retry_recovery"] = "created_degraded"
+        elif int(enrichment_report.get("atoms_skipped_no_lexical_content", 0)):
+            stages["hidden_retry_recovery"] = "created_with_skipped_atoms"
+        else:
+            stages["hidden_retry_recovery"] = "created"
+
+    if enrichment_status in {
+        PASSTHROUGH_STATUS,
+        "complete_with_degraded_evidence",
+    }:
+        warning = {
+            "stage": "hidden_retry_recovery",
+            "status": enrichment_status,
+            "message": (
+                "Optional CTC retry evidence was unavailable for part or all "
+                "of the recording; VoiceCut continued with the primary "
+                "Whisper occurrences."
+            ),
+            "report": str(enrichment_report_path.resolve()),
+        }
+        pipeline_warnings.append(warning)
+        print(f"warning: {warning['message']}", file=sys.stderr, flush=True)
 
     planner_arguments = _planner_cli_arguments(
         args=args,
@@ -1017,6 +1118,33 @@ def run_full_pipeline(
     final_manifest = _read_object(final_manifest_path)
     if final_manifest is None:
         raise FullPipelineError("final render manifest is missing")
+    semantic_fallback_count = int(
+        final_manifest.get("semantic_planner_fallback_count", 0)
+    )
+    pause_fallback_count = int(final_manifest.get("pause_degraded_batch_count", 0))
+    if semantic_fallback_count:
+        pipeline_warnings.append(
+            {
+                "stage": "semantic_plan",
+                "status": "source_passthrough_used",
+                "message": (
+                    "The planner exhausted its bounded retries in "
+                    f"{semantic_fallback_count} window(s); exact source audio "
+                    "was preserved locally."
+                ),
+            }
+        )
+    if pause_fallback_count:
+        pipeline_warnings.append(
+            {
+                "stage": "semantic_pause_plan",
+                "status": "deterministic_pause_fallback",
+                "message": (
+                    "Pause classification used deterministic rules for "
+                    f"{pause_fallback_count} failed planner batch(es)."
+                ),
+            }
+        )
     final_wav_value = final_manifest.get("final_cut_wav")
     if not isinstance(final_wav_value, str):
         raise FullPipelineError("final render manifest has no WAV output")
@@ -1090,17 +1218,25 @@ def run_full_pipeline(
         "analysis": str(analysis_path),
         "transcript": str(transcript_path),
         "enriched_transcript": str(enriched_path),
+        "ctc_enrichment_report": str(enrichment_report_path),
+        "ctc_enrichment_status": enrichment_status,
         "streaming_plan": str(plan_path),
         "render_manifest": str(final_manifest_path),
         "publication_manifest": str(publication_path),
         "final_cut_wav": str(final_wav),
         "duration_seconds": final_manifest["duration_seconds"],
         "delivery_status": final_manifest.get("delivery_status", "complete"),
-        "preserved_problem_intervals": len(
-            (final_manifest.get("delivery_fallback") or {}).get(
-                "preserved_intervals", []
+        "preserved_problem_intervals": (
+            len(
+                (final_manifest.get("delivery_fallback") or {}).get(
+                    "preserved_intervals", []
+                )
             )
+            + semantic_fallback_count
         ),
+        "semantic_fallback_windows": semantic_fallback_count,
+        "pause_fallback_batches": pause_fallback_count,
+        "pipeline_warnings": pipeline_warnings,
     }
     write_json(work_dir / "pipeline_run.json", result)
     work_lock.close()
@@ -1272,10 +1408,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(f"output: {result['output']}")
     print(f"duration: {result['duration_seconds']:.3f} s")
     print(f"delivery status: {result['delivery_status']}")
-    if result["preserved_problem_intervals"]:
+    acoustic_preserved = (
+        result["preserved_problem_intervals"] - result["semantic_fallback_windows"]
+    )
+    if acoustic_preserved:
         print(
             "warning: preserved original source context at "
-            f"{result['preserved_problem_intervals']} unresolved cut(s)"
+            f"{acoustic_preserved} unresolved cut(s)"
+        )
+    if result["semantic_fallback_windows"]:
+        print(
+            "warning: preserved exact source text in "
+            f"{result['semantic_fallback_windows']} failed planner window(s)"
+        )
+    if result["pause_fallback_batches"]:
+        print(
+            "warning: used deterministic pause classification for "
+            f"{result['pause_fallback_batches']} failed planner batch(es)"
         )
     print(f"planner: {result['planner_backend']} / {result['planner_model']}")
     print(f"cache: {result['work_dir']}")

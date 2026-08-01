@@ -4852,6 +4852,38 @@ def build_final_boundary_plan(
         int(output_segments[-1]["output_end_sample"]) if output_segments else 0
     )
     final_boundary = boundaries[-1]
+    semantic_fallbacks = (
+        [
+            json.loads(json.dumps(item))
+            for item in semantic_plan.get("fallbacks", [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(semantic_plan.get("fallbacks"), list)
+        else []
+    )
+    semantic_preserved_source_fallbacks = [
+        json.loads(json.dumps(item))
+        for item in semantic_fallbacks
+        if isinstance(item.get("source_ranges"), list) and item["source_ranges"]
+    ]
+    pause_degraded_batches = (
+        [
+            json.loads(json.dumps(item))
+            for item in pause_plan.get("degraded_batches", [])
+            if isinstance(item, dict)
+        ]
+        if isinstance(pause_plan.get("degraded_batches"), list)
+        else []
+    )
+    if (
+        isinstance(semantic_plan.get("delivery_fallback"), dict)
+        or semantic_preserved_source_fallbacks
+    ):
+        delivery_status = "complete_with_preserved_source_context"
+    elif pause_degraded_batches:
+        delivery_status = "complete_with_deterministic_pauses"
+    else:
+        delivery_status = "complete"
     return {
         "schema_version": 2,
         "planner": "authoritative_single_pass_boundary_plan_v2",
@@ -4870,12 +4902,12 @@ def build_final_boundary_plan(
         "pause_plan": str(pause_plan_path),
         "pause_plan_sha256": sha256_file(pause_plan_path),
         "pause_policy": pause_policy,
-        "delivery_status": (
-            "complete_with_preserved_source_context"
-            if isinstance(semantic_plan.get("delivery_fallback"), dict)
-            else "complete"
-        ),
+        "delivery_status": delivery_status,
         "delivery_fallback": semantic_plan.get("delivery_fallback"),
+        "semantic_planner_fallbacks": semantic_fallbacks,
+        "semantic_preserved_source_fallbacks": (semantic_preserved_source_fallbacks),
+        "pause_plan_degraded": bool(pause_degraded_batches),
+        "pause_degraded_batches": pause_degraded_batches,
         "configuration": {
             "alignment_backend": "mfa",
             "mfa_version": MFA_VERSION,
@@ -6084,7 +6116,26 @@ def render_final_cut(
         "renderer": "authoritative_single_pass_final_render_v3",
         "status": "complete",
         "delivery_status": boundary_plan.get("delivery_status", "complete"),
-        "delivery_fallback": delivery_fallback_record,
+        "delivery_fallback": (
+            delivery_fallback_record or boundary_plan.get("delivery_fallback")
+        ),
+        "semantic_planner_fallbacks": list(
+            boundary_plan.get("semantic_planner_fallbacks", [])
+        ),
+        "semantic_planner_request_failure_count": len(
+            boundary_plan.get("semantic_planner_fallbacks", [])
+        ),
+        "semantic_planner_fallback_count": len(
+            boundary_plan.get("semantic_preserved_source_fallbacks", [])
+        ),
+        "semantic_preserved_source_fallbacks": list(
+            boundary_plan.get("semantic_preserved_source_fallbacks", [])
+        ),
+        "pause_plan_degraded": bool(boundary_plan.get("pause_plan_degraded")),
+        "pause_degraded_batches": list(boundary_plan.get("pause_degraded_batches", [])),
+        "pause_degraded_batch_count": len(
+            boundary_plan.get("pause_degraded_batches", [])
+        ),
         "alignment_backend": "mfa",
         "mfa_version": MFA_VERSION,
         "mfa_model": MFA_MODEL_ID,
@@ -6195,15 +6246,37 @@ def render_final_cut(
     }
     write_json(output_dir / "final_render_manifest.json", manifest)
     if manifest["delivery_status"] != "complete":
+        warning_parts: list[str] = []
+        semantic_fallback_count = int(manifest["semantic_planner_fallback_count"])
+        if semantic_fallback_count:
+            warning_parts.append(
+                f"preserved exact source in {semantic_fallback_count} semantic "
+                "planner window(s)"
+            )
+        delivery_record = manifest.get("delivery_fallback")
         preserved = (
-            delivery_fallback_record.get("preserved_intervals", [])
-            if isinstance(delivery_fallback_record, dict)
+            delivery_record.get("preserved_intervals", [])
+            if isinstance(delivery_record, dict)
             else []
         )
+        if preserved:
+            warning_parts.append(
+                f"preserved source context at {len(preserved)} unresolved cut(s)"
+            )
+        pause_fallback_count = int(manifest["pause_degraded_batch_count"])
+        if pause_fallback_count:
+            warning_parts.append(
+                f"used deterministic pauses for {pause_fallback_count} "
+                "planner batch(es)"
+            )
+        if not warning_parts:
+            warning_parts.append("preserved conservative source context")
         warnings.warn(
-            "VoiceCut completed with conservative source preservation at "
-            f"{len(preserved)} unresolved cut(s). The output is playable, but "
-            "those local regions may retain an abandoned attempt.",
+            "VoiceCut completed with conservative source preservation and a "
+            "playable fallback: "
+            + "; ".join(warning_parts)
+            + ". Review those localized regions; no invalid model range or "
+            "guessed acoustic cut was accepted.",
             RuntimeWarning,
             stacklevel=2,
         )

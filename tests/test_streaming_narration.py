@@ -10,7 +10,6 @@ from voicecut.common import read_json, write_json
 from voicecut.streaming_narration import (
     DecisionValidationError,
     SourceGroundingValidationError,
-    StreamingPlanError,
     TranscriptWord,
     build_conservative_delivery_plan,
     load_transcript_words,
@@ -601,9 +600,11 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertTrue((output_dir / "iteration_0001_attempt_1.raw.txt").exists())
             self.assertTrue((output_dir / "iteration_0001_attempt_2.raw.json").exists())
 
-    def test_second_invalid_response_fails_and_saves_raw_responses(self) -> None:
+    def test_malformed_window_fails_soft_with_exact_source_passthrough(self) -> None:
         transcript = transcript_with_word_groups([(0.0, ["One", "thought."])])
-        backend = FakeStreamingBackend(["not json", "still not json"])
+        backend = FakeStreamingBackend(
+            ["not json", "still not json", "bad eof", "bad eof again"]
+        )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -611,24 +612,103 @@ class StreamingNarrationTests(unittest.TestCase):
             write_json(transcript_path, transcript)
             output_dir = root / "plan"
 
-            with self.assertRaisesRegex(
-                StreamingPlanError,
-                "after one retry",
-            ):
-                run_streaming_planner(
-                    transcript_path=transcript_path,
-                    output_dir=output_dir,
-                    backend=backend,
-                )
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
 
             failure = read_json(output_dir / "iteration_0001_failure.json")
             self.assertEqual(len(failure["attempts"]), 2)
+            self.assertEqual(plan["status"], "complete")
             self.assertEqual(
-                read_json(output_dir / "streaming_plan.json")["status"],
-                "failed",
+                plan["reconstructed_narration"],
+                "One thought.",
+            )
+            self.assertEqual(
+                plan["selected_source_ranges"],
+                [{"start_word_id": 0, "end_word_id": 2}],
+            )
+            self.assertEqual(plan["fallback_status"], "source_passthrough_used")
+            self.assertEqual(
+                [item["status"] for item in plan["fallbacks"]],
+                [
+                    "source_passthrough_deferred_for_lookahead",
+                    "eof_source_passthrough",
+                ],
+            )
+            self.assertEqual(
+                [item["trigger"] for item in plan["fallbacks"]],
+                ["request_failure", "request_failure"],
+            )
+            self.assertTrue(
+                all(
+                    not item["rejected_model_output_accepted"]
+                    for item in plan["fallbacks"]
+                )
+            )
+            grounding = read_json(output_dir / "grounding_validation.json")
+            self.assertEqual(grounding["status"], "valid")
+            self.assertTrue(grounding["plan_accepted"])
+            self.assertEqual(grounding["fallback_count"], 2)
+
+    def test_deferred_failure_that_later_resolves_is_not_counted_as_passthrough(
+        self,
+    ) -> None:
+        transcript = transcript_with_word_groups(
+            [(0.0, ["First", "thought."]), (35.0, ["Second", "thought."])]
+        )
+        backend = FakeStreamingBackend(
+            [
+                "bad response",
+                "still bad",
+                response(
+                    finalized=[
+                        thought(
+                            "First thought.",
+                            (0, 1, "First", "thought.", "First thought."),
+                        )
+                    ],
+                    pending_start_word_id=2,
+                ),
+                response(
+                    finalized=[
+                        thought(
+                            "Second thought.",
+                            (2, 3, "Second", "thought.", "Second thought."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
             )
 
-    def test_second_unsupported_response_saves_grounding_failure(self) -> None:
+            self.assertEqual(plan["committed_words"], [0, 1, 2, 3])
+            self.assertEqual(len(plan["fallbacks"]), 1)
+            self.assertEqual(plan["fallbacks"][0]["source_ranges"], [])
+            self.assertEqual(
+                plan["fallback_status"],
+                "planner_failure_recovered_without_source_passthrough",
+            )
+            self.assertEqual(plan["fallback_event_count"], 1)
+            self.assertEqual(plan["source_passthrough_count"], 0)
+            grounding = read_json(output_dir / "grounding_validation.json")
+            self.assertEqual(grounding["fallback_count"], 1)
+            self.assertEqual(grounding["source_passthrough_count"], 0)
+
+    def test_unsupported_response_is_rejected_then_source_is_preserved(self) -> None:
         transcript = transcript_with_word_groups(
             [
                 (
@@ -652,7 +732,7 @@ class StreamingNarrationTests(unittest.TestCase):
             ],
             pending_start_word_id=5,
         )
-        backend = FakeStreamingBackend([invalid, invalid])
+        backend = FakeStreamingBackend([invalid, invalid, invalid, invalid])
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -660,21 +740,234 @@ class StreamingNarrationTests(unittest.TestCase):
             write_json(transcript_path, transcript)
             output_dir = root / "plan"
 
-            with self.assertRaisesRegex(StreamingPlanError, "after one retry"):
-                run_streaming_planner(
-                    transcript_path=transcript_path,
-                    output_dir=output_dir,
-                    backend=backend,
-                )
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
 
             grounding = read_json(output_dir / "grounding_validation.json")
-            self.assertEqual(grounding["status"], "failed")
-            self.assertFalse(grounding["plan_accepted"])
-            self.assertEqual(grounding["planner_retries"], 1)
-            self.assertEqual(grounding["unsupported_tokens"], ["example"])
+            self.assertEqual(plan["status"], "complete")
             self.assertEqual(
-                grounding["grounding_failures"][0]["unsupported_canonical_token"],
+                plan["selected_source_ranges"],
+                [{"start_word_id": 0, "end_word_id": 7}],
+            )
+            self.assertEqual(grounding["status"], "valid")
+            self.assertTrue(grounding["plan_accepted"])
+            self.assertEqual(grounding["planner_retries"], 2)
+            self.assertEqual(grounding["unsupported_tokens"], [])
+            self.assertEqual(
+                grounding["fallbacks"][0]["grounding_failure"][
+                    "unsupported_canonical_token"
+                ],
                 "example",
+            )
+            self.assertEqual(
+                grounding["fallbacks"][1]["grounding_failure"][
+                    "unsupported_canonical_token"
+                ],
+                "example",
+            )
+
+    def test_final_eof_failure_preserves_every_pending_source_word(self) -> None:
+        transcript = transcript_with_word_groups(
+            [(0.0, ["Keep", "every", "pending", "word."])]
+        )
+        backend = FakeStreamingBackend(
+            [
+                response(finalized=[], pending_start_word_id=0),
+                "malformed eof",
+                "still malformed eof",
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
+
+            self.assertEqual(
+                plan["reconstructed_narration"], "Keep every pending word."
+            )
+            self.assertEqual(plan["committed_words"], [0, 1, 2, 3])
+            self.assertEqual(len(plan["fallbacks"]), 1)
+            fallback = plan["fallbacks"][0]
+            self.assertEqual(fallback["status"], "eof_source_passthrough")
+            self.assertEqual(fallback["trigger"], "request_failure")
+            self.assertEqual(
+                fallback["source_ranges"],
+                [{"start_word_id": 0, "end_word_id": 4}],
+            )
+            self.assertEqual(fallback["passthrough_word_ids"], [0, 1, 2, 3])
+            self.assertIsNone(fallback["remaining_pending_range"])
+            validation = plan["committed"][0]["grounding_validation"]
+            self.assertEqual(
+                validation["grounding_mode"],
+                "deterministic_exact_source_passthrough",
+            )
+
+    def test_repeated_window_failures_continue_chronologically(self) -> None:
+        transcript = transcript_with_word_groups(
+            [
+                (0.0, ["Window", "zero."]),
+                (35.0, ["Window", "one."]),
+                (70.0, ["Window", "two."]),
+                (105.0, ["Window", "three."]),
+            ]
+        )
+        backend = FakeStreamingBackend(["bad response"] * 10)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
+
+            self.assertEqual(plan["status"], "complete")
+            self.assertEqual(plan["committed_words"], list(range(8)))
+            self.assertEqual(
+                plan["selected_source_ranges"],
+                [
+                    {"start_word_id": 0, "end_word_id": 2},
+                    {"start_word_id": 2, "end_word_id": 4},
+                    {"start_word_id": 4, "end_word_id": 6},
+                    {"start_word_id": 6, "end_word_id": 8},
+                ],
+            )
+            self.assertEqual(len(plan["iterations"]), 5)
+            self.assertEqual(len(plan["fallbacks"]), 5)
+            self.assertEqual(
+                plan["iterations"][1]["remaining_pending_transcript"][0]["id"],
+                2,
+            )
+            self.assertTrue(
+                all(
+                    right["start_word_id"] == left["end_word_id"]
+                    for left, right in zip(
+                        plan["selected_source_ranges"],
+                        plan["selected_source_ranges"][1:],
+                        strict=False,
+                    )
+                )
+            )
+
+    def test_repeated_valid_no_progress_is_bounded_and_preserves_source(self) -> None:
+        transcript = transcript_with_word_groups(
+            [
+                (0.0, ["Window", "zero."]),
+                (35.0, ["Window", "one."]),
+                (70.0, ["Window", "two."]),
+                (105.0, ["Window", "three."]),
+            ]
+        )
+        backend = FakeStreamingBackend(
+            [
+                response(finalized=[], pending_start_word_id=0),
+                response(finalized=[], pending_start_word_id=0),
+                response(finalized=[], pending_start_word_id=2),
+                response(finalized=[], pending_start_word_id=4),
+                response(finalized=[], pending_start_word_id=None),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
+
+            self.assertEqual(plan["status"], "complete")
+            self.assertEqual(plan["committed_words"], list(range(8)))
+            self.assertEqual(
+                plan["selected_source_ranges"],
+                [
+                    {"start_word_id": 0, "end_word_id": 2},
+                    {"start_word_id": 2, "end_word_id": 4},
+                    {"start_word_id": 4, "end_word_id": 6},
+                    {"start_word_id": 6, "end_word_id": 8},
+                ],
+            )
+            self.assertEqual(
+                [fallback["trigger"] for fallback in plan["fallbacks"]],
+                [
+                    "valid_no_progress",
+                    "valid_no_progress",
+                    "valid_no_progress",
+                    "valid_eof_no_progress",
+                ],
+            )
+            self.assertIsNone(plan["iterations"][0]["fallback"])
+            self.assertLessEqual(
+                max(
+                    len(iteration["complete_pending_input"])
+                    for iteration in plan["iterations"][:-1]
+                ),
+                4,
+            )
+            self.assertTrue(
+                all(len(iteration["attempts"]) == 1 for iteration in plan["iterations"])
+            )
+
+    def test_valid_empty_eof_response_preserves_pending_source(self) -> None:
+        transcript = transcript_with_word_groups(
+            [(0.0, ["Do", "not", "drop", "this."])]
+        )
+        backend = FakeStreamingBackend(
+            [
+                response(finalized=[], pending_start_word_id=0),
+                response(finalized=[], pending_start_word_id=None),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+            )
+
+            self.assertEqual(plan["reconstructed_narration"], "Do not drop this.")
+            self.assertEqual(plan["committed_words"], [0, 1, 2, 3])
+            self.assertEqual(len(plan["fallbacks"]), 1)
+            fallback = plan["fallbacks"][0]
+            self.assertEqual(fallback["trigger"], "valid_eof_no_progress")
+            self.assertEqual(fallback["status"], "eof_source_passthrough")
+            self.assertEqual(
+                fallback["source_ranges"],
+                [{"start_word_id": 0, "end_word_id": 4}],
+            )
+            self.assertNotIn(
+                "iteration_0002_failure.json", {p.name for p in output_dir.iterdir()}
+            )
+            grounding = read_json(output_dir / "grounding_validation.json")
+            self.assertEqual(grounding["status"], "valid")
+            self.assertEqual(
+                grounding["fallbacks"][0]["trigger"],
+                "valid_eof_no_progress",
             )
 
     def test_validation_rejects_unsafe_range_geometry(self) -> None:

@@ -1316,6 +1316,76 @@ def test_final_render_preserves_local_source_context_after_retry_exhaustion(
     assert len(boundary_plan["source_intervals"]) == 1
 
 
+def test_final_render_propagates_semantic_and_pause_fallback_provenance(
+    tmp_path: Path,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    plan = read_json(plan_path)
+    semantic_fallback = {
+        "iteration": 4,
+        "status": "source_passthrough",
+        "source_ranges": [{"start_word_id": 0, "end_word_id": 1}],
+        "rejected_model_output_accepted": False,
+    }
+    deferred_failure = {
+        "iteration": 1,
+        "status": "source_passthrough_deferred_for_lookahead",
+        "source_ranges": [],
+        "rejected_model_output_accepted": False,
+    }
+    plan["fallback_status"] = "source_passthrough_used"
+    plan["fallbacks"] = [deferred_failure, semantic_fallback]
+    write_json(plan_path, plan)
+
+    pause_plan = read_json(pause_plan_path)
+    pause_fallback = {
+        "batch": 1,
+        "start_thought_index": 0,
+        "end_thought_index": 1,
+        "classification_source": "deterministic_pause_heuristics_v1",
+    }
+    pause_plan["streaming_plan_sha256"] = sha256_file(plan_path)
+    pause_plan["degraded"] = True
+    pause_plan["degraded_batch_count"] = 1
+    pause_plan["degraded_batches"] = [pause_fallback]
+    write_json(pause_plan_path, pause_plan)
+
+    words = plan["words"]
+    completeness, mfa = _grounded_evidence(
+        words=words,
+        audio_path=audio_path,
+    )
+    with pytest.warns(RuntimeWarning, match="playable fallback"):
+        manifest = render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=tmp_path / "planner_fallback_provenance",
+            pause_plan_path=pause_plan_path,
+            alignment_python=tmp_path / "model-must-not-run",
+            alignment_payload=completeness,
+            mfa_payload=mfa,
+            max_acoustic_retries=0,
+        )
+
+    assert manifest["delivery_status"] == ("complete_with_preserved_source_context")
+    assert manifest["semantic_planner_request_failure_count"] == 2
+    assert manifest["semantic_planner_fallback_count"] == 1
+    assert manifest["semantic_planner_fallbacks"] == [
+        deferred_failure,
+        semantic_fallback,
+    ]
+    assert manifest["semantic_preserved_source_fallbacks"] == [semantic_fallback]
+    assert manifest["pause_degraded_batch_count"] == 1
+    assert manifest["pause_degraded_batches"] == [pause_fallback]
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert boundary_plan["semantic_planner_fallbacks"] == [
+        deferred_failure,
+        semantic_fallback,
+    ]
+    assert boundary_plan["semantic_preserved_source_fallbacks"] == [semantic_fallback]
+    assert boundary_plan["pause_degraded_batches"] == [pause_fallback]
+
+
 def test_final_render_accepts_dense_mfa_phone_boundary_without_silence(
     tmp_path: Path,
 ) -> None:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -46,6 +47,44 @@ EOF_TRAILING_SILENCE_MS = 300.0
 ROOM_TONE_WORD_GUARD_MS = 40.0
 ROOM_TONE_FADE_MS = 5.0
 PAUSE_PLANNER_MAX_THOUGHTS_PER_BATCH = 40
+DETERMINISTIC_PAUSE_FALLBACK = "deterministic_pause_heuristics_v1"
+
+_SECTION_CUE_PATTERNS = tuple(
+    re.compile(pattern, flags=re.IGNORECASE)
+    for pattern in (
+        r"^(?:chapter|section)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        r"^part\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        r"^(?:in\s+)?the\s+next\s+(?:chapter|section|part)\b",
+        r"^(?:now\s+)?(?:let(?:'s|\s+us)\s+)?(?:move|turn)\s+on\b",
+        r"^(?:now\s+)?(?:let(?:'s|\s+us)\s+)?(?:move|turn)\s+to\b",
+        r"^(?:moving|turning)\s+(?:on|to)\b",
+    )
+)
+_CLOSELY_CONNECTED_PREFIXES = (
+    "also",
+    "and",
+    "as a result",
+    "because",
+    "but",
+    "consequently",
+    "for example",
+    "however",
+    "in other words",
+    "instead",
+    "meanwhile",
+    "moreover",
+    "nevertheless",
+    "next",
+    "or",
+    "otherwise",
+    "similarly",
+    "so",
+    "then",
+    "therefore",
+    "thus",
+    "which",
+    "yet",
+)
 
 
 class PausePlanError(RuntimeError):
@@ -297,13 +336,87 @@ def _pause_batches(
     return batches
 
 
+def _starts_with_connected_cue(text: str) -> bool:
+    normalized = re.sub(r"^[\s\"'“”‘’([{]+", "", text).casefold()
+    normalized = re.sub(r"\s+", " ", normalized)
+    return any(
+        normalized == prefix
+        or normalized.startswith(f"{prefix} ")
+        or normalized.startswith(f"{prefix},")
+        for prefix in _CLOSELY_CONNECTED_PREFIXES
+    )
+
+
+def _deterministic_pause_type(
+    previous_text: str,
+    next_text: str,
+) -> tuple[str, str]:
+    """Classify one transition conservatively without a model call.
+
+    The fallback deliberately uses only explicit punctuation and discourse
+    cues.  It does not infer new narration, source ranges, or a duration.
+    """
+
+    next_visible = re.sub(r"^[\s\"'“”‘’([{]+", "", next_text.strip())
+    if any(pattern.search(next_visible) for pattern in _SECTION_CUE_PATTERNS):
+        return "section", "explicit_section_cue"
+
+    previous_visible = re.sub(r"[\s\"'“”‘’\])}]+$", "", previous_text.strip())
+    if previous_visible.endswith(("...", "…")):
+        return "continuation", "previous_ellipsis"
+    if previous_visible.endswith((",", ":", "—", "–", "-")):
+        return "continuation", "previous_continuation_punctuation"
+    if not previous_visible.endswith((".", "?", "!", ";")):
+        return "continuation", "previous_has_no_terminal_punctuation"
+    if previous_visible.endswith(";"):
+        return "short", "previous_semicolon"
+    if _starts_with_connected_cue(next_visible):
+        return "short", "next_thought_connective"
+    return "thought", "complete_sentence_default"
+
+
+def deterministic_pause_fallback(
+    thoughts: Sequence[dict[str, Any]],
+    *,
+    start_thought_index: int = 0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return deterministic transitions and inspectable rule provenance."""
+
+    transitions: list[dict[str, Any]] = []
+    provenance: list[dict[str, Any]] = []
+    for local_index, (previous, following) in enumerate(
+        zip(thoughts[:-1], thoughts[1:], strict=True)
+    ):
+        after = start_thought_index + local_index
+        pause_type, rule = _deterministic_pause_type(
+            str(previous["canonical_text"]),
+            str(following["canonical_text"]),
+        )
+        transitions.append(
+            {
+                "after_thought_index": after,
+                "before_thought_index": after + 1,
+                "pause_type": pause_type,
+            }
+        )
+        provenance.append(
+            {
+                "after_thought_index": after,
+                "before_thought_index": after + 1,
+                "pause_type": pause_type,
+                "rule": rule,
+            }
+        )
+    return transitions, provenance
+
+
 def create_pause_plan(
     *,
     plan_path: Path,
     output_dir: Path,
     backend: PausePlannerBackend,
 ) -> dict[str, Any]:
-    """Call the pause classifier once, retry malformed output once, and save."""
+    """Classify batched transitions, retry once, and degrade failed batches."""
 
     plan_path = plan_path.resolve()
     output_dir = output_dir.resolve()
@@ -321,6 +434,8 @@ def create_pause_plan(
     schema = pause_response_schema()
     attempts: list[dict[str, Any]] = []
     batches = _pause_batches(thoughts)
+    degraded_batches: list[dict[str, Any]] = []
+    batch_provenance: list[dict[str, Any]] = []
 
     if len(thoughts) == 1:
         transitions: list[dict[str, Any]] = []
@@ -331,6 +446,13 @@ def create_pause_plan(
                 "raw_response": raw,
                 "validation_error": None,
                 "model_call_skipped": "there are no thought transitions",
+            }
+        )
+        batch_provenance.append(
+            {
+                "batch": 0,
+                "classification_source": "none",
+                "reason": "there are no thought transitions",
             }
         )
     else:
@@ -377,6 +499,19 @@ def create_pause_plan(
                         raw,
                         encoding="utf-8",
                     )
+                    batch_provenance.append(
+                        {
+                            "batch": batch_index,
+                            "start_thought_index": start_index,
+                            "end_thought_index": (
+                                start_index + len(batch_thoughts) - 1
+                            ),
+                            "classification_source": "model",
+                            "backend": backend.backend_name,
+                            "model": backend.model,
+                            "accepted_attempt": attempt,
+                        }
+                    )
                     break
                 except Exception as error:
                     last_raw = raw
@@ -401,20 +536,31 @@ def create_pause_plan(
                             validation_error=last_error,
                         )
             else:
-                failure = {
-                    "schema_version": 1,
-                    "streaming_plan": str(plan_path),
-                    "streaming_plan_sha256": sha256_file(plan_path),
-                    "failed_batch": batch_index,
-                    "validation_error": last_error,
-                    "raw_response": last_raw,
-                    "attempts": attempts,
+                batch_transitions, fallback_provenance = deterministic_pause_fallback(
+                    batch_thoughts,
+                    start_thought_index=start_index,
+                )
+                validate_pause_response(
+                    json.dumps({"transitions": batch_transitions}),
+                    thought_count=len(batch_thoughts),
+                    start_thought_index=start_index,
+                )
+                degraded_batch = {
+                    "batch": batch_index,
+                    "start_thought_index": start_index,
+                    "end_thought_index": start_index + len(batch_thoughts) - 1,
+                    "transition_count": len(batch_transitions),
+                    "classification_source": DETERMINISTIC_PAUSE_FALLBACK,
+                    "model_attempts": 2,
+                    "model_error": last_error,
+                    "last_raw_response": last_raw,
+                    "transition_provenance": fallback_provenance,
                 }
-                write_json(output_dir / "pause_plan_failure.json", failure)
-                raise PausePlanError(
-                    f"{backend.backend_name} pause planner batch {batch_index} "
-                    f"failed after one retry: {last_error}; raw responses were "
-                    f"saved in {output_dir}"
+                degraded_batches.append(degraded_batch)
+                batch_provenance.append(dict(degraded_batch))
+                write_json(
+                    output_dir / f"pause_plan_batch_{batch_index:03d}_fallback.json",
+                    degraded_batch,
                 )
             transitions.extend(batch_transitions)
 
@@ -431,6 +577,10 @@ def create_pause_plan(
         "thought_count": len(thoughts),
         "transition_count": len(transitions),
         "batch_count": len(batches),
+        "degraded": bool(degraded_batches),
+        "degraded_batch_count": len(degraded_batches),
+        "degraded_batches": degraded_batches,
+        "batch_provenance": batch_provenance,
         "transitions": transitions,
         "attempts": attempts,
     }

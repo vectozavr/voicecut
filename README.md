@@ -392,6 +392,12 @@ geometry. It expands only proven insertions, so a phrase such as
 `with familiar, with the familiar words` remains visible to the planner rather
 than collapsing to one apparent take.
 
+This pass is optional evidence. Blank/noise-only VAD atoms are preserved and
+explicitly skipped, and an isolated CTC crop failure does not discard the
+other crops. If the CTC runtime itself is unavailable, VoiceCut continues with
+the validated primary Whisper transcript and records the degraded provenance
+in `ctc_enrichment_report.json`; it does not fabricate hidden words.
+
 ### 5. Streaming semantic planning
 
 The selected LLM sees the unresolved transcript suffix plus new look-ahead
@@ -414,6 +420,28 @@ selected source range. VoiceCut then verifies:
 - a model cannot introduce text without corresponding source audio.
 
 The LLM selects occurrences; it never selects sample coordinates.
+
+### Long recordings and recoverable failures
+
+Whisper and CTC atom checkpoints are retained and validated, so an interrupted
+long run resumes instead of starting again at atom zero. Each planner request
+still gets one corrective retry. If both responses for one streaming window
+remain malformed or source-unsupported, VoiceCut rejects both responses and
+conservatively preserves the exact source words for only that local window.
+Newer look-ahead remains pending, so later windows can continue to receive
+normal semantic editing. At EOF, all unresolved source words are preserved.
+
+Semantic-pause classification follows the same local policy: only a failed
+batch uses deterministic punctuation and discourse rules; successful batches
+remain model-classified. These fallbacks are listed in `streaming_plan.json`,
+`pause_plan.json`, `final_boundary_plan.json`, and the final run manifest.
+They favor a playable result with a potentially under-edited local region over
+losing an otherwise valid hour-long edit.
+
+Structural corruption is different and remains fatal: mismatched source-audio
+hashes, duplicate word/atom IDs, invalid timestamp geometry, unsupported
+source-record shapes, ambiguous MFA mapping, or a cut that still cannot be
+made outside a retained phone are never accepted as fallbacks.
 
 ### 6. One authoritative boundary plan and one render
 

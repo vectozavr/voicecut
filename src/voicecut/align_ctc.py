@@ -633,6 +633,52 @@ def _requested_segments(source: dict[str, Any]) -> list[dict[str, Any]]:
     return requested
 
 
+def _requested_skipped_segments(
+    source: dict[str, Any],
+    *,
+    decoded_phrase_ids: set[int],
+) -> list[dict[str, Any]]:
+    raw_segments = source.get("skipped_segments", [])
+    if not isinstance(raw_segments, list):
+        raise ValueError("CTC input 'skipped_segments' must be a list.")
+    skipped: list[dict[str, Any]] = []
+    seen_phrase_ids: set[int] = set()
+    for position, raw in enumerate(raw_segments):
+        if not isinstance(raw, dict):
+            raise ValueError(f"CTC skipped segment {position} must be an object.")
+        phrase_index = raw.get("phrase_index")
+        if type(phrase_index) is not int:
+            raise ValueError(
+                f"CTC skipped segment {position} has no integer phrase_index."
+            )
+        if phrase_index in decoded_phrase_ids or phrase_index in seen_phrase_ids:
+            raise ValueError(f"CTC input repeats phrase_index {phrase_index}.")
+        try:
+            start = float(raw["input_start"])
+            end = float(raw["input_end"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"CTC skipped segment {phrase_index} has invalid timestamps."
+            ) from error
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or end <= start
+            or raw.get("reason") != "no_lexical_content"
+        ):
+            raise ValueError(f"CTC skipped segment {phrase_index} is invalid.")
+        seen_phrase_ids.add(phrase_index)
+        skipped.append(
+            {
+                "phrase_index": phrase_index,
+                "input_start": start,
+                "input_end": end,
+                "reason": "no_lexical_content",
+            }
+        )
+    return skipped
+
+
 def _evidence_segment(
     requested: dict[str, Any],
     greedy_words: list[dict[str, Any]],
@@ -654,6 +700,28 @@ def _evidence_segment(
                 greedy_words,
             )
         ),
+    }
+
+
+def _failed_evidence_segment(
+    requested: dict[str, Any],
+    error: Exception,
+) -> dict[str, Any]:
+    """Represent one failed optional decode without losing later segments."""
+
+    return {
+        "phrase_index": int(requested["phrase_index"]),
+        "input_start": float(requested["start"]),
+        "input_end": float(requested["end"]),
+        "input_text": str(requested["text"]),
+        "greedy_ctc_words": [],
+        "acoustic_insertions": [],
+        "acoustic_expected_substitutions": [],
+        "status": "decode_failed",
+        "decode_error": {
+            "type": type(error).__name__,
+            "message": str(error),
+        },
     }
 
 
@@ -735,7 +803,7 @@ def _normalized_checkpoint_segments(
             raise RuntimeError(
                 f"CTC checkpoint phrase {phrase_index} has invalid evidence."
             )
-        completed[phrase_index] = {
+        normalized = {
             "phrase_index": phrase_index,
             "input_start": float(requested["start"]),
             "input_end": float(requested["end"]),
@@ -744,6 +812,18 @@ def _normalized_checkpoint_segments(
             "acoustic_insertions": insertions,
             "acoustic_expected_substitutions": substitutions,
         }
+        status = raw.get("status")
+        if status is not None:
+            if status != "decode_failed" or not isinstance(
+                raw.get("decode_error"),
+                dict,
+            ):
+                raise RuntimeError(
+                    f"CTC checkpoint phrase {phrase_index} has invalid status."
+                )
+            normalized["status"] = "decode_failed"
+            normalized["decode_error"] = dict(raw["decode_error"])
+        completed[phrase_index] = normalized
     return completed
 
 
@@ -793,6 +873,10 @@ def main() -> None:
     if not isinstance(source, dict):
         raise ValueError("CTC input root must be an object.")
     segments = _requested_segments(source)
+    skipped_segments = _requested_skipped_segments(
+        source,
+        decoded_phrase_ids={int(segment["phrase_index"]) for segment in segments},
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if not segments:
         args.output.write_text(
@@ -801,6 +885,11 @@ def main() -> None:
                     "schema_version": OUTPUT_SCHEMA_VERSION,
                     "mode": OUTPUT_MODE,
                     "segments": [],
+                    **(
+                        {"skipped_segments": skipped_segments}
+                        if skipped_segments
+                        else {}
+                    ),
                 },
                 indent=2,
             ),
@@ -839,19 +928,25 @@ def main() -> None:
             device=args.device,
         )
         for requested in pending:
-            greedy_words = decode_greedy_ctc_segment(
-                model,
-                metadata,
-                audio,
-                start=float(requested["start"]),
-                end=float(requested["end"]),
-                device=args.device,
-            )
             phrase_index = int(requested["phrase_index"])
-            completed_by_id[phrase_index] = _evidence_segment(
-                requested,
-                greedy_words,
-            )
+            try:
+                greedy_words = decode_greedy_ctc_segment(
+                    model,
+                    metadata,
+                    audio,
+                    start=float(requested["start"]),
+                    end=float(requested["end"]),
+                    device=args.device,
+                )
+                completed_by_id[phrase_index] = _evidence_segment(
+                    requested,
+                    greedy_words,
+                )
+            except Exception as error:
+                completed_by_id[phrase_index] = _failed_evidence_segment(
+                    requested,
+                    error,
+                )
             ordered_completed = [
                 completed_by_id[int(segment["phrase_index"])]
                 for segment in segments
@@ -875,6 +970,7 @@ def main() -> None:
         "schema_version": OUTPUT_SCHEMA_VERSION,
         "mode": OUTPUT_MODE,
         "segments": ordered_segments,
+        **({"skipped_segments": skipped_segments} if skipped_segments else {}),
     }
     args.output.write_text(
         json.dumps(serializable(evidence), indent=2, ensure_ascii=False),
@@ -888,10 +984,15 @@ def main() -> None:
     retry_count = sum(
         len(segment["acoustic_insertions"]) for segment in ordered_segments
     )
+    failed_count = sum(
+        segment.get("status") == "decode_failed" for segment in ordered_segments
+    )
     print(
         json.dumps(
             {
                 "segments": len(ordered_segments),
+                "segments_skipped_no_lexical_content": len(skipped_segments),
+                "segment_decode_failures": failed_count,
                 "raw_words": raw_word_count,
                 "spoken_retries": retry_count,
                 "output": str(args.output.resolve()),

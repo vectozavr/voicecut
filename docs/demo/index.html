@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Listen to and watch real before-and-after VoiceCut examples in English, Russian, and video."
+    />
+    <meta name="theme-color" content="#07111f" />
+    <meta property="og:title" content="VoiceCut — hear the edit" />
+    <meta
+      property="og:description"
+      content="Real narration before and after VoiceCut, playable in your browser."
+    />
+    <meta property="og:type" content="website" />
+    <meta
+      property="og:url"
+      content="https://vectozavr.github.io/voicecut/"
+    />
+    <meta
+      property="og:image"
+      content="https://vectozavr.github.io/voicecut/assets/video-after.jpg"
+    />
+    <title>VoiceCut — before &amp; after</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="player.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#examples">Skip to the examples</a>
+
+    <header class="site-header">
+      <a class="brand" href="https://github.com/vectozavr/voicecut">
+        <span class="brand-mark" aria-hidden="true">V</span>
+        <span>VoiceCut</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#audio">Audio</a>
+        <a href="#video">Video</a>
+        <a href="https://github.com/vectozavr/voicecut">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow">Real pipeline results · no manual repair</p>
+          <h1 id="hero-title">Hear the edit.<br />Keep the voice.</h1>
+          <p class="hero-lede">
+            VoiceCut turns retake-heavy narration into a clean, coherent take.
+            Compare the original and edited recordings below—directly in your
+            browser.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#examples">Play examples</a>
+            <a
+              class="button button-secondary"
+              href="https://github.com/vectozavr/voicecut#quick-start"
+              >Get VoiceCut</a
+            >
+          </div>
+          <dl class="hero-stats">
+            <div>
+              <dt>2</dt>
+              <dd>languages</dd>
+            </div>
+            <div>
+              <dt>3</dt>
+              <dd>real examples</dd>
+            </div>
+            <div>
+              <dt>1×</dt>
+              <dd>source render</dd>
+            </div>
+          </dl>
+        </div>
+        <div class="hero-visual" aria-label="Waveforms before and after editing">
+          <div class="visual-labels" aria-hidden="true">
+            <span>Raw narration</span>
+            <span>VoiceCut result</span>
+          </div>
+          <img
+            src="assets/audio-waveforms.svg"
+            alt="Waveform comparison of the English and Russian recordings before and after VoiceCut"
+          />
+          <p>
+            Fewer retries and dead ends. The speaker's original voice remains.
+          </p>
+        </div>
+      </section>
+
+      <section class="trust-strip" aria-label="VoiceCut guarantees">
+        <span>No synthesized speech</span>
+        <span>Phone-aligned cuts</span>
+        <span>Source samples rendered once</span>
+      </section>
+
+      <section class="examples" id="examples" aria-labelledby="examples-title">
+        <div class="section-heading">
+          <p class="eyebrow">Before / after</p>
+          <h2 id="examples-title">Listen for yourself</h2>
+          <p>
+            Headphones help when comparing the boundaries. Starting one player
+            automatically pauses the others.
+          </p>
+        </div>
+
+        <div class="audio-examples" id="audio">
+          <article class="demo-card">
+            <header class="card-header">
+              <div>
+                <p class="card-kicker">English narration</p>
+                <h3>False starts become one clean take</h3>
+              </div>
+              <span class="reduction">28.1% shorter</span>
+            </header>
+            <div class="player-grid">
+              <section class="player-panel before-panel" aria-labelledby="en-before">
+                <div class="player-heading">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <h4 id="en-before">Original</h4>
+                  <span>38.00 s</span>
+                </div>
+                <audio controls preload="metadata">
+                  <source src="media/audio/example_en.wav" type="audio/wav" />
+                  Your browser cannot play this WAV file.
+                  <a href="media/audio/example_en.wav">Open the original audio</a>.
+                </audio>
+              </section>
+              <section class="player-panel result-panel" aria-labelledby="en-after">
+                <div class="player-heading">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <h4 id="en-after">VoiceCut</h4>
+                  <span>27.34 s</span>
+                </div>
+                <audio controls preload="metadata">
+                  <source
+                    src="media/audio/example_en_edited.wav"
+                    type="audio/wav"
+                  />
+                  Your browser cannot play this WAV file.
+                  <a href="media/audio/example_en_edited.wav">Open the edited audio</a>.
+                </audio>
+              </section>
+            </div>
+            <p class="card-note">
+              The abandoned opening and repeated phrase are removed; the
+              complete intended take remains.
+            </p>
+          </article>
+
+          <article class="demo-card" lang="ru">
+            <header class="card-header">
+              <div>
+                <p class="card-kicker">Русская речь</p>
+                <h3>Повторы превращаются в связное объяснение</h3>
+              </div>
+              <span class="reduction">38,2% короче</span>
+            </header>
+            <div class="player-grid">
+              <section class="player-panel before-panel" aria-labelledby="ru-before">
+                <div class="player-heading">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <h4 id="ru-before">Оригинал</h4>
+                  <span>35,07 с</span>
+                </div>
+                <audio controls preload="metadata">
+                  <source src="media/audio/example_ru.wav" type="audio/wav" />
+                  Ваш браузер не может воспроизвести WAV.
+                  <a href="media/audio/example_ru.wav">Открыть оригинал</a>.
+                </audio>
+              </section>
+              <section class="player-panel result-panel" aria-labelledby="ru-after">
+                <div class="player-heading">
+                  <span class="status-dot" aria-hidden="true"></span>
+                  <h4 id="ru-after">VoiceCut</h4>
+                  <span>21,68 с</span>
+                </div>
+                <audio controls preload="metadata">
+                  <source
+                    src="media/audio/example_ru_edited.wav"
+                    type="audio/wav"
+                  />
+                  Ваш браузер не может воспроизвести WAV.
+                  <a href="media/audio/example_ru_edited.wav">Открыть результат</a>.
+                </audio>
+              </section>
+            </div>
+            <p class="card-note">
+              Неудачные попытки и повторённые фразы удалены, а финальное
+              объяснение сохранено.
+            </p>
+          </article>
+        </div>
+
+        <article class="demo-card video-card" id="video">
+          <header class="card-header">
+            <div>
+              <p class="card-kicker">Video editing</p>
+              <h3>The picture follows the selected speech</h3>
+            </div>
+            <span class="reduction">21.4% shorter</span>
+          </header>
+          <div class="video-grid">
+            <section class="video-panel" aria-labelledby="video-before">
+              <div class="player-heading">
+                <span class="status-dot" aria-hidden="true"></span>
+                <h4 id="video-before">Original</h4>
+                <span>30.25 s</span>
+              </div>
+              <video
+                controls
+                playsinline
+                preload="metadata"
+                poster="assets/video-before.jpg"
+              >
+                <source src="media/video/video.mp4" type="video/mp4" />
+                Your browser cannot play this MP4 file.
+                <a href="media/video/video.mp4">Open the original video</a>.
+              </video>
+            </section>
+            <section class="video-panel result-panel" aria-labelledby="video-after">
+              <div class="player-heading">
+                <span class="status-dot" aria-hidden="true"></span>
+                <h4 id="video-after">VoiceCut</h4>
+                <span>23.78 s</span>
+              </div>
+              <video
+                controls
+                playsinline
+                preload="metadata"
+                poster="assets/video-after.jpg"
+              >
+                <source src="media/video/video_edited.mp4" type="video/mp4" />
+                Your browser cannot play this MP4 file.
+                <a href="media/video/video_edited.mp4">Open the edited video</a>.
+              </video>
+            </section>
+          </div>
+          <p class="card-note">
+            VoiceCut applies direct visual cuts at the selected speech ranges—no
+            frozen frames and no artificial video pauses.
+          </p>
+        </article>
+      </section>
+
+      <section class="how-it-works" aria-labelledby="how-title">
+        <div class="section-heading">
+          <p class="eyebrow">Under the hood</p>
+          <h2 id="how-title">Meaning first. Boundaries second.</h2>
+        </div>
+        <ol class="steps">
+          <li>
+            <span>01</span>
+            <div>
+              <h3>Transcribe</h3>
+              <p>Whisper maps every spoken occurrence to the source recording.</p>
+            </div>
+          </li>
+          <li>
+            <span>02</span>
+            <div>
+              <h3>Edit</h3>
+              <p>The planner keeps the successful takes and removes abandoned ones.</p>
+            </div>
+          </li>
+          <li>
+            <span>03</span>
+            <div>
+              <h3>Align</h3>
+              <p>MFA resolves phone-safe source boundaries for every real cut.</p>
+            </div>
+          </li>
+          <li>
+            <span>04</span>
+            <div>
+              <h3>Render once</h3>
+              <p>The result is assembled directly from the canonical source.</p>
+            </div>
+          </li>
+        </ol>
+      </section>
+
+      <section class="cta" aria-labelledby="cta-title">
+        <div>
+          <p class="eyebrow">One command</p>
+          <h2 id="cta-title">Turn your next recording into the final take.</h2>
+        </div>
+        <div class="command-wrap">
+          <code>voicecut recording.wav</code>
+          <button type="button" data-copy="voicecut recording.wav">
+            Copy command
+          </button>
+          <span class="copy-status" aria-live="polite"></span>
+        </div>
+        <a class="button button-primary" href="https://github.com/vectozavr/voicecut#quick-start">
+          Install from GitHub
+        </a>
+      </section>
+    </main>
+
+    <footer>
+      <a class="brand" href="https://github.com/vectozavr/voicecut">
+        <span class="brand-mark" aria-hidden="true">V</span>
+        <span>VoiceCut</span>
+      </a>
+      <p>Open-source automatic narration editing for Apple Silicon.</p>
+      <div>
+        <a href="https://github.com/vectozavr/voicecut">Repository</a>
+        <a href="https://github.com/vectozavr/voicecut/blob/main/examples/README.md"
+          >Reproduce examples</a
+        >
+        <a href="https://github.com/vectozavr/voicecut/blob/main/LICENSE">MIT License</a>
+      </div>
+    </footer>
+  </body>
+</html>

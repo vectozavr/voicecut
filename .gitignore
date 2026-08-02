@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .coverage
+.pages-site/
 htmlcov/
 build/
 dist/

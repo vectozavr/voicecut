@@ -5,6 +5,8 @@ pipeline. They are deliberately short enough to review directly on GitHub.
 The originals contain retries, abandoned phrases, or pauses; the edited media
 keeps the selected narration and uses phone-safe source boundaries.
 
+[**▶ Play all examples in your browser**](https://vectozavr.github.io/voicecut/)
+
 ![Waveforms for the English and Russian examples](../docs/assets/readme/audio-waveforms.svg)
 
 ## Results

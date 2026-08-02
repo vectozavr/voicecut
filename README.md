@@ -23,6 +23,9 @@ These are real VoiceCut runs from this repository. The edited files were
 produced by the normal production command with Gemini planning; they were not
 manually repaired afterward.
 
+> [**▶ Play every example in your browser**](https://vectozavr.github.io/voicecut/)
+> — compare the original and edited English audio, Russian audio, and video.
+
 [![Waveform comparison for the English and Russian audio examples](docs/assets/readme/audio-waveforms.svg)](examples/README.md)
 
 | Example | Original | VoiceCut result | What changed |

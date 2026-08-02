@@ -7,7 +7,7 @@ on:
     paths:
       - ".github/workflows/pages.yml"
       - "docs/demo/**"
-      - "docs/assets/readme/audio-waveforms.svg"
+      - "docs/assets/readme/pipeline.svg"
       - "docs/assets/readme/video-before.jpg"
       - "docs/assets/readme/video-after.jpg"
       - "examples/media/**"

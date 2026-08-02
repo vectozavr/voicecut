@@ -9,7 +9,7 @@ SITE_SOURCE = PROJECT_ROOT / "docs" / "demo"
 MEDIA_SOURCE = PROJECT_ROOT / "examples" / "media"
 README_ASSETS = PROJECT_ROOT / "docs" / "assets" / "readme"
 REQUIRED_ASSETS = (
-    "audio-waveforms.svg",
+    "pipeline.svg",
     "video-before.jpg",
     "video-after.jpg",
 )

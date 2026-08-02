@@ -1,18 +1,17 @@
 # VoiceCut
 
-> Turn retake-heavy narration into a clean audio or video edit with one
-> command.
+> Automatic narration editing for content creators.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f855a.svg)](LICENSE)
 [![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%E2%80%933.12-3776ab.svg)](pyproject.toml)
 [![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-111827.svg)](#requirements)
 [![Languages: English and Russian](https://img.shields.io/badge/speech-English%20%7C%20Russian-7c3aed.svg)](#requirements)
 
-VoiceCut finds false starts, repeated takes, corrections, and recording
-directions in spoken narration, then keeps the intended source occurrences and
-joins them at phone-safe boundaries. It edits audio and video, never
-synthesizes replacement speech, and renders audio once from the canonical
-source WAV before media publication.
+VoiceCut turns retake-heavy narration into a clean audio or video edit with one
+command. It finds false starts, repeated takes, corrections, and recording
+directions, then keeps the intended source occurrences and joins them at
+phone-safe boundaries. VoiceCut never synthesizes replacement speech and
+renders audio once from the canonical source WAV before media publication.
 
 The project is in beta and currently targets narrated, single-speaker
 recordings on Apple Silicon Macs.

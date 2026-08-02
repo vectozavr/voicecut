@@ -60,10 +60,9 @@
   <rect x="300.47" y="390" width="424.58" height="58" rx="7" fill="#11a683"/>
   <line x1="300.47" y1="383" x2="300.47" y2="455" stroke="#087b65" stroke-width="1.5"/>
   <text x="512.76" y="425" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">words 3–40</text>
-  <rect x="773.43" y="390" width="68.76" height="58" rx="7" fill="#11a683"/>
+  <rect x="773.43" y="390" width="177.06" height="58" rx="7" fill="#11a683"/>
   <line x1="773.43" y1="383" x2="773.43" y2="455" stroke="#087b65" stroke-width="1.5"/>
-  <rect x="865.36" y="390" width="85.13" height="58" rx="7" fill="#11a683"/>
-  <line x1="865.36" y1="383" x2="865.36" y2="455" stroke="#087b65" stroke-width="1.5"/>
+  <text x="861.96" y="425" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">words 42–58</text>
   <rect x="1036.94" y="390" width="208.06" height="58" rx="7" fill="#11a683"/>
   <line x1="1036.94" y1="383" x2="1036.94" y2="455" stroke="#087b65" stroke-width="1.5"/>
   <text x="1140.97" y="425" text-anchor="middle" font-size="12" font-weight="700" fill="#ffffff">words 65–82</text>

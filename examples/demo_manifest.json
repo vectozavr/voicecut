@@ -27,9 +27,7 @@
       "reference_build_implementation_sha256": "fc0025a7a7f568d01d3f509b40491d5293d2722348806349661199dc551e5685",
       "input": {
         "path": "examples/media/audio/example_en.wav",
-        "preview_path": "examples/media/audio/example_en.mp3",
         "sha256": "74124be48fb08a4ce17a9fcf0e20bbbae1aae4bd31cb728e5fc6497c2117fe2f",
-        "preview_sha256": "45aebf1b3487d26e3d65d392208866bb08a264e274fcb9a7590867792f71a738",
         "bytes": 5472104,
         "duration_seconds": 38.0,
         "codec": "pcm_s24le",
@@ -38,9 +36,7 @@
       },
       "output": {
         "path": "examples/media/audio/example_en_edited.wav",
-        "preview_path": "examples/media/audio/example_en_edited.mp3",
         "sha256": "02609bdc2720079569c3e0b1a656a7c7623a8a7bea3dc251a0afd2cb7cae46e1",
-        "preview_sha256": "7e0b5cb9f794e569d22e7f668ccbcbd538a8486e1d7126aadfa296c8cd52a347",
         "bytes": 3937068,
         "duration_seconds": 27.340021,
         "codec": "pcm_s24le",
@@ -79,9 +75,7 @@
       "reference_build_implementation_sha256": "8b4b80d36ade4565f02cb65baff4f3a94214546e95eeaab6caa6e0cd8e26ea04",
       "input": {
         "path": "examples/media/audio/example_ru.wav",
-        "preview_path": "examples/media/audio/example_ru.mp3",
         "sha256": "4816c8735b70e0081db8a09796768d70ac19a28e4ae9c085d9f577699f715183",
-        "preview_sha256": "789a4c22b8175b9bba6e7d36e024354781e63328d3e437c1a9d2d56419773296",
         "bytes": 6732702,
         "duration_seconds": 35.065667,
         "codec": "pcm_f32le",
@@ -90,9 +84,7 @@
       },
       "output": {
         "path": "examples/media/audio/example_ru_edited.wav",
-        "preview_path": "examples/media/audio/example_ru_edited.mp3",
         "sha256": "566cc9705fcd9b6b9d8758c9034b61399a368e481f12adba6901d9c981bfda0b",
-        "preview_sha256": "a5537d2f458fcb677d52f9c333aa5347e78ec87106001f3ac6f4441c7fdbd1bd",
         "bytes": 3122048,
         "duration_seconds": 21.680167,
         "codec": "pcm_s24le",
@@ -161,9 +153,9 @@
       },
       "output": {
         "path": "examples/media/video/video_edited.mp4",
-        "sha256": "1db8049641bb702fec61e4647a2becfe61eb7351dfe346b038e7a2829ac88189",
-        "bytes": 3088820,
-        "duration_seconds": 23.1,
+        "sha256": "ae9ecdcf2cd380f04872b5a9ab70cfe1ca4d7ebc845311f70becfe53280e37ad",
+        "bytes": 3024846,
+        "duration_seconds": 23.781,
         "video_codec": "h264",
         "audio_codec": "aac",
         "width": 960,
@@ -172,11 +164,11 @@
         "channels": 2
       },
       "result": {
-        "removed_seconds": 7.15,
-        "duration_reduction_percent": 23.6364,
+        "removed_seconds": 6.469,
+        "duration_reduction_percent": 21.3851,
         "semantic_thoughts": 5,
         "selected_source_ranges": 6,
-        "alignment_resolved_boundaries": 8,
+        "alignment_resolved_boundaries": 6,
         "unsafe_boundaries": 0,
         "visual_policy": "normal-speed selected source video with clear cuts and no inserted frame holds"
       },
@@ -189,14 +181,8 @@
         },
         {
           "start_word_id": 42,
-          "end_word_id": 48,
-          "start_seconds": 16.400604,
-          "end_seconds": 18.420146
-        },
-        {
-          "start_word_id": 49,
           "end_word_id": 59,
-          "start_seconds": 19.100438,
+          "start_seconds": 16.400604,
           "end_seconds": 21.600625
         },
         {

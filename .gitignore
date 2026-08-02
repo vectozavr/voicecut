@@ -40,12 +40,8 @@ venv/
 # demo cache or an arbitrary personal recording cannot become trackable.
 !examples/media/audio/example_en.wav
 !examples/media/audio/example_en_edited.wav
-!examples/media/audio/example_en.mp3
-!examples/media/audio/example_en_edited.mp3
 !examples/media/audio/example_ru.wav
 !examples/media/audio/example_ru_edited.wav
-!examples/media/audio/example_ru.mp3
-!examples/media/audio/example_ru_edited.mp3
 !examples/media/video/video.mp4
 !examples/media/video/video_edited.mp4
 

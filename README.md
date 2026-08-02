@@ -27,15 +27,15 @@ manually repaired afterward.
 
 | Example | Original | VoiceCut result | What changed |
 | --- | --- | --- | --- |
-| English narration | [Listen to MP3](examples/media/audio/example_en.mp3) · [WAV](examples/media/audio/example_en.wav) · 38.00 s | [Listen to MP3](examples/media/audio/example_en_edited.mp3) · [WAV](examples/media/audio/example_en_edited.wav) · 27.34 s | False starts and a repeated phrase were removed; the complete intended take was retained. |
-| Russian narration | [Listen to MP3](examples/media/audio/example_ru.mp3) · [WAV](examples/media/audio/example_ru.wav) · 35.07 s | [Listen to MP3](examples/media/audio/example_ru_edited.mp3) · [WAV](examples/media/audio/example_ru_edited.wav) · 21.68 s | Abandoned attempts and repeated clauses were removed while the final explanation stayed intact. |
+| English narration | [Original WAV](examples/media/audio/example_en.wav) · 38.00 s | [Edited WAV](examples/media/audio/example_en_edited.wav) · 27.34 s | False starts and a repeated phrase were removed; the complete intended take was retained. |
+| Russian narration | [Original WAV](examples/media/audio/example_ru.wav) · 35.07 s | [Edited WAV](examples/media/audio/example_ru_edited.wav) · 21.68 s | Abandoned attempts and repeated clauses were removed while the final explanation stayed intact. |
 
 ### Video editing
 
 VoiceCut uses the selected speech intervals as the visual timeline. Video joins
 are direct cuts—no frozen frames or artificial pauses are inserted.
 
-| Before · 30.25 s | After · 23.10 s |
+| Before · 30.25 s | After · 23.78 s |
 | --- | --- |
 | [![Original video example](docs/assets/readme/video-before.jpg)](examples/media/video/video.mp4) | [![VoiceCut video result](docs/assets/readme/video-after.jpg)](examples/media/video/video_edited.mp4) |
 | [Play original MP4](examples/media/video/video.mp4) | [Play edited MP4](examples/media/video/video_edited.mp4) |

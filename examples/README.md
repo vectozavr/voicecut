@@ -11,9 +11,9 @@ keeps the selected narration and uses phone-safe source boundaries.
 
 | Example | Original | VoiceCut result | Duration | Reduction |
 | --- | --- | --- | ---: | ---: |
-| English narration | [MP3](media/audio/example_en.mp3) · [WAV](media/audio/example_en.wav) | [MP3](media/audio/example_en_edited.mp3) · [WAV](media/audio/example_en_edited.wav) | 38.00s → 27.34s | 28.1% |
-| Russian narration | [MP3](media/audio/example_ru.mp3) · [WAV](media/audio/example_ru.wav) | [MP3](media/audio/example_ru_edited.mp3) · [WAV](media/audio/example_ru_edited.wav) | 35.07s → 21.68s | 38.2% |
-| Video | [Original MP4](media/video/video.mp4) | [Edited MP4](media/video/video_edited.mp4) | 30.25s → 23.10s | 23.6% |
+| English narration | [Original WAV](media/audio/example_en.wav) | [Edited WAV](media/audio/example_en_edited.wav) | 38.00s → 27.34s | 28.1% |
+| Russian narration | [Original WAV](media/audio/example_ru.wav) | [Edited WAV](media/audio/example_ru_edited.wav) | 35.07s → 21.68s | 38.2% |
+| Video | [Original MP4](media/video/video.mp4) | [Edited MP4](media/video/video_edited.mp4) | 30.25s → 23.78s | 21.4% |
 
 The percentages describe duration reduction, not a quality score. A cloud
 planner may make a semantically equivalent selection on a later run, so a

@@ -3,9 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
-from collections import Counter
 from datetime import UTC, date, datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -14,59 +14,71 @@ from typing import Any
 GITHUB_API_VERSION = "2026-03-10"
 
 
-def _github_json(url: str, token: str) -> tuple[Any, dict[str, str]]:
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github.star+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "voicecut-star-history",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-        },
-    )
+def _read_json_url(url: str, token: str | None = None) -> Any:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "voicecut-star-history",
+    }
+    if token:
+        headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "X-GitHub-Api-Version": GITHUB_API_VERSION,
+            }
+        )
+    request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-        return payload, dict(response.headers.items())
+        return json.loads(response.read().decode("utf-8"))
 
 
-def _load_repository_history(repository: str, token: str) -> tuple[date, list[date]]:
+def _repository_snapshot(repository: str, token: str) -> tuple[date, int]:
     encoded_repository = urllib.parse.quote(repository, safe="/")
-    metadata, _ = _github_json(
+    metadata = _read_json_url(
         f"https://api.github.com/repos/{encoded_repository}", token
     )
     created_at = datetime.fromisoformat(metadata["created_at"].replace("Z", "+00:00"))
-    expected_star_count = int(metadata["stargazers_count"])
+    return created_at.astimezone(UTC).date(), int(metadata["stargazers_count"])
 
-    star_dates: list[date] = []
-    page = 1
-    while True:
-        stargazers, _ = _github_json(
-            "https://api.github.com/repos/"
-            f"{encoded_repository}/stargazers?per_page=100&page={page}",
-            token,
+
+def _parse_history(payload: Any, repository: str) -> dict[date, int]:
+    if not isinstance(payload, dict) or payload.get("repository") != repository:
+        raise ValueError("star history belongs to a different repository")
+    observations = payload.get("observations")
+    if not isinstance(observations, list):
+        raise ValueError("star history observations must be a list")
+
+    parsed: dict[date, int] = {}
+    for observation in observations:
+        if not isinstance(observation, dict):
+            raise ValueError("invalid star history observation")
+        observed_on = date.fromisoformat(str(observation["date"]))
+        star_count = int(observation["stars"])
+        if star_count < 0:
+            raise ValueError("star counts cannot be negative")
+        parsed[observed_on] = star_count
+    return parsed
+
+
+def _load_history(
+    repository: str,
+    seed_path: Path | None,
+    published_url: str | None,
+) -> dict[date, int]:
+    history: dict[date, int] = {}
+    if seed_path is not None:
+        history.update(
+            _parse_history(
+                json.loads(seed_path.read_text(encoding="utf-8")), repository
+            )
         )
-        if not isinstance(stargazers, list):
-            raise RuntimeError("GitHub returned an invalid stargazer response")
-        for stargazer in stargazers:
-            timestamp = stargazer.get("starred_at")
-            if not timestamp:
-                raise RuntimeError(
-                    "GitHub did not return stargazer timestamps; the workflow token "
-                    "must be allowed to read repository metadata"
-                )
-            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-            star_dates.append(parsed.astimezone(UTC).date())
-        if len(stargazers) < 100:
-            break
-        page += 1
-
-    if len(star_dates) != expected_star_count:
-        raise RuntimeError(
-            "GitHub returned incomplete stargazer history: "
-            f"expected {expected_star_count}, received {len(star_dates)}"
-        )
-
-    return created_at.astimezone(UTC).date(), sorted(star_dates)
+    if published_url:
+        try:
+            published = _read_json_url(published_url)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            print("Published star history is unavailable; continuing from the seed")
+        else:
+            history.update(_parse_history(published, repository))
+    return history
 
 
 def _x_coordinate(
@@ -85,8 +97,7 @@ def _date_label(value: date) -> str:
 
 def render_star_history_svg(
     repository: str,
-    created_at: date,
-    star_dates: list[date],
+    observations: list[tuple[date, int]],
     generated_at: date,
 ) -> str:
     width = 960
@@ -97,45 +108,34 @@ def render_star_history_svg(
     chart_height = 180
     chart_bottom = chart_top + chart_height
 
-    start = min([created_at, *star_dates, generated_at])
-    end = max([created_at, *star_dates, generated_at])
+    start = observations[0][0]
+    end = observations[-1][0]
     if end <= start:
         end = start + timedelta(days=1)
     span_days = max(1, (end - start).days)
-    final_count = len(star_dates)
-    y_maximum = max(1, final_count)
+    final_count = observations[-1][1]
+    y_maximum = max(1, *(value for _, value in observations))
 
-    daily_stars = Counter(star_dates)
+    first_day, first_count = observations[0]
     path_parts = [
         "M",
-        f"{_x_coordinate(start, start, span_days, chart_left, chart_width):.2f}",
-        f"{_y_coordinate(0, y_maximum, chart_top, chart_height):.2f}",
+        f"{_x_coordinate(first_day, start, span_days, chart_left, chart_width):.2f}",
+        f"{_y_coordinate(first_count, y_maximum, chart_top, chart_height):.2f}",
     ]
-    cumulative = 0
-    for day, added in sorted(daily_stars.items()):
-        x = _x_coordinate(day, start, span_days, chart_left, chart_width)
+    previous_count = first_count
+    for observed_on, count in observations[1:]:
+        x = _x_coordinate(observed_on, start, span_days, chart_left, chart_width)
         path_parts.extend(
             [
                 "L",
                 f"{x:.2f}",
-                f"{_y_coordinate(cumulative, y_maximum, chart_top, chart_height):.2f}",
-            ]
-        )
-        cumulative += added
-        path_parts.extend(
-            [
+                f"{_y_coordinate(previous_count, y_maximum, chart_top, chart_height):.2f}",
                 "L",
                 f"{x:.2f}",
-                f"{_y_coordinate(cumulative, y_maximum, chart_top, chart_height):.2f}",
+                f"{_y_coordinate(count, y_maximum, chart_top, chart_height):.2f}",
             ]
         )
-    path_parts.extend(
-        [
-            "L",
-            f"{_x_coordinate(end, start, span_days, chart_left, chart_width):.2f}",
-            f"{_y_coordinate(cumulative, y_maximum, chart_top, chart_height):.2f}",
-        ]
-    )
+        previous_count = count
 
     y_ticks = sorted({0, y_maximum // 2, y_maximum})
     grid_lines = []
@@ -159,7 +159,9 @@ def render_star_history_svg(
             f'font-size="13" fill="#64748b">{escape(_date_label(value))}</text>'
         )
 
-    final_x = _x_coordinate(end, start, span_days, chart_left, chart_width)
+    final_x = _x_coordinate(
+        observations[-1][0], start, span_days, chart_left, chart_width
+    )
     final_y = _y_coordinate(final_count, y_maximum, chart_top, chart_height)
     repository_label = escape(repository)
     updated_label = escape(_date_label(generated_at))
@@ -189,6 +191,11 @@ def main() -> None:
     parser.add_argument("--repository", required=True, help="GitHub owner/repository")
     parser.add_argument("--output", required=True, type=Path, help="output SVG path")
     parser.add_argument(
+        "--history-output", required=True, type=Path, help="updated history JSON path"
+    )
+    parser.add_argument("--history-url", help="previously published history JSON URL")
+    parser.add_argument("--seed", type=Path, help="repository history seed JSON")
+    parser.add_argument(
         "--token-env",
         default="GITHUB_TOKEN",
         help="environment variable containing the GitHub token",
@@ -197,22 +204,32 @@ def main() -> None:
 
     token = os.environ.get(args.token_env) or os.environ.get("GH_TOKEN")
     if not token:
-        raise RuntimeError(
-            f"{args.token_env} is required to read timestamped GitHub stargazers"
-        )
-    created_at, star_dates = _load_repository_history(args.repository, token)
+        raise RuntimeError(f"{args.token_env} is required to read repository metadata")
+
+    created_at, current_count = _repository_snapshot(args.repository, token)
+    history = _load_history(args.repository, args.seed, args.history_url)
+    history.setdefault(created_at, 0)
     generated_at = datetime.now(UTC).date()
-    svg = render_star_history_svg(
-        args.repository,
-        created_at,
-        star_dates,
-        generated_at,
-    )
+    history[generated_at] = current_count
+    observations = sorted(history.items())
+
+    svg = render_star_history_svg(args.repository, observations, generated_at)
+    history_payload = {
+        "repository": args.repository,
+        "observations": [
+            {"date": observed_on.isoformat(), "stars": count}
+            for observed_on, count in observations
+        ],
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(svg, encoding="utf-8")
-    count = len(star_dates)
-    star_label = "star" if count == 1 else "stars"
-    print(f"Star history built at {args.output} ({count} {star_label})")
+    args.history_output.parent.mkdir(parents=True, exist_ok=True)
+    args.history_output.write_text(
+        json.dumps(history_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    star_label = "star" if current_count == 1 else "stars"
+    print(f"Star history built at {args.output} ({current_count} {star_label})")
 
 
 if __name__ == "__main__":

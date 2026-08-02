@@ -8,6 +8,7 @@ on:
       - ".github/workflows/pages.yml"
       - "docs/demo/**"
       - "docs/assets/readme/pipeline.svg"
+      - "docs/assets/readme/star-history.json"
       - "docs/assets/readme/video-before.jpg"
       - "docs/assets/readme/video-after.jpg"
       - "examples/media/**"
@@ -50,6 +51,9 @@ jobs:
           python3 scripts/build_star_history.py
           --repository "${{ github.repository }}"
           --output .pages-site/assets/star-history.svg
+          --history-output .pages-site/assets/star-history.json
+          --history-url https://vectozavr.github.io/voicecut/assets/star-history.json
+          --seed docs/assets/readme/star-history.json
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

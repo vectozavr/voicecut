@@ -1,6 +1,4 @@
-# VoiceCut
-
-> Automatic narration editing for content creators.
+# VoiceCut — automatic narration editing for content creators
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-2f855a.svg)](LICENSE)
 [![Python 3.11–3.12](https://img.shields.io/badge/python-3.11%E2%80%933.12-3776ab.svg)](pyproject.toml)
@@ -16,34 +14,10 @@ renders audio once from the canonical source WAV before media publication.
 The project is in beta and currently targets narrated, single-speaker
 recordings on Apple Silicon Macs.
 
-## See it in action
+## Examples
 
-These are real VoiceCut runs from this repository. The edited files were
-produced by the normal production command with Gemini planning; they were not
-manually repaired afterward.
-
-> [**▶ Play every example in your browser**](https://vectozavr.github.io/voicecut/)
-> — compare the original and edited English audio, Russian audio, and video.
-
-[![Waveform comparison for the English and Russian audio examples](docs/assets/readme/audio-waveforms.svg)](examples/README.md)
-
-| Example | Original | VoiceCut result | What changed |
-| --- | --- | --- | --- |
-| English narration | [Original WAV](examples/media/audio/example_en.wav) · 38.00 s | [Edited WAV](examples/media/audio/example_en_edited.wav) · 27.34 s | False starts and a repeated phrase were removed; the complete intended take was retained. |
-| Russian narration | [Original WAV](examples/media/audio/example_ru.wav) · 35.07 s | [Edited WAV](examples/media/audio/example_ru_edited.wav) · 21.68 s | Abandoned attempts and repeated clauses were removed while the final explanation stayed intact. |
-
-### Video editing
-
-VoiceCut uses the selected speech intervals as the visual timeline. Video joins
-are direct cuts—no frozen frames or artificial pauses are inserted.
-
-| Before · 30.25 s | After · 23.78 s |
-| --- | --- |
-| [![Original video example](docs/assets/readme/video-before.jpg)](examples/media/video/video.mp4) | [![VoiceCut video result](docs/assets/readme/video-after.jpg)](examples/media/video/video_edited.mp4) |
-| [Play original MP4](examples/media/video/video.mp4) | [Play edited MP4](examples/media/video/video_edited.mp4) |
-
-Every example, its exact command, and a reproducibility manifest are in
-[examples/](examples/README.md).
+[Play the original and edited English audio, Russian audio, and video on the
+VoiceCut demo page.](https://vectozavr.github.io/voicecut/)
 
 ## Quick start
 
@@ -120,8 +94,6 @@ downloads and manual setup.
    output samples are written. Audio is sliced directly from the canonical
    source; video follows the same intervals with direct picture cuts.
 
-![Semantic selection and acoustic boundary resolution](docs/assets/readme/selection-boundaries.svg)
-
 For English, Respiro-en breath replacement is enabled by default and operates
 only inside MFA-confirmed non-speech using verified clean ambience copied from
 the same recording. It cannot alter retained phone samples; disable it with
@@ -194,7 +166,10 @@ MFA edit and its original pause content.
 - English and Russian are supported; language selection is explicit.
 - Video is edited from speech timing only. VoiceCut does not understand visual
   continuity, slides, gestures, or camera changes.
-- LLM planning is probabilistic. Review important exports before publication.
+- LLM planning is probabilistic and may occasionally select the wrong take.
+- MFA phone alignment can occasionally place a cut slightly too early or late,
+  especially around acronyms, technical terms, or tightly connected speech.
+  Review every final export before publication.
 - Local Qwen/Gemma planning remains experimental.
 - The first run downloads several model assets and can take time.
 
@@ -231,6 +206,10 @@ VoiceCut builds on
 [Silero VAD](https://github.com/snakers4/silero-vad), and
 [FFmpeg](https://ffmpeg.org/), together with the selected planner provider.
 See [credits and licensing details](docs/credits.md).
+
+## Star history
+
+[![VoiceCut GitHub stars over time](https://vectozavr.github.io/voicecut/assets/star-history.svg)](https://github.com/vectozavr/voicecut)
 
 ## License
 

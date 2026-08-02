@@ -29,6 +29,7 @@ from .planner_backends import (
 
 
 DEFAULT_WINDOW_SECONDS = 30.0
+SUPPORTED_LANGUAGES = ("en", "ru")
 
 
 class StreamingPlanError(RuntimeError):
@@ -250,15 +251,35 @@ def _debug_word_text(words: Sequence[TranscriptWord]) -> str:
     )
 
 
-def _normalized_anchor(text: str) -> str:
-    return "".join(
-        character
-        for character in unicodedata.normalize("NFKD", text).casefold()
-        if not unicodedata.combining(character) and character.isalnum()
-    )
+def _require_language(language: str) -> str:
+    normalized = language.strip().casefold()
+    if normalized not in SUPPORTED_LANGUAGES:
+        raise ValueError(
+            f"unsupported narration language {language!r}; expected one of "
+            f"{', '.join(SUPPORTED_LANGUAGES)}"
+        )
+    return normalized
 
 
-def _anchors_match(actual: str, expected: str) -> bool:
+def _normalized_anchor(text: str, *, language: str = "en") -> str:
+    language = _require_language(language)
+    if language == "ru":
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+    else:
+        normalized = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", text).casefold()
+            if not unicodedata.combining(character)
+        )
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def _anchors_match(
+    actual: str,
+    expected: str,
+    *,
+    language: str = "en",
+) -> bool:
     """Compare lexical anchors while preserving exact non-lexical anchors.
 
     Whisper occasionally emits standalone punctuation occurrences such as
@@ -273,8 +294,8 @@ def _anchors_match(actual: str, expected: str) -> bool:
     spoken word.
     """
 
-    actual_lexical = _normalized_anchor(actual)
-    expected_lexical = _normalized_anchor(expected)
+    actual_lexical = _normalized_anchor(actual, language=language)
+    expected_lexical = _normalized_anchor(expected, language=language)
     if actual_lexical or expected_lexical:
         return bool(actual_lexical) and actual_lexical == expected_lexical
     actual_literal = unicodedata.normalize("NFKC", actual).casefold().strip()
@@ -282,10 +303,10 @@ def _anchors_match(actual: str, expected: str) -> bool:
     return bool(actual_literal) and actual_literal == expected_literal
 
 
-def _compact_canonical_text(text: str) -> str:
+def _compact_canonical_text(text: str, *, language: str = "en") -> str:
     """Normalize punctuation, case, whitespace, and joined/split forms."""
 
-    return _normalized_anchor(text)
+    return _normalized_anchor(text, language=language)
 
 
 def _phonetic_key(text: str) -> str:
@@ -310,13 +331,24 @@ def _phonetic_key(text: str) -> str:
 def _token_group_similarity(
     canonical_tokens: Sequence[str],
     source_tokens: Sequence[str],
+    *,
+    language: str = "en",
 ) -> float | None:
+    language = _require_language(language)
     canonical = "".join(canonical_tokens)
     source = "".join(source_tokens)
     if not canonical or not source:
         return None
     if canonical == source:
         return 1.0
+    # Russian ASR commonly loses the written е/ё distinction even when the
+    # spoken occurrence is unambiguous.  Treat only that single orthographic
+    # distinction as equivalent; broader fuzzy Cyrillic matching could hide a
+    # genuinely different inflection or content word.
+    if language == "ru":
+        if canonical.replace("ё", "е") == source.replace("ё", "е"):
+            return 0.99
+        return None
     lexical = SequenceMatcher(None, canonical, source).ratio()
     if canonical[0] == source[0] and lexical >= 0.78:
         return lexical
@@ -341,11 +373,13 @@ def _token_group_similarity(
 
 def _source_token_ledger(
     words: Sequence[TranscriptWord],
+    *,
+    language: str = "en",
 ) -> tuple[list[str], list[int]]:
     source_tokens: list[str] = []
     source_owners: list[int] = []
     for word in words:
-        for token in tokenize(word.text):
+        for token in tokenize(word.text, language=language):
             source_tokens.append(token)
             source_owners.append(word.id)
     return source_tokens, source_owners
@@ -354,6 +388,8 @@ def _source_token_ledger(
 def _first_unsupported_token(
     canonical_tokens: Sequence[str],
     source_tokens: Sequence[str],
+    *,
+    language: str = "en",
 ) -> str:
     source_cursor = 0
     for canonical_index, canonical_token in enumerate(canonical_tokens):
@@ -372,6 +408,7 @@ def _first_unsupported_token(
                     _token_group_similarity(
                         [canonical_token],
                         source_tokens[source_start:source_end],
+                        language=language,
                     )
                     is not None
                 ):
@@ -389,11 +426,15 @@ def _align_range_canonical_text(
     *,
     range_words: Sequence[TranscriptWord],
     canonical_text: str,
+    language: str = "en",
 ) -> tuple[tuple[dict[str, Any], ...], list[str]]:
     """Monotonically support every canonical token inside one fixed range."""
 
-    canonical_tokens = tokenize(canonical_text)
-    source_tokens, source_owners = _source_token_ledger(range_words)
+    canonical_tokens = tokenize(canonical_text, language=language)
+    source_tokens, source_owners = _source_token_ledger(
+        range_words,
+        language=language,
+    )
     if not canonical_tokens:
         raise DecisionValidationError("range canonical_text has no spoken tokens")
     if not source_tokens:
@@ -435,6 +476,7 @@ def _align_range_canonical_text(
                 similarity = _token_group_similarity(
                     canonical_tokens[canonical_index:canonical_end],
                     source_tokens[source_index:source_end],
+                    language=language,
                 )
                 if similarity is None:
                     continue
@@ -464,6 +506,7 @@ def _align_range_canonical_text(
         unsupported = _first_unsupported_token(
             canonical_tokens,
             source_tokens,
+            language=language,
         )
         return (), [unsupported]
 
@@ -519,6 +562,7 @@ def _unsupported_token_error(
     pending_words: Sequence[TranscriptWord],
     thought_index: int,
     range_index: int,
+    language: str = "en",
 ) -> SourceGroundingValidationError:
     final_source_word = range_words[-1]
     word_by_id = {word.id: word for word in pending_words}
@@ -528,7 +572,8 @@ def _unsupported_token_error(
         outside is not None
         and _token_group_similarity(
             [unsupported_token],
-            tokenize(outside.text),
+            tokenize(outside.text, language=language),
+            language=language,
         )
         is not None
     ):
@@ -570,7 +615,9 @@ def _prompt(
     pending_words: Sequence[TranscriptWord],
     committed_thoughts: Sequence[dict[str, Any]],
     final_pass: bool,
+    language: str = "en",
 ) -> str:
+    language = _require_language(language)
     committed_context = [
         str(thought["canonical_text"]) for thought in committed_thoughts[-4:]
     ]
@@ -585,7 +632,21 @@ def _prompt(
             "evidence that the speaker moved on."
         )
     )
+    language_instruction = (
+        "SOURCE LANGUAGE: Russian (ru). Keep every canonical_text value in "
+        "Russian. Preserve Cyrillic spelling, including the distinction "
+        "between е and ё. Do not translate, transliterate, or replace Russian "
+        "narration with English. Latin technical terms may remain Latin only "
+        "when they are present in the source occurrences."
+        if language == "ru"
+        else (
+            "SOURCE LANGUAGE: English (en). Keep every canonical_text value "
+            "in English and do not translate the narration."
+        )
+    )
     return f"""Plan a narration edit from exact Whisper word occurrences.
+
+{language_instruction}
 
 {phase}
 
@@ -734,8 +795,11 @@ def validate_decision(
     pending_words: Sequence[TranscriptWord],
     final_pass: bool,
     committed_source_end: int,
+    language: str = "en",
 ) -> PlannerDecision:
     """Parse and enforce source/commitment invariants."""
+
+    language = _require_language(language)
 
     try:
         value = json.loads(raw.strip())
@@ -781,7 +845,8 @@ def validate_decision(
                         min(visible_end, raw_pending_start + 24),
                     )
                 ]
-            )
+            ),
+            language=language,
         )
         for thought_index, raw_thought in enumerate(raw_finalized):
             canonical_value = (
@@ -791,7 +856,7 @@ def validate_decision(
             )
             if not isinstance(canonical_value, str):
                 continue
-            finalized_tokens = tokenize(canonical_value)
+            finalized_tokens = tokenize(canonical_value, language=language)
             match = SequenceMatcher(
                 None,
                 finalized_tokens,
@@ -882,12 +947,20 @@ def validate_decision(
                     )
             expected_first = pending_word_by_id[first_word_id].text
             expected_last = pending_word_by_id[last_word_id].text
-            if not _anchors_match(first_word, expected_first):
+            if not _anchors_match(
+                first_word,
+                expected_first,
+                language=language,
+            ):
                 raise DecisionValidationError(
                     f'first_word anchor "{first_word}" does not match source '
                     f'word {first_word_id} "{expected_first}"'
                 )
-            if not _anchors_match(last_word, expected_last):
+            if not _anchors_match(
+                last_word,
+                expected_last,
+                language=language,
+            ):
                 raise DecisionValidationError(
                     f'last_word anchor "{last_word}" does not match source '
                     f'word {last_word_id} "{expected_last}"'
@@ -896,6 +969,7 @@ def validate_decision(
             token_support, unsupported_tokens = _align_range_canonical_text(
                 range_words=range_words,
                 canonical_text=range_canonical_text.strip(),
+                language=language,
             )
             if unsupported_tokens:
                 raise _unsupported_token_error(
@@ -906,8 +980,11 @@ def validate_decision(
                     pending_words=pending_words,
                     thought_index=thought_index,
                     range_index=range_index,
+                    language=language,
                 )
-            canonical_token_count = len(tokenize(range_canonical_text))
+            canonical_token_count = len(
+                tokenize(range_canonical_text, language=language)
+            )
             supported_token_count = len(
                 {int(item["canonical_token_index"]) for item in token_support}
             )
@@ -915,7 +992,9 @@ def validate_decision(
                 missing = next(
                     (
                         token
-                        for index, token in enumerate(tokenize(range_canonical_text))
+                        for index, token in enumerate(
+                            tokenize(range_canonical_text, language=language)
+                        )
                         if index
                         not in {
                             int(item["canonical_token_index"]) for item in token_support
@@ -931,8 +1010,12 @@ def validate_decision(
                     pending_words=pending_words,
                     thought_index=thought_index,
                     range_index=range_index,
+                    language=language,
                 )
-            source_tokens, source_owners = _source_token_ledger(range_words)
+            source_tokens, source_owners = _source_token_ledger(
+                range_words,
+                language=language,
+            )
             represented_source_indices = {
                 int(source_index)
                 for item in token_support
@@ -1006,8 +1089,12 @@ def validate_decision(
         joined_range_text = " ".join(
             source_range.canonical_text for source_range in ranges
         )
-        if _compact_canonical_text(canonical_text) != _compact_canonical_text(
-            joined_range_text
+        if _compact_canonical_text(
+            canonical_text,
+            language=language,
+        ) != _compact_canonical_text(
+            joined_range_text,
+            language=language,
         ):
             raise DecisionValidationError(
                 f"finalized[{thought_index}].canonical_text does not equal "
@@ -1015,7 +1102,7 @@ def validate_decision(
                 "punctuation, whitespace, capitalization, and joined/split "
                 "normalization"
             )
-        thought_token_count = len(tokenize(canonical_text))
+        thought_token_count = len(tokenize(canonical_text, language=language))
         finalized.append(
             FinalizedThought(
                 canonical_text=canonical_text.strip(),
@@ -1026,6 +1113,7 @@ def validate_decision(
                     "supported_tokens": thought_token_count,
                     "unsupported_tokens": [],
                     "status": "valid",
+                    "language": language,
                     "source_ranges": range_reports,
                 },
             )
@@ -1102,6 +1190,7 @@ def _request_validated_decision(
     iteration: int,
     output_dir: Path,
     decision_validator: Callable[[PlannerDecision], None] | None = None,
+    language: str = "en",
 ) -> tuple[PlannerDecision, list[dict[str, Any]]]:
     schema = streaming_response_schema()
     attempts: list[dict[str, Any]] = []
@@ -1121,6 +1210,7 @@ def _request_validated_decision(
                 pending_words=pending_words,
                 final_pass=final_pass,
                 committed_source_end=committed_source_end,
+                language=language,
             )
             if decision_validator is not None:
                 decision_validator(decision)
@@ -1192,6 +1282,8 @@ def _request_validated_decision(
 
 def _exact_source_passthrough_thought(
     words: Sequence[TranscriptWord],
+    *,
+    language: str = "en",
 ) -> FinalizedThought:
     """Create a contiguous thought whose text is copied exactly from source.
 
@@ -1209,7 +1301,11 @@ def _exact_source_passthrough_thought(
             )
 
     canonical_text = _word_text(words)
-    source_tokens, source_owners = _source_token_ledger(words)
+    language = _require_language(language)
+    source_tokens, source_owners = _source_token_ledger(
+        words,
+        language=language,
+    )
     token_support = tuple(
         {
             "canonical_token_index": token_index,
@@ -1242,6 +1338,7 @@ def _exact_source_passthrough_thought(
             "supported_tokens": len(source_tokens),
             "unsupported_tokens": [],
             "status": "valid",
+            "language": language,
             "grounding_mode": "deterministic_exact_source_passthrough",
             "source_ranges": [
                 {
@@ -1277,6 +1374,7 @@ def _source_passthrough_decision(
     attempts: Sequence[dict[str, Any]],
     reason: str,
     grounding_failure: dict[str, Any] | None,
+    language: str = "en",
 ) -> tuple[PlannerDecision, list[dict[str, Any]], dict[str, Any]]:
     """Fail soft after a request failure while retaining one look-ahead window."""
 
@@ -1327,7 +1425,7 @@ def _source_passthrough_decision(
         )
 
     finalized = (
-        (_exact_source_passthrough_thought(passthrough_words),)
+        (_exact_source_passthrough_thought(passthrough_words, language=language),)
         if passthrough_words
         else ()
     )
@@ -1382,6 +1480,7 @@ def _passthrough_after_request_failure(
     window_seconds: float,
     iteration: int,
     output_dir: Path,
+    language: str = "en",
 ) -> tuple[PlannerDecision, list[dict[str, Any]], dict[str, Any]]:
     """Fail soft after two invalid or failed backend attempts."""
 
@@ -1408,6 +1507,7 @@ def _passthrough_after_request_failure(
         grounding_failure=(
             grounding_failure if isinstance(grounding_failure, dict) else None
         ),
+        language=language,
     )
 
 
@@ -1459,7 +1559,9 @@ def _acoustic_repair_prompt(
     unsafe_boundaries: Sequence[dict[str, Any]],
     previous_context: str | None,
     next_context: str | None,
+    language: str = "en",
 ) -> str:
+    language = _require_language(language)
     boundary_summary = []
     for boundary in unsafe_boundaries:
         boundary_summary.append(
@@ -1476,7 +1578,15 @@ def _acoustic_repair_prompt(
                 "reason": boundary.get("error"),
             }
         )
+    language_instruction = (
+        "The source narration is Russian. Return canonical text in Russian, "
+        "preserve Cyrillic and ё, and do not translate or transliterate it."
+        if language == "ru"
+        else "The source narration is English. Keep canonical text in English."
+    )
     return f"""Repair one source-grounded narration thought after acoustic validation.
+
+{language_instruction}
 
 The original semantic decision was meaningful, but its exact occurrence layout
 requires a cut where retained and omitted speech touch. The renderer correctly
@@ -1536,14 +1646,18 @@ def _validate_acoustic_repair_decision(
     *,
     original_thought: dict[str, Any],
     unsafe_boundaries: Sequence[dict[str, Any]],
+    language: str = "en",
 ) -> None:
     if len(decision.finalized) != 1:
         raise DecisionValidationError(
             "acoustic repair must return exactly one replacement thought"
         )
     replacement = decision.finalized[0]
-    original_tokens = tokenize(str(original_thought["canonical_text"]))
-    replacement_tokens = tokenize(replacement.canonical_text)
+    original_tokens = tokenize(
+        str(original_thought["canonical_text"]),
+        language=language,
+    )
+    replacement_tokens = tokenize(replacement.canonical_text, language=language)
     if not original_tokens or not replacement_tokens:
         raise DecisionValidationError("acoustic repair returned empty narration")
     matcher = SequenceMatcher(
@@ -1676,6 +1790,7 @@ def repair_plan_for_acoustic_safety(
         raise StreamingPlanError(
             "acoustic repair backend must match the original semantic planner"
         )
+    language = _require_language(str(plan.get("language", "en")))
     words = _words_from_complete_plan(plan)
     raw_thoughts = plan.get("committed")
     if not isinstance(raw_thoughts, list) or not raw_thoughts:
@@ -1816,6 +1931,7 @@ def repair_plan_for_acoustic_safety(
                 if thought_index + 1 < len(committed)
                 else None
             ),
+            language=language,
         )
         request_iteration = 10_000 + retry_index * 100 + thought_index
         try:
@@ -1827,11 +1943,13 @@ def repair_plan_for_acoustic_safety(
                 committed_source_end=context_start,
                 iteration=request_iteration,
                 output_dir=output_dir,
+                language=language,
                 decision_validator=lambda value, original=original_thought, constraints=(tuple(thought_constraints)): (
                     _validate_acoustic_repair_decision(
                         value,
                         original_thought=original,
                         unsafe_boundaries=constraints,
+                        language=language,
                     )
                 ),
             )
@@ -1980,6 +2098,7 @@ def repair_plan_for_acoustic_safety(
             else []
         ),
         status="complete",
+        language=language,
     )
     grounding["acoustic_repair_index"] = retry_index
     grounding["acoustic_repairs"] = repair_records
@@ -2029,6 +2148,7 @@ def build_conservative_delivery_plan(
         raise StreamingPlanError("delivery fallback requires a complete plan")
     if not isinstance(boundary_plan, dict) or boundary_plan.get("status") != "unsafe":
         raise StreamingPlanError("delivery fallback requires an unsafe boundary plan")
+    language = _require_language(str(plan.get("language", "en")))
     words = _words_from_complete_plan(plan)
     committed_value = plan.get("committed")
     intervals = boundary_plan.get("source_intervals")
@@ -2187,6 +2307,7 @@ def build_conservative_delivery_plan(
         pending_words=words,
         final_pass=True,
         committed_source_end=0,
+        language=language,
     )
     serialized = _serialize_decision(decision)
     fallback_committed = serialized["finalized"]
@@ -2241,6 +2362,7 @@ def build_conservative_delivery_plan(
             else []
         ),
         status="complete",
+        language=language,
     )
     grounding["delivery_fallback"] = fallback_record
     write_json(output_dir / "grounding_validation.json", grounding)
@@ -2296,7 +2418,9 @@ def _grounding_validation_document(
     status: str,
     error: str | None = None,
     grounding_failures: Sequence[dict[str, Any]] = (),
+    language: str = "en",
 ) -> dict[str, Any]:
+    language = _require_language(language)
     thoughts: list[dict[str, Any]] = []
     for thought_index, thought in enumerate(committed_thoughts):
         raw_validation = thought.get("grounding_validation")
@@ -2349,6 +2473,7 @@ def _grounding_validation_document(
     return {
         "schema_version": 1,
         "validator": "strict_bidirectional_range_source_grounding_v2",
+        "language": language,
         "status": (
             "valid"
             if status == "complete"
@@ -2421,9 +2546,11 @@ def run_streaming_planner(
     output_dir: Path,
     backend: NarrationPlannerBackend,
     window_seconds: float = DEFAULT_WINDOW_SECONDS,
+    language: str = "en",
 ) -> dict[str, Any]:
     """Run chronological look-ahead planning and save its full ledger."""
 
+    language = _require_language(language)
     if not math.isfinite(window_seconds) or window_seconds <= 0.0:
         raise ValueError("window_seconds must be finite and positive")
     transcript_path = transcript_path.resolve()
@@ -2440,6 +2567,17 @@ def run_streaming_planner(
     if not isinstance(transcript_data, dict):
         raise ValueError("Whisper transcript root must be an object")
     words = load_transcript_words(transcript_data)
+    transcript_language = transcript_data.get("language")
+    if (
+        isinstance(transcript_language, str)
+        and transcript_language.strip()
+        and transcript_language.strip().casefold() != language
+    ):
+        raise ValueError(
+            "streaming planner language does not match source transcript: "
+            f"requested {language!r}, transcript declares "
+            f"{transcript_language!r}"
+        )
     word_by_id = {word.id: word for word in words}
 
     committed_words: list[TranscriptWord] = []
@@ -2461,6 +2599,16 @@ def run_streaming_planner(
             "status": status,
             "backend": backend.backend_name,
             "model": backend.model,
+            "language": language,
+            "language_provenance": {
+                "planner_language": language,
+                "source_transcript_language": (
+                    transcript_language.strip().casefold()
+                    if isinstance(transcript_language, str)
+                    and transcript_language.strip()
+                    else None
+                ),
+            },
             "transcript": str(transcript_path),
             "transcript_sha256": sha256_file(transcript_path),
             "grounding_validation": str(output_dir / "grounding_validation.json"),
@@ -2506,6 +2654,7 @@ def run_streaming_planner(
                 pending_words=complete_pending_input,
                 committed_thoughts=committed_thoughts,
                 final_pass=False,
+                language=language,
             )
             committed_before = _fingerprint(committed_thoughts)
             fallback: dict[str, Any] | None = None
@@ -2519,6 +2668,7 @@ def run_streaming_planner(
                     committed_source_end=committed_source_end,
                     iteration=iteration,
                     output_dir=output_dir,
+                    language=language,
                 )
             except StreamingPlanError:
                 request_failed = True
@@ -2529,6 +2679,7 @@ def run_streaming_planner(
                     window_seconds=window_seconds,
                     iteration=iteration,
                     output_dir=output_dir,
+                    language=language,
                 )
                 fallback_records.append(fallback)
             if request_failed:
@@ -2625,6 +2776,7 @@ def run_streaming_planner(
                     committed_thoughts=committed_thoughts,
                     iterations=iterations,
                     status="in_progress",
+                    language=language,
                 ),
             )
             _print_iteration(debug, backend_name=backend.backend_name)
@@ -2636,6 +2788,7 @@ def run_streaming_planner(
             pending_words=final_pending_input,
             committed_thoughts=committed_thoughts,
             final_pass=True,
+            language=language,
         )
         committed_before = _fingerprint(committed_thoughts)
         fallback = None
@@ -2649,6 +2802,7 @@ def run_streaming_planner(
                 committed_source_end=committed_source_end,
                 iteration=iteration,
                 output_dir=output_dir,
+                language=language,
             )
         except StreamingPlanError:
             request_failed = True
@@ -2659,6 +2813,7 @@ def run_streaming_planner(
                 window_seconds=window_seconds,
                 iteration=iteration,
                 output_dir=output_dir,
+                language=language,
             )
             fallback_records.append(fallback)
         # A valid empty EOF decision is an intentional semantic decision: the
@@ -2726,6 +2881,7 @@ def run_streaming_planner(
             committed_thoughts=committed_thoughts,
             iterations=iterations,
             status="complete",
+            language=language,
         )
         write_json(
             output_dir / "grounding_validation.json",
@@ -2770,6 +2926,7 @@ def run_streaming_planner(
                 status="failed",
                 error=error_text,
                 grounding_failures=grounding_failures,
+                language=language,
             ),
         )
         raise
@@ -2786,6 +2943,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-plan", action="store_true")
     parser.add_argument("--transcript", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGES,
+        default="en",
+        help="Source narration language used for prompting and grounding.",
+    )
     add_planner_backend_arguments(parser)
     parser.add_argument(
         "--window-seconds",
@@ -2828,6 +2991,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             output_dir=args.output_dir,
             backend=backend,
             window_seconds=args.window_seconds,
+            language=args.language,
         )
     finally:
         backend.close()
@@ -2837,6 +3001,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "status": plan["status"],
                 "backend": plan["backend"],
                 "model": plan["model"],
+                "language": plan["language"],
                 "plan": str((args.output_dir.resolve() / "streaming_plan.json")),
                 "reconstructed_narration": plan["reconstructed_narration"],
             },

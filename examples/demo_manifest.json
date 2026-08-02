@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "description": "Sanitized provenance for the public VoiceCut before/after examples.",
+  "repository_state": {
+    "kind": "voicecut_implementation_sha256",
+    "value": "fc0025a7a7f568d01d3f509b40491d5293d2722348806349661199dc551e5685",
+    "note": "An implementation fingerprint is recorded instead of claiming an exact Git revision because the reference renders were produced from a working source tree."
+  },
+  "planner": {
+    "backend": "gemini",
+    "model": "gemini-3.6-flash",
+    "api_key_environment_variable": "GEMINI_API_KEY"
+  },
+  "privacy": {
+    "absolute_paths_included": false,
+    "api_keys_included": false,
+    "raw_model_responses_included": false,
+    "private_work_directories_included": false
+  },
+  "examples": [
+    {
+      "id": "english_audio",
+      "title": "English narration",
+      "kind": "audio",
+      "language": "en",
+      "command": "voicecut examples/media/audio/example_en.wav -o examples/generated/work/example_en/example_en_edited.wav --language en --planner-backend gemini --work-dir examples/generated/work/example_en/cache --overwrite",
+      "reference_build_implementation_sha256": "fc0025a7a7f568d01d3f509b40491d5293d2722348806349661199dc551e5685",
+      "input": {
+        "path": "examples/media/audio/example_en.wav",
+        "preview_path": "examples/media/audio/example_en.mp3",
+        "sha256": "74124be48fb08a4ce17a9fcf0e20bbbae1aae4bd31cb728e5fc6497c2117fe2f",
+        "preview_sha256": "45aebf1b3487d26e3d65d392208866bb08a264e274fcb9a7590867792f71a738",
+        "bytes": 5472104,
+        "duration_seconds": 38.0,
+        "codec": "pcm_s24le",
+        "sample_rate": 48000,
+        "channels": 1
+      },
+      "output": {
+        "path": "examples/media/audio/example_en_edited.wav",
+        "preview_path": "examples/media/audio/example_en_edited.mp3",
+        "sha256": "02609bdc2720079569c3e0b1a656a7c7623a8a7bea3dc251a0afd2cb7cae46e1",
+        "preview_sha256": "7e0b5cb9f794e569d22e7f668ccbcbd538a8486e1d7126aadfa296c8cd52a347",
+        "bytes": 3937068,
+        "duration_seconds": 27.340021,
+        "codec": "pcm_s24le",
+        "sample_rate": 48000,
+        "channels": 1
+      },
+      "result": {
+        "removed_seconds": 10.659979,
+        "duration_reduction_percent": 28.0526,
+        "semantic_thoughts": 6,
+        "selected_source_ranges": 7,
+        "alignment_resolved_boundaries": 4,
+        "unsafe_boundaries": 0
+      },
+      "selected_source_intervals": [
+        {
+          "start_word_id": 14,
+          "end_word_id": 32,
+          "start_seconds": 9.68,
+          "end_seconds": 15.040271
+        },
+        {
+          "start_word_id": 34,
+          "end_word_id": 91,
+          "start_seconds": 15.850271,
+          "end_seconds": 37.670021
+        }
+      ]
+    },
+    {
+      "id": "russian_audio",
+      "title": "Russian narration",
+      "kind": "audio",
+      "language": "ru",
+      "command": "voicecut examples/media/audio/example_ru.wav -o examples/generated/work/example_ru/example_ru_edited.wav --language ru --planner-backend gemini --work-dir examples/generated/work/example_ru/cache --overwrite",
+      "reference_build_implementation_sha256": "8b4b80d36ade4565f02cb65baff4f3a94214546e95eeaab6caa6e0cd8e26ea04",
+      "input": {
+        "path": "examples/media/audio/example_ru.wav",
+        "preview_path": "examples/media/audio/example_ru.mp3",
+        "sha256": "4816c8735b70e0081db8a09796768d70ac19a28e4ae9c085d9f577699f715183",
+        "preview_sha256": "789a4c22b8175b9bba6e7d36e024354781e63328d3e437c1a9d2d56419773296",
+        "bytes": 6732702,
+        "duration_seconds": 35.065667,
+        "codec": "pcm_f32le",
+        "sample_rate": 48000,
+        "channels": 1
+      },
+      "output": {
+        "path": "examples/media/audio/example_ru_edited.wav",
+        "preview_path": "examples/media/audio/example_ru_edited.mp3",
+        "sha256": "566cc9705fcd9b6b9d8758c9034b61399a368e481f12adba6901d9c981bfda0b",
+        "preview_sha256": "a5537d2f458fcb677d52f9c333aa5347e78ec87106001f3ac6f4441c7fdbd1bd",
+        "bytes": 3122048,
+        "duration_seconds": 21.680167,
+        "codec": "pcm_s24le",
+        "sample_rate": 48000,
+        "channels": 1
+      },
+      "result": {
+        "removed_seconds": 13.3855,
+        "duration_reduction_percent": 38.1727,
+        "semantic_thoughts": 5,
+        "selected_source_ranges": 7,
+        "alignment_resolved_boundaries": 9,
+        "unsafe_boundaries": 0
+      },
+      "selected_source_intervals": [
+        {
+          "start_word_id": 0,
+          "end_word_id": 9,
+          "start_seconds": 0.0,
+          "end_seconds": 4.010292
+        },
+        {
+          "start_word_id": 14,
+          "end_word_id": 22,
+          "start_seconds": 6.5,
+          "end_seconds": 9.46
+        },
+        {
+          "start_word_id": 26,
+          "end_word_id": 30,
+          "start_seconds": 11.971063,
+          "end_seconds": 13.710938
+        },
+        {
+          "start_word_id": 35,
+          "end_word_id": 39,
+          "start_seconds": 17.370458,
+          "end_seconds": 18.770021
+        },
+        {
+          "start_word_id": 45,
+          "end_word_id": 69,
+          "start_seconds": 23.249583,
+          "end_seconds": 34.820021
+        }
+      ]
+    },
+    {
+      "id": "video",
+      "title": "Video with narration-driven cuts",
+      "kind": "video",
+      "language": "en",
+      "command": "voicecut examples/media/video/video.mp4 -o examples/generated/work/video/video_edited.mp4 --language en --planner-backend gemini --work-dir examples/generated/work/video/cache --overwrite",
+      "reference_build_implementation_sha256": "fc0025a7a7f568d01d3f509b40491d5293d2722348806349661199dc551e5685",
+      "input": {
+        "path": "examples/media/video/video.mp4",
+        "sha256": "67616a4f8654a7aa022437be94456535e9d4ce804d611440b3472314dd7b4819",
+        "bytes": 1811150,
+        "duration_seconds": 30.25,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "width": 960,
+        "height": 540,
+        "sample_rate": 48000,
+        "channels": 2
+      },
+      "output": {
+        "path": "examples/media/video/video_edited.mp4",
+        "sha256": "1db8049641bb702fec61e4647a2becfe61eb7351dfe346b038e7a2829ac88189",
+        "bytes": 3088820,
+        "duration_seconds": 23.1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "width": 960,
+        "height": 540,
+        "sample_rate": 48000,
+        "channels": 2
+      },
+      "result": {
+        "removed_seconds": 7.15,
+        "duration_reduction_percent": 23.6364,
+        "semantic_thoughts": 5,
+        "selected_source_ranges": 6,
+        "alignment_resolved_boundaries": 8,
+        "unsafe_boundaries": 0,
+        "visual_policy": "normal-speed selected source video with clear cuts and no inserted frame holds"
+      },
+      "selected_source_intervals": [
+        {
+          "start_word_id": 3,
+          "end_word_id": 41,
+          "start_seconds": 2.510021,
+          "end_seconds": 14.979625
+        },
+        {
+          "start_word_id": 42,
+          "end_word_id": 48,
+          "start_seconds": 16.400604,
+          "end_seconds": 18.420146
+        },
+        {
+          "start_word_id": 49,
+          "end_word_id": 59,
+          "start_seconds": 19.100438,
+          "end_seconds": 21.600625
+        },
+        {
+          "start_word_id": 65,
+          "end_word_id": 83,
+          "start_seconds": 24.139354,
+          "end_seconds": 30.250667
+        }
+      ]
+    }
+  ]
+}

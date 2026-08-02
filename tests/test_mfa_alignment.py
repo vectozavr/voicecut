@@ -10,6 +10,7 @@ import pytest
 import soundfile as sf
 
 from voicecut.common import read_json
+from voicecut.language_profiles import get_language_profile
 from voicecut.mfa_alignment import (
     MFA_MODEL_ID,
     MFA_VERSION,
@@ -60,6 +61,8 @@ def _prepare(
     crop_start: float = 0.5,
     crop_end: float = 2.5,
     token_mappings: tuple[MFATokenMapping, ...] | None = None,
+    language: str = "en",
+    model_id: str | None = None,
 ) -> MFABatchPaths:
     audio_path = tmp_path / "source.wav"
     _write_source(audio_path)
@@ -80,6 +83,8 @@ def _prepare(
             }
         ],
         work_dir=tmp_path / "work",
+        language=language,
+        model_id=model_id,
     )
 
 
@@ -503,6 +508,110 @@ def test_normalize_source_words_preserves_one_to_many_mapping() -> None:
     assert [mapping.source_word_ids for mapping in mappings] == [(7,), (7,), (8,)]
     assert all(mapping.source_text == "Voice-Cut" for mapping in mappings[:2])
     assert nonlexical == (9,)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Ёжик", ("ёжик",)),
+        ("Всё?!", ("всё",)),
+        ("кто-то", ("кто", "то")),
+        ("50%", ("50", "процент")),
+        ("модель & GPU", ("модель", "и", "gpu")),
+    ],
+)
+def test_normalize_mfa_token_is_cyrillic_safe_for_russian(
+    source: str,
+    expected: tuple[str, ...],
+) -> None:
+    assert normalize_mfa_token(source, language="ru") == expected
+
+
+def test_prepare_russian_batch_preserves_unicode_and_pinned_model(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_source(audio_path)
+    profile = get_language_profile("ru")
+
+    paths = prepare_mfa_batch(
+        audio_path=audio_path,
+        contexts=[
+            {
+                "context_id": "context_ru",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [
+                    _word(0, "Всё", 0.8, 1.1),
+                    _word(1, "хорошо!", 1.2, 1.7),
+                ],
+                "boundary_ids": ["gap_ru"],
+            }
+        ],
+        work_dir=tmp_path / "work",
+        language="ru",
+        model_id=profile.mfa_model,
+    )
+
+    assert (paths.speaker_corpus / "context_ru.lab").read_text(
+        encoding="utf-8"
+    ) == "всё хорошо\n"
+    batch = read_json(paths.metadata / "batch.json")
+    assert batch["language"] == "ru"
+    assert batch["model_id"] == profile.mfa_model
+
+
+def test_russian_model_is_used_by_explicit_mfa_command(tmp_path: Path) -> None:
+    profile = get_language_profile("ru")
+    paths = MFABatchPaths(
+        root=tmp_path,
+        corpus=tmp_path / "corpus",
+        metadata=tmp_path / "metadata",
+        output=tmp_path / "output",
+        temporary=tmp_path / "temp",
+    )
+
+    command = build_mfa_align_command(paths=paths, model_id=profile.mfa_model)
+
+    assert command[7] == profile.mfa_model
+
+
+def test_parse_russian_batch_validates_model_and_maps_cyrillic(
+    tmp_path: Path,
+) -> None:
+    profile = get_language_profile("ru")
+    paths = _prepare(
+        tmp_path,
+        words=[_word(30, "Привет!", 0.8, 1.3)],
+        language="ru",
+        model_id=profile.mfa_model,
+    )
+    _write_mfa_json(
+        paths,
+        word_entries=[
+            [0.0, 0.3, "<eps>"],
+            [0.3, 0.9, "привет"],
+            [0.9, 2.0, "<eps>"],
+        ],
+        phone_entries=[
+            [0.0, 0.3, "sil"],
+            [0.3, 0.6, "p"],
+            [0.6, 0.9, "t"],
+            [0.9, 2.0, "sil"],
+        ],
+    )
+
+    result = parse_mfa_batch(
+        paths,
+        language="ru",
+        model_id=profile.mfa_model,
+    )
+
+    assert result["language"] == "ru"
+    assert result["model_id"] == profile.mfa_model
+    assert result["contexts"][0]["words"][0]["source_word_ids"] == [30]
+    with pytest.raises(MFAAlignmentError, match="does not match"):
+        parse_mfa_batch(paths, language="ru", model_id="english_us_arpa")
 
 
 def test_prepare_and_parse_mock_oov_output_with_reversible_tokens(

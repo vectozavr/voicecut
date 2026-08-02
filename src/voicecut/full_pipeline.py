@@ -37,11 +37,16 @@ from .ctc_enrich import (
     SOURCE_DECODE_STRATEGY,
     write_passthrough_enrichment,
 )
+from .language_profiles import (
+    SUPPORTED_LANGUAGE_CODES,
+    LanguageProfile,
+    get_language_profile,
+)
 from .media import (
     AUDIO_OUTPUT_EXTENSIONS,
-    MediaError,
     VIDEO_INPUT_EXTENSIONS,
     VIDEO_OUTPUT_EXTENSIONS,
+    MediaError,
     output_media_kind,
     prepare_media_input,
     publish_audio,
@@ -49,7 +54,6 @@ from .media import (
 from .mfa_alignment import (
     DEFAULT_MFA_CACHE_ROOT,
     DEFAULT_MFA_PREFIX,
-    MFA_MODEL_ID,
     MFA_VERSION,
 )
 from .planner_backends import (
@@ -63,16 +67,15 @@ from .planner_backends import (
 )
 from .video_render import render_edited_video
 
-
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULT_ALIGNMENT_BACKEND = "mfa"
-MFA_MODEL = MFA_MODEL_ID
 MFA_FINE_TUNE = True
 DEFAULT_MFA_MICROMAMBA = Path("micromamba")
 DEFAULT_MFA_NUM_JOBS = max(1, min(os.cpu_count() or 1, 4))
-PIPELINE_SCHEMA_VERSION = 8
+PIPELINE_SCHEMA_VERSION = 9
+CTC_LANGUAGE_SKIP_STATUS = "skipped_unsupported_language"
 
 
 def _preferred_python(relative_path: str) -> Path:
@@ -207,6 +210,57 @@ def _enrichment_artifacts_are_current(
     )
 
 
+def _ctc_language_skip_report_is_current(
+    report_path: Path,
+    *,
+    transcript_path: Path,
+    audio_sha256: str,
+    profile: LanguageProfile,
+) -> bool:
+    """Validate metadata proving that CTC was intentionally not fabricated."""
+
+    report = _read_object(report_path)
+    return (
+        report is not None
+        and report.get("schema_version") == 1
+        and report.get("status") == CTC_LANGUAGE_SKIP_STATUS
+        and report.get("language") == profile.code
+        and report.get("ctc_enrichment_supported") is False
+        and report.get("audio_sha256") == audio_sha256
+        and report.get("semantic_transcript") == str(transcript_path.resolve())
+        and report.get("semantic_transcript_sha256") == sha256_file(transcript_path)
+    )
+
+
+def _write_ctc_language_skip_report(
+    report_path: Path,
+    *,
+    transcript_path: Path,
+    audio_sha256: str,
+    profile: LanguageProfile,
+) -> None:
+    """Record an honest language-policy skip without creating fake evidence."""
+
+    write_json(
+        report_path,
+        {
+            "schema_version": 1,
+            "status": CTC_LANGUAGE_SKIP_STATUS,
+            "language": profile.code,
+            "language_display_name": profile.display_name,
+            "ctc_enrichment_supported": False,
+            "audio_sha256": audio_sha256,
+            "semantic_transcript": str(transcript_path.resolve()),
+            "semantic_transcript_sha256": sha256_file(transcript_path),
+            "reason": (
+                "The optional hidden-retry CTC enrichment is not validated "
+                f"for {profile.display_name}; semantic planning uses the "
+                "primary Whisper transcript directly."
+            ),
+        },
+    )
+
+
 def _plan_is_current(
     path: Path,
     *,
@@ -232,6 +286,7 @@ def _render_is_current(
     plan_path: Path,
     backend: str,
     model: str,
+    mfa_model: str,
     breath_cleanup: str,
     breath_threshold: float,
     breath_min_duration_ms: int,
@@ -251,7 +306,7 @@ def _render_is_current(
         and value.get("renderer") == "authoritative_single_pass_final_render_v3"
         and value.get("alignment_backend") == DEFAULT_ALIGNMENT_BACKEND
         and value.get("mfa_version") == MFA_VERSION
-        and value.get("mfa_model") == MFA_MODEL
+        and value.get("mfa_model") == mfa_model
         and value.get("mfa_fine_tune") is MFA_FINE_TUNE
         and value.get("breath_cleanup_mode") == breath_cleanup
         and value.get("breath_threshold") == breath_threshold
@@ -530,13 +585,24 @@ def _configuration(
     mfa_cache_root: Path,
     mfa_micromamba: Path,
     pause_policy: str,
+    language_profile: LanguageProfile,
 ) -> dict[str, Any]:
     return {
         "schema_version": PIPELINE_SCHEMA_VERSION,
         "implementation_sha256": _implementation_fingerprint(),
         "input": str(input_path),
         "input_sha256": input_sha256,
-        "language": args.language,
+        "language": language_profile.code,
+        "language_profile": {
+            "code": language_profile.code,
+            "display_name": language_profile.display_name,
+            "whisper_language": language_profile.whisper_language,
+            "whisperx_language": language_profile.whisperx_language,
+            "whisperx_model": language_profile.whisperx_model,
+            "mfa_model": language_profile.mfa_model,
+            "ctc_enrichment_supported": (language_profile.ctc_enrichment_supported),
+            "default_breath_cleanup": language_profile.default_breath_cleanup,
+        },
         "whisper_model": args.whisper_model,
         "planner_backend": args.planner_backend,
         "planner_model": planner_model,
@@ -551,7 +617,7 @@ def _configuration(
         "asr_python": str(asr_python),
         "alignment_backend": args.alignment_backend,
         "mfa_version": MFA_VERSION,
-        "mfa_model": MFA_MODEL,
+        "mfa_model": language_profile.mfa_model,
         "mfa_fine_tune": MFA_FINE_TUNE,
         "mfa_prefix": str(mfa_prefix),
         "mfa_cache_root": str(mfa_cache_root),
@@ -696,6 +762,14 @@ def run_full_pipeline(
         output_kind = output_media_kind(output_path)
     except MediaError as error:
         raise FullPipelineError(str(error)) from error
+    try:
+        language_profile = get_language_profile(args.language)
+    except ValueError as error:
+        raise FullPipelineError(str(error)) from None
+    # ``None`` means that the user accepted the language profile's safe
+    # default.  An explicit ``off`` or ``replace`` always wins.
+    if args.breath_cleanup is None:
+        args.breath_cleanup = language_profile.default_breath_cleanup
     if args.window_seconds <= 0:
         raise FullPipelineError("--window-seconds must be positive")
     if args.max_output_tokens <= 0:
@@ -756,6 +830,7 @@ def run_full_pipeline(
         mfa_cache_root=mfa_cache_root,
         mfa_micromamba=mfa_micromamba,
         pause_policy=pause_policy,
+        language_profile=language_profile,
     )
     work_dir = _resolve_work_dir(
         requested=args.work_dir,
@@ -879,7 +954,7 @@ def run_full_pipeline(
                 "--model",
                 args.whisper_model,
                 "--language",
-                args.language,
+                language_profile.whisper_language,
                 "--artifact-role",
                 "source_primary",
                 "--output",
@@ -897,11 +972,34 @@ def run_full_pipeline(
     enrichment_dir = work_dir / "03_ctc_enrichment"
     enriched_path = enrichment_dir / "source_transcript_ctc_enriched.json"
     enrichment_report_path = enrichment_dir / "ctc_enrichment_report.json"
-    if _enrichment_artifacts_are_current(
+    semantic_transcript_path: Path
+    if not language_profile.ctc_enrichment_supported:
+        semantic_transcript_path = transcript_path
+        if _ctc_language_skip_report_is_current(
+            enrichment_report_path,
+            transcript_path=transcript_path,
+            audio_sha256=audio_sha256,
+            profile=language_profile,
+        ):
+            stages["hidden_retry_recovery"] = "cached_skipped_language_policy"
+        else:
+            enrichment_dir.mkdir(parents=True, exist_ok=True)
+            enriched_path.unlink(missing_ok=True)
+            enrichment_report_path.unlink(missing_ok=True)
+            _write_ctc_language_skip_report(
+                enrichment_report_path,
+                transcript_path=transcript_path,
+                audio_sha256=audio_sha256,
+                profile=language_profile,
+            )
+            stages["hidden_retry_recovery"] = "skipped_language_policy"
+        enrichment_status = CTC_LANGUAGE_SKIP_STATUS
+    elif _enrichment_artifacts_are_current(
         enriched_path,
         enrichment_report_path,
         audio_sha256,
     ):
+        semantic_transcript_path = enriched_path
         enrichment_report = _read_object(enrichment_report_path)
         assert enrichment_report is not None
         enrichment_status = str(enrichment_report["status"])
@@ -912,6 +1010,7 @@ def run_full_pipeline(
             else "cached"
         )
     else:
+        semantic_transcript_path = enriched_path
         # CTC is optional evidence, and its worker has a validated resumable
         # per-atom checkpoint.  Preserve that checkpoint across reruns.  If
         # the optional subprocess itself crashes, publish an explicitly
@@ -1000,7 +1099,7 @@ def run_full_pipeline(
     plan_path = plan_dir / "streaming_plan.json"
     if _plan_is_current(
         plan_path,
-        transcript_path=enriched_path,
+        transcript_path=semantic_transcript_path,
         backend=args.planner_backend,
         model=planner_model,
     ):
@@ -1015,11 +1114,13 @@ def run_full_pipeline(
                 "voicecut.streaming_narration",
                 "--stream-plan",
                 "--transcript",
-                str(enriched_path),
+                str(semantic_transcript_path),
                 "--output-dir",
                 str(plan_dir),
                 "--window-seconds",
                 str(args.window_seconds),
+                "--language",
+                language_profile.code,
                 *planner_arguments,
             ],
             runner=runner,
@@ -1028,7 +1129,7 @@ def run_full_pipeline(
         )
         if not _plan_is_current(
             plan_path,
-            transcript_path=enriched_path,
+            transcript_path=semantic_transcript_path,
             backend=args.planner_backend,
             model=planner_model,
         ):
@@ -1045,6 +1146,7 @@ def run_full_pipeline(
         plan_path=plan_path,
         backend=args.planner_backend,
         model=planner_model,
+        mfa_model=language_profile.mfa_model,
         breath_cleanup=args.breath_cleanup,
         breath_threshold=args.breath_threshold,
         breath_min_duration_ms=args.breath_min_duration_ms,
@@ -1068,6 +1170,8 @@ def run_full_pipeline(
             str(alignment_python),
             "--alignment-backend",
             args.alignment_backend,
+            "--language",
+            language_profile.code,
             "--mfa-prefix",
             str(mfa_prefix),
             "--mfa-cache-root",
@@ -1105,6 +1209,7 @@ def run_full_pipeline(
             plan_path=plan_path,
             backend=args.planner_backend,
             model=planner_model,
+            mfa_model=language_profile.mfa_model,
             breath_cleanup=args.breath_cleanup,
             breath_threshold=args.breath_threshold,
             breath_min_duration_ms=args.breath_min_duration_ms,
@@ -1222,15 +1327,20 @@ def run_full_pipeline(
         "pipeline_configuration": str(configuration_path),
         "planner_backend": args.planner_backend,
         "planner_model": planner_model,
+        "language": language_profile.code,
+        "language_profile": language_profile.display_name,
         "alignment_backend": args.alignment_backend,
         "mfa_version": MFA_VERSION,
-        "mfa_model": MFA_MODEL,
+        "mfa_model": language_profile.mfa_model,
         "pause_policy": pause_policy,
         "stages": stages,
         "media_input_manifest": str(media_manifest_path),
         "analysis": str(analysis_path),
         "transcript": str(transcript_path),
-        "enriched_transcript": str(enriched_path),
+        "semantic_transcript": str(semantic_transcript_path),
+        "enriched_transcript": (
+            str(enriched_path) if language_profile.ctc_enrichment_supported else None
+        ),
         "ctc_enrichment_report": str(enrichment_report_path),
         "ctc_enrichment_status": enrichment_status,
         "streaming_plan": str(plan_path),
@@ -1340,11 +1450,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--breath-cleanup",
         choices=("off", "replace"),
-        default="replace",
+        default=None,
         help=(
             "Respiro-en cleanup and ambience screening inside MFA-confirmed "
-            "non-speech; off suppresses unverified inserted ambience "
-            "(default: replace)."
+            "non-speech. Defaults to replace for English and off for Russian; "
+            "an explicit selection overrides the language default."
         ),
     )
     parser.add_argument(
@@ -1368,9 +1478,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL)
     parser.add_argument(
         "--language",
-        choices=("en",),
+        choices=SUPPORTED_LANGUAGE_CODES,
         default="en",
-        help="Source language. This production release currently supports English.",
+        help="Source language (supported: en, ru; default: en).",
     )
     add_planner_backend_arguments(parser)
     parser.add_argument(

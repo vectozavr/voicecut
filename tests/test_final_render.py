@@ -18,6 +18,7 @@ from voicecut.breath_detection import (
 )
 from voicecut.common import read_json, sha256_file, write_json
 from voicecut.final_render import FinalRenderError, render_final_cut
+from voicecut.language_profiles import get_language_profile
 from voicecut.mfa_alignment import MFA_MODEL_ID, MFA_VERSION
 
 SAMPLE_RATE = 1000
@@ -478,11 +479,14 @@ def _completeness_payload(
     *,
     words: list[dict[str, Any]],
     contexts: list[tuple[range, int | None]],
+    language: str = "en",
+    requested_model: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "backend": "whisperx_alignment",
-        "language": "en",
+        "language": language,
+        "requested_model": requested_model,
         "device": "cpu",
         "purpose": "retained_word_completeness_veto",
         "coordinate_authority": False,
@@ -581,12 +585,15 @@ def _mfa_payload(
     ],
     selected_word_ids: set[int],
     source_audio_sha256: str,
+    language: str = "en",
+    model_id: str = MFA_MODEL_ID,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "backend": "mfa",
         "mfa_version": MFA_VERSION,
-        "model_id": MFA_MODEL_ID,
+        "language": language,
+        "model_id": model_id,
         "fine_tune": True,
         "sample_rate": SAMPLE_RATE,
         "source_audio_sha256": source_audio_sha256,
@@ -660,7 +667,13 @@ def _grounded_fixture(
     tmp_path: Path,
     *,
     dense_leading_boundary: bool = False,
+    language: str = "en",
 ) -> tuple[Path, Path, Path, dict[str, Any]]:
+    lexical = (
+        ("выбранный", "лишний", "последний")
+        if language == "ru"
+        else ("selected", "omitted", "last")
+    )
     source = np.empty((2300, 1), dtype=np.float32)
     time = np.arange(len(source), dtype=np.float32) / SAMPLE_RATE
     source[:, 0] = 0.001 * np.sin(2.0 * np.pi * 13.0 * time)
@@ -678,6 +691,7 @@ def _grounded_fixture(
         {
             "schema_version": 1,
             "artifact_role": "source_transcript",
+            "language": language,
             "audio": str(audio_path),
             "audio_sha256": sha256_file(audio_path),
             "atoms": [],
@@ -687,16 +701,16 @@ def _grounded_fixture(
     selected_range = _range_payload(
         first_word_id=0,
         last_word_id=0,
-        first_word="selected",
-        last_word="selected",
-        canonical_text="Selected.",
+        first_word=lexical[0],
+        last_word=lexical[0],
+        canonical_text=f"{lexical[0].capitalize()}.",
     )
     final_range = _range_payload(
         first_word_id=2,
         last_word_id=2,
-        first_word="last",
-        last_word="last",
-        canonical_text="Last.",
+        first_word=lexical[2],
+        last_word=lexical[2],
+        canonical_text=f"{lexical[2].capitalize()}.",
     )
     committed = [
         _thought(thought_index=0, source_range=selected_range),
@@ -710,6 +724,7 @@ def _grounded_fixture(
         "status": "complete",
         "backend": "gemini",
         "model": "cached-test-model",
+        "language": language,
         "transcript": str(transcript_path),
         "transcript_sha256": sha256_file(transcript_path),
         "grounding_validation": str(grounding_path),
@@ -717,19 +732,19 @@ def _grounded_fixture(
         "words": [
             {
                 "id": 0,
-                "text": "selected",
+                "text": lexical[0],
                 "start": 0.10,
                 "end": 0.50,
             },
             {
                 "id": 1,
-                "text": "omitted",
+                "text": lexical[1],
                 "start": 0.50,
                 "end": 0.95,
             },
             {
                 "id": 2,
-                "text": "last",
+                "text": lexical[2],
                 "start": 1.20,
                 "end": 1.50,
             },
@@ -739,13 +754,16 @@ def _grounded_fixture(
             {"start_word_id": 0, "end_word_id": 1},
             {"start_word_id": 2, "end_word_id": 3},
         ],
-        "reconstructed_narration": "Selected. Last.",
+        "reconstructed_narration": (
+            f"{lexical[0].capitalize()}. {lexical[2].capitalize()}."
+        ),
     }
     write_json(plan_path, plan)
 
     grounding = {
         "schema_version": 1,
         "validator": "strict_bidirectional_range_source_grounding_v2",
+        "language": language,
         "status": "valid",
         "finalized_thoughts": 2,
         "source_ranges": 2,
@@ -1254,9 +1272,13 @@ def _grounded_evidence(
     words: list[dict[str, Any]],
     audio_path: Path,
     dense_leading_boundary: bool = False,
+    language: str = "en",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    profile = get_language_profile(language)
     completeness = _completeness_payload(
         words=words,
+        language=profile.whisperx_language,
+        requested_model=profile.whisperx_model,
         contexts=[
             (range(3), None),
             (range(3), None),
@@ -1277,6 +1299,8 @@ def _grounded_evidence(
         words=words,
         selected_word_ids={0, 2},
         source_audio_sha256=sha256_file(audio_path),
+        language=profile.code,
+        model_id=profile.mfa_model,
         contexts=[
             (
                 "source_gap_0000_left",
@@ -1489,6 +1513,47 @@ def test_final_render_builds_one_boundary_plan_and_renders_source_once(
 
     saved = read_json(output_dir / "final_render_manifest.json")
     assert saved == manifest
+
+
+def test_russian_final_render_uses_russian_completeness_and_mfa_provenance(
+    tmp_path: Path,
+) -> None:
+    profile = get_language_profile("ru")
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(
+        tmp_path,
+        language="ru",
+    )
+    words = read_json(plan_path)["words"]
+    completeness, mfa = _grounded_evidence(
+        words=words,
+        audio_path=audio_path,
+        language="ru",
+    )
+    output_dir = tmp_path / "russian-final"
+
+    manifest = render_final_cut(
+        audio_path=audio_path,
+        plan_path=plan_path,
+        output_dir=output_dir,
+        pause_plan_path=pause_plan_path,
+        alignment_python=tmp_path / "model-must-not-run",
+        language="ru",
+        pause_backend=ExplodingPauseBackend(),
+        alignment_payload=completeness,
+        mfa_payload=mfa,
+        breath_cleanup="off",
+    )
+
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert manifest["language"] == "ru"
+    assert manifest["mfa_model"] == profile.mfa_model
+    assert manifest["whisperx_completeness_language"] == "ru"
+    assert manifest["whisperx_completeness_model"] == profile.whisperx_model
+    assert boundary_plan["language"] == "ru"
+    assert boundary_plan["mfa_model"] == profile.mfa_model
+    assert boundary_plan["configuration"]["whisperx_language"] == "ru"
+    assert boundary_plan["configuration"]["whisperx_model"] == (profile.whisperx_model)
+    assert Path(manifest["final_cut_wav"]).is_file()
 
 
 def test_cut_pause_policy_skips_planner_and_inserts_no_room_tone(

@@ -28,6 +28,7 @@ from typing import Any
 import soundfile as sf
 
 from .common import read_json, sha256_file, write_json
+from .language_profiles import get_language_profile
 
 MFA_VERSION = "3.4.1"
 MFA_MODEL_ID = "english_us_arpa"
@@ -43,6 +44,7 @@ DEFAULT_MFA_CACHE_ROOT = REPOSITORY_ROOT / ".voicecut-cache" / "runtime" / "mfa"
 
 _VERSION_RE = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)*")
+_UNICODE_TOKEN_RE = re.compile(r"[^\W_]+(?:'[^\W_]+)*", re.UNICODE)
 _SILENCE_PHONES = frozenset({"", "<eps>", "sil", "silence", "sp"})
 _SILENCE_WORD_LABELS = frozenset({"", "<eps>"})
 
@@ -111,6 +113,18 @@ class MFABatchPaths:
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def _resolved_mfa_configuration(
+    *,
+    language: str,
+    model_id: str | None,
+) -> tuple[str, str]:
+    profile = get_language_profile(language)
+    resolved_model = profile.mfa_model if model_id is None else str(model_id).strip()
+    if not resolved_model:
+        raise ValueError("model_id must not be empty")
+    return profile.code, resolved_model
+
+
 def _finite_number(value: Any, *, field: str) -> float:
     try:
         converted = float(value)
@@ -174,24 +188,42 @@ def _is_mfa_silence_word(word: str) -> bool:
     return str(word).strip().casefold() in _SILENCE_WORD_LABELS
 
 
-def _normalize_mfa_token_piece(value: str) -> list[str]:
-    normalized = "".join(
-        character
-        for character in unicodedata.normalize("NFKD", value)
-        if not unicodedata.combining(character)
+def _normalize_mfa_token_piece(value: str, *, language_code: str) -> list[str]:
+    profile = get_language_profile(language_code)
+    apostrophe_normalized = (
+        str(value).replace("\u2018", "'").replace("\u2019", "'").replace("\u02bc", "'")
     )
+    if profile.code == "en":
+        # Preserve the original English behavior, including deterministic
+        # diacritic folding used by existing caches and MFA fixtures.
+        normalized = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", apostrophe_normalized)
+            if not unicodedata.combining(character)
+        )
+        normalized = (
+            normalized.casefold().replace("%", " percent ").replace("&", " and ")
+        )
+        return _TOKEN_RE.findall(normalized)
+
+    # Russian must retain Unicode letters and, specifically, preserve ё as
+    # distinct from е. NFKC normalizes presentation variants without decomposing
+    # ё into a combining sequence. Latin technical terms and digits remain
+    # valid tokens for MFA's G2P path.
     normalized = (
-        normalized.casefold()
-        .replace("\u2018", "'")
-        .replace("\u2019", "'")
-        .replace("\u02bc", "'")
-        .replace("%", " percent ")
-        .replace("&", " and ")
+        unicodedata.normalize("NFKC", apostrophe_normalized)
+        .casefold()
+        .replace("%", " процент ")
+        .replace("&", " и ")
     )
-    return _TOKEN_RE.findall(normalized)
+    return _UNICODE_TOKEN_RE.findall(normalized)
 
 
-def normalize_mfa_token(value: str) -> tuple[str, ...]:
+def normalize_mfa_token(
+    value: str,
+    *,
+    language: str = "en",
+) -> tuple[str, ...]:
     """Normalize source text to deterministic whitespace-delimited MFA tokens.
 
     Surrounding punctuation and Whisper punctuation artifacts are removed,
@@ -200,11 +232,13 @@ def normalize_mfa_token(value: str) -> tuple[str, ...]:
     deterministically produce multiple MFA tokens.
     """
 
-    return tuple(_normalize_mfa_token_piece(str(value)))
+    return tuple(_normalize_mfa_token_piece(str(value), language_code=language))
 
 
 def normalize_source_words(
     words: Sequence[MFASourceWord | Mapping[str, Any]],
+    *,
+    language: str = "en",
 ) -> tuple[tuple[MFATokenMapping, ...], tuple[int, ...]]:
     """Return ordered reversible mappings and explicit non-lexical word IDs.
 
@@ -218,7 +252,7 @@ def normalize_source_words(
     mappings: list[MFATokenMapping] = []
     nonlexical: list[int] = []
     for word in coerced:
-        tokens = normalize_mfa_token(word.text)
+        tokens = normalize_mfa_token(word.text, language=language)
         if not tokens:
             if any(character.isalnum() for character in word.text):
                 raise MFAAlignmentError(
@@ -287,6 +321,8 @@ def _coerce_source_word(value: MFASourceWord | Mapping[str, Any]) -> MFASourceWo
 
 def _coerce_token_mapping(
     value: MFATokenMapping | Mapping[str, Any],
+    *,
+    language: str = "en",
 ) -> MFATokenMapping:
     if isinstance(value, MFATokenMapping):
         result = value
@@ -304,7 +340,7 @@ def _coerce_token_mapping(
         )
     else:
         raise TypeError(f"unsupported token mapping: {type(value).__name__}")
-    normalized = normalize_mfa_token(result.token)
+    normalized = normalize_mfa_token(result.token, language=language)
     if normalized != (result.token,):
         raise MFAAlignmentError(
             "mfa_word_mapping_failed",
@@ -320,7 +356,11 @@ def _coerce_token_mapping(
     return result
 
 
-def _coerce_context(value: MFAContextSpec | Mapping[str, Any]) -> MFAContextSpec:
+def _coerce_context(
+    value: MFAContextSpec | Mapping[str, Any],
+    *,
+    language: str = "en",
+) -> MFAContextSpec:
     if isinstance(value, MFAContextSpec):
         result = MFAContextSpec(
             context_id=value.context_id,
@@ -329,7 +369,10 @@ def _coerce_context(value: MFAContextSpec | Mapping[str, Any]) -> MFAContextSpec
             words=tuple(_coerce_source_word(word) for word in value.words),
             boundary_ids=tuple(str(item) for item in value.boundary_ids),
             token_mappings=(
-                tuple(_coerce_token_mapping(item) for item in value.token_mappings)
+                tuple(
+                    _coerce_token_mapping(item, language=language)
+                    for item in value.token_mappings
+                )
                 if value.token_mappings is not None
                 else None
             ),
@@ -342,7 +385,9 @@ def _coerce_context(value: MFAContextSpec | Mapping[str, Any]) -> MFAContextSpec
             )
         raw_mappings = value.get("token_mappings")
         mappings = (
-            tuple(_coerce_token_mapping(item) for item in raw_mappings)
+            tuple(
+                _coerce_token_mapping(item, language=language) for item in raw_mappings
+            )
             if isinstance(raw_mappings, Sequence) and not isinstance(raw_mappings, str)
             else None
         )
@@ -396,10 +441,15 @@ def _coerce_context(value: MFAContextSpec | Mapping[str, Any]) -> MFAContextSpec
 
 def _validated_context_mappings(
     context: MFAContextSpec,
+    *,
+    language: str = "en",
 ) -> tuple[tuple[MFATokenMapping, ...], tuple[int, ...]]:
     if context.token_mappings is None:
-        return normalize_source_words(context.words)
-    mappings = tuple(_coerce_token_mapping(item) for item in context.token_mappings)
+        return normalize_source_words(context.words, language=language)
+    mappings = tuple(
+        _coerce_token_mapping(item, language=language)
+        for item in context.token_mappings
+    )
     known_ids = {word.word_id for word in context.words}
     mapped_ids: set[int] = set()
     for mapping in mappings:
@@ -445,13 +495,19 @@ def prepare_mfa_batch(
     audio_path: Path,
     contexts: Sequence[MFAContextSpec | Mapping[str, Any]],
     work_dir: Path,
+    language: str = "en",
+    model_id: str | None = None,
 ) -> MFABatchPaths:
     """Create one MFA corpus containing every context for a render attempt."""
 
+    language, model_id = _resolved_mfa_configuration(
+        language=language,
+        model_id=model_id,
+    )
     audio_path = audio_path.resolve()
     if not audio_path.is_file():
         raise FileNotFoundError(audio_path)
-    coerced = tuple(_coerce_context(context) for context in contexts)
+    coerced = tuple(_coerce_context(context, language=language) for context in contexts)
     if not coerced:
         raise MFAAlignmentError(
             "mfa_word_mapping_failed", "MFA batch requires at least one context"
@@ -483,7 +539,10 @@ def prepare_mfa_batch(
 
         batch_metadata: list[dict[str, Any]] = []
         for context in coerced:
-            mappings, nonlexical = _validated_context_mappings(context)
+            mappings, nonlexical = _validated_context_mappings(
+                context,
+                language=language,
+            )
             crop_start_sample = max(
                 0,
                 min(
@@ -528,6 +587,8 @@ def prepare_mfa_batch(
             metadata = {
                 "schema_version": 1,
                 "context_id": context.context_id,
+                "language": language,
+                "model_id": model_id,
                 "crop_source_start_seconds": actual_start,
                 "crop_source_end_seconds": actual_end,
                 "crop_source_start_sample": crop_start_sample,
@@ -552,7 +613,8 @@ def prepare_mfa_batch(
             "schema_version": 1,
             "backend": "mfa",
             "mfa_version": MFA_VERSION,
-            "model_id": MFA_MODEL_ID,
+            "language": language,
+            "model_id": model_id,
             "fine_tune": True,
             "source_audio": str(audio_path),
             "source_audio_sha256": sha256_file(audio_path),
@@ -642,11 +704,15 @@ def build_mfa_align_command(
     prefix: Path = DEFAULT_MFA_PREFIX,
     micromamba: str | Path = "micromamba",
     num_jobs: int = 1,
+    model_id: str = MFA_MODEL_ID,
 ) -> list[str]:
     """Build the exact documented MFA 3.4.1 batched ``align_hf`` command."""
 
     if num_jobs <= 0:
         raise ValueError("num_jobs must be positive")
+    model_id = str(model_id).strip()
+    if not model_id:
+        raise ValueError("model_id must not be empty")
     return [
         os.fspath(micromamba),
         "run",
@@ -655,7 +721,7 @@ def build_mfa_align_command(
         "mfa",
         "align_hf",
         str(paths.corpus.resolve()),
-        MFA_MODEL_ID,
+        model_id,
         str(paths.output.resolve()),
         "--use_g2p",
         "--no_tokenization",
@@ -679,10 +745,12 @@ def invoke_mfa_batch(
     cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
     micromamba: str | Path = "micromamba",
     num_jobs: int = 1,
+    model_id: str = MFA_MODEL_ID,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
     """Verify the pinned runtime and execute one batched MFA alignment."""
 
+    model_id = str(model_id).strip()
     version = verify_mfa_version(
         micromamba=micromamba,
         prefix=prefix,
@@ -694,6 +762,7 @@ def invoke_mfa_batch(
         prefix=prefix,
         micromamba=micromamba,
         num_jobs=num_jobs,
+        model_id=model_id,
     )
     environment = _mfa_environment(cache_root=cache_root)
     result = _run_checked(command, environment=environment, runner=runner)
@@ -701,7 +770,7 @@ def invoke_mfa_batch(
         "schema_version": 1,
         "backend": "mfa",
         "mfa_version": version,
-        "model_id": MFA_MODEL_ID,
+        "model_id": model_id,
         "fine_tune": True,
         "command": command,
         "environment": {
@@ -797,8 +866,8 @@ def _parse_intervals(
     return parsed
 
 
-def _normalized_output_token(label: str) -> str:
-    tokens = normalize_mfa_token(label)
+def _normalized_output_token(label: str, *, language: str = "en") -> str:
+    tokens = normalize_mfa_token(label, language=language)
     if len(tokens) != 1:
         raise MFAAlignmentError(
             "mfa_word_mapping_failed",
@@ -871,6 +940,7 @@ def _mapped_word_records(
     lexical_words: Sequence[Mapping[str, Any]],
     mappings: Sequence[MFATokenMapping],
     phone_intervals: Sequence[Mapping[str, Any]],
+    language: str = "en",
 ) -> list[dict[str, Any]]:
     """Map ordered MFA words, including MFA's split contraction clitics.
 
@@ -892,7 +962,7 @@ def _mapped_word_records(
                 str(interval["label"])
                 for interval in lexical_words[output_index:end_index]
             )
-            normalized = normalize_mfa_token(candidate)
+            normalized = normalize_mfa_token(candidate, language=language)
             if normalized == (mapping.token,):
                 matched = list(lexical_words[output_index:end_index])
                 output_index = end_index
@@ -955,6 +1025,7 @@ def _parse_mfa_context(
     paths: MFABatchPaths,
     raw_context: Mapping[str, Any],
     sample_rate: int,
+    language: str = "en",
 ) -> dict[str, Any]:
     context_id = str(raw_context["context_id"])
     crop_start = float(raw_context["crop_source_start_seconds"])
@@ -1010,12 +1081,15 @@ def _parse_mfa_context(
             "mfa_word_mapping_failed",
             f"context {context_id} has no token mapping",
         )
-    mappings = tuple(_coerce_token_mapping(item) for item in raw_mappings)
+    mappings = tuple(
+        _coerce_token_mapping(item, language=language) for item in raw_mappings
+    )
     mapped_words = _mapped_word_records(
         context_id=context_id,
         lexical_words=lexical_words,
         mappings=mappings,
         phone_intervals=phone_intervals,
+        language=language,
     )
 
     all_phones: list[dict[str, Any]] = []
@@ -1047,7 +1121,12 @@ def _parse_mfa_context(
     }
 
 
-def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
+def parse_mfa_batch(
+    paths: MFABatchPaths,
+    *,
+    language: str | None = None,
+    model_id: str | None = None,
+) -> dict[str, Any]:
     """Parse every usable MFA context without discarding partial success.
 
     MFA reports per-utterance alignment failures by omitting their exported
@@ -1061,6 +1140,23 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
     batch = read_json(paths.metadata / "batch.json")
     if not isinstance(batch, Mapping):
         raise MFAAlignmentError("mfa_word_mapping_failed", "invalid MFA batch metadata")
+    batch_language = str(batch.get("language", "en"))
+    batch_model = str(batch.get("model_id", MFA_MODEL_ID))
+    resolved_language = get_language_profile(
+        batch_language if language is None else language
+    ).code
+    if resolved_language != get_language_profile(batch_language).code:
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            "MFA batch language does not match the requested language: "
+            f"{batch_language!r} != {resolved_language!r}",
+        )
+    if model_id is not None and str(model_id).strip() != batch_model:
+        raise MFAAlignmentError(
+            "mfa_word_mapping_failed",
+            "MFA batch model does not match the requested model: "
+            f"{batch_model!r} != {str(model_id).strip()!r}",
+        )
     sample_rate = int(batch.get("sample_rate", 0))
     if sample_rate <= 0:
         raise MFAAlignmentError(
@@ -1090,6 +1186,7 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
                     paths=paths,
                     raw_context=raw_context,
                     sample_rate=sample_rate,
+                    language=resolved_language,
                 )
             )
         except (MFAAlignmentError, OSError, TypeError, ValueError) as error:
@@ -1110,7 +1207,8 @@ def parse_mfa_batch(paths: MFABatchPaths) -> dict[str, Any]:
         "schema_version": 1,
         "backend": "mfa",
         "mfa_version": MFA_VERSION,
-        "model_id": MFA_MODEL_ID,
+        "language": resolved_language,
+        "model_id": batch_model,
         "fine_tune": True,
         "sample_rate": sample_rate,
         "source_audio": batch.get("source_audio"),
@@ -1278,6 +1376,8 @@ def align_mfa_contexts(
     micromamba: str | Path = "micromamba",
     num_jobs: int = 1,
     context_recovery_attempts: int = MFA_CONTEXT_RECOVERY_ATTEMPTS,
+    language: str = "en",
+    model_id: str | None = None,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
     """Align local contexts, retrying only utterances MFA did not export.
@@ -1295,7 +1395,13 @@ def align_mfa_contexts(
 
     if context_recovery_attempts < 0:
         raise ValueError("context_recovery_attempts must be non-negative")
-    coerced_contexts = tuple(_coerce_context(context) for context in contexts)
+    language, model_id = _resolved_mfa_configuration(
+        language=language,
+        model_id=model_id,
+    )
+    coerced_contexts = tuple(
+        _coerce_context(context, language=language) for context in contexts
+    )
 
     # One malformed ASR occurrence must not poison every otherwise independent
     # alignment context in a long recording.  Validate contexts before creating
@@ -1305,7 +1411,7 @@ def align_mfa_contexts(
     preflight_errors: dict[str, dict[str, Any]] = {}
     for context in coerced_contexts:
         try:
-            _validated_context_mappings(context)
+            _validated_context_mappings(context, language=language)
         except (MFAAlignmentError, TypeError, ValueError) as error:
             preflight_errors[context.context_id] = {
                 "context_id": context.context_id,
@@ -1336,7 +1442,8 @@ def align_mfa_contexts(
             "schema_version": 1,
             "backend": "mfa",
             "mfa_version": MFA_VERSION,
-            "model_id": MFA_MODEL_ID,
+            "language": language,
+            "model_id": model_id,
             "fine_tune": True,
             "sample_rate": sample_rate,
             "source_audio": str(audio_path.resolve()),
@@ -1361,6 +1468,8 @@ def align_mfa_contexts(
         audio_path=audio_path,
         contexts=valid_contexts,
         work_dir=work_dir,
+        language=language,
+        model_id=model_id,
     )
     try:
         invocation = invoke_mfa_batch(
@@ -1369,6 +1478,7 @@ def align_mfa_contexts(
             cache_root=cache_root,
             micromamba=micromamba,
             num_jobs=num_jobs,
+            model_id=model_id,
             runner=runner,
         )
         invocation["status"] = "complete"
@@ -1381,14 +1491,15 @@ def align_mfa_contexts(
             "schema_version": 1,
             "backend": "mfa",
             "mfa_version": MFA_VERSION,
-            "model_id": MFA_MODEL_ID,
+            "language": language,
+            "model_id": model_id,
             "fine_tune": True,
             "status": "failed_with_possible_partial_outputs",
             "error_code": error.code,
             "error": f"{type(error).__name__}: {error}",
         }
         write_json(paths.metadata / "mfa_invocation.json", invocation)
-    result = parse_mfa_batch(paths)
+    result = parse_mfa_batch(paths, language=language, model_id=model_id)
     result["invocation"] = invocation
     recovery_batches: list[dict[str, Any]] = []
     contexts_by_id = {
@@ -1425,6 +1536,8 @@ def align_mfa_contexts(
             audio_path=audio_path,
             contexts=retry_contexts,
             work_dir=retry_work_dir,
+            language=language,
+            model_id=model_id,
         )
         try:
             retry_invocation = invoke_mfa_batch(
@@ -1433,6 +1546,7 @@ def align_mfa_contexts(
                 cache_root=cache_root,
                 micromamba=micromamba,
                 num_jobs=min(num_jobs, len(retry_contexts)),
+                model_id=model_id,
                 runner=runner,
             )
             retry_invocation["status"] = "complete"
@@ -1441,7 +1555,8 @@ def align_mfa_contexts(
                 "schema_version": 1,
                 "backend": "mfa",
                 "mfa_version": MFA_VERSION,
-                "model_id": MFA_MODEL_ID,
+                "language": language,
+                "model_id": model_id,
                 "fine_tune": True,
                 "status": "failed_with_possible_partial_outputs",
                 "error_code": error.code,
@@ -1451,7 +1566,11 @@ def align_mfa_contexts(
                 retry_paths.metadata / "mfa_invocation.json",
                 retry_invocation,
             )
-        retry_result = parse_mfa_batch(retry_paths)
+        retry_result = parse_mfa_batch(
+            retry_paths,
+            language=language,
+            model_id=model_id,
+        )
         resolved_ids: list[str] = []
         for context in retry_result["contexts"]:
             context_id = str(context["context_id"])

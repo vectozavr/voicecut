@@ -11,9 +11,10 @@ import shutil
 import subprocess
 import sys
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 from statistics import median
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -42,6 +43,7 @@ from .breath_detection import (
     analyze_breath_evidence,
 )
 from .common import read_json, sha256_file, write_json
+from .language_profiles import SUPPORTED_LANGUAGE_CODES, get_language_profile
 from .mfa_alignment import (
     DEFAULT_MFA_CACHE_ROOT,
     DEFAULT_MFA_PREFIX,
@@ -56,9 +58,11 @@ from .planner_backends import (
     DEFAULT_LOCAL_PYTHON,
     DEFAULT_MAX_OUTPUT_TOKENS,
     PAUSE_SYSTEM_INSTRUCTION,
-    PlannerBackend as PausePlannerBackend,
     add_planner_backend_arguments,
     create_planner_backend,
+)
+from .planner_backends import (
+    PlannerBackend as PausePlannerBackend,
 )
 from .rough_render import (
     MergedRange,
@@ -79,7 +83,6 @@ from .streaming_narration import (
     build_conservative_delivery_plan,
     repair_plan_for_acoustic_safety,
 )
-
 
 DEFAULT_ALIGNMENT_PYTHON = Path(sys.executable)
 CONTEXT_WORDS_PER_SIDE = 3
@@ -133,7 +136,9 @@ def _validate_grounded_plan(
     *,
     audio_path: Path,
     plan_path: Path,
+    language: str = ALIGNMENT_LANGUAGE,
 ) -> tuple[dict[str, Any], Path, int]:
+    language_profile = get_language_profile(language)
     plan = read_json(plan_path)
     if not isinstance(plan, dict) or plan.get("status") != "complete":
         raise FinalRenderError("final rendering requires a complete streaming plan")
@@ -160,6 +165,16 @@ def _validate_grounded_plan(
     transcript = read_json(transcript_path)
     if not isinstance(transcript, dict):
         raise FinalRenderError("source transcript root must be an object")
+    transcript_language = str(transcript.get("language", "en"))
+    plan_language = str(plan.get("language", transcript_language))
+    if (
+        transcript_language != language_profile.whisper_language
+        or plan_language != language_profile.code
+    ):
+        raise FinalRenderError(
+            "transcript/semantic language provenance does not match the render "
+            f"language {language_profile.code!r}"
+        )
     expected_audio_sha = transcript.get("audio_sha256")
     if not isinstance(expected_audio_sha, str):
         raise FinalRenderError("source transcript has no audio SHA-256")
@@ -1470,6 +1485,8 @@ def _run_completeness_worker(
     result_path: Path,
     alignment_python: Path,
     log_path: Path,
+    language: str = ALIGNMENT_LANGUAGE,
+    align_model: str | None = None,
 ) -> dict[str, Any]:
     executable = _absolute_without_resolving_symlinks(alignment_python)
     if not executable.is_file():
@@ -1486,10 +1503,12 @@ def _run_completeness_worker(
         "--output",
         str(result_path),
         "--language",
-        ALIGNMENT_LANGUAGE,
+        language,
         "--device",
         "cpu",
     ]
+    if align_model:
+        command.extend(["--align-model", align_model])
     environment = os.environ.copy()
     source_dir = str(Path(__file__).resolve().parents[1])
     environment["PYTHONPATH"] = source_dir + (
@@ -2428,11 +2447,14 @@ def _validated_mfa_contexts(
     requests: Sequence[dict[str, Any]] | None = None,
     source_audio_sha256: str,
     sample_rate: int,
+    expected_model_id: str = MFA_MODEL_ID,
+    expected_language: str = ALIGNMENT_LANGUAGE,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     if (
         payload.get("backend") != "mfa"
         or payload.get("mfa_version") != MFA_VERSION
-        or payload.get("model_id") != MFA_MODEL_ID
+        or payload.get("language", ALIGNMENT_LANGUAGE) != expected_language
+        or payload.get("model_id") != expected_model_id
         or payload.get("fine_tune") is not True
     ):
         raise FinalRenderError("MFA payload has incompatible runtime provenance")
@@ -4478,6 +4500,7 @@ def build_final_boundary_plan(
     pause_plan_path: Path,
     output_dir: Path,
     alignment_python: Path,
+    language: str = ALIGNMENT_LANGUAGE,
     alignment_backend: str = "mfa",
     mfa_prefix: Path = DEFAULT_MFA_PREFIX,
     mfa_cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
@@ -4494,6 +4517,13 @@ def build_final_boundary_plan(
 ) -> dict[str, Any]:
     """Resolve every source boundary before rendering any output waveform."""
 
+    language_profile = get_language_profile(language)
+    semantic_language = str(semantic_plan.get("language", "en"))
+    if semantic_language != language_profile.code:
+        raise FinalRenderError(
+            "semantic plan language does not match the requested render language: "
+            f"{semantic_language!r} != {language_profile.code!r}"
+        )
     if alignment_backend != "mfa":
         raise FinalRenderError("production cut coordinates require MFA")
     if breath_cleanup not in BREATH_CLEANUP_MODES:
@@ -4546,7 +4576,8 @@ def build_final_boundary_plan(
             "schema_version": 1,
             "source_audio": str(audio_path),
             "source_audio_sha256": sha256_file(audio_path),
-            "language": ALIGNMENT_LANGUAGE,
+            "language": language_profile.whisperx_language,
+            "alignment_model": language_profile.whisperx_model,
             "device": "cpu",
             "purpose": "retained_word_completeness_veto",
             "coordinate_authority": False,
@@ -4563,12 +4594,15 @@ def build_final_boundary_plan(
             result_path=worker_path,
             alignment_python=alignment_python,
             log_path=output_dir / "completeness_worker.log",
+            language=language_profile.whisperx_language,
+            align_model=language_profile.whisperx_model,
         )
     else:
         worker_result = {
             "schema_version": 1,
             "backend": "whisperx_alignment",
-            "language": ALIGNMENT_LANGUAGE,
+            "language": language_profile.whisperx_language,
+            "requested_model": language_profile.whisperx_model,
             "device": "cpu",
             "purpose": "retained_word_completeness_veto",
             "coordinate_authority": False,
@@ -4576,6 +4610,18 @@ def build_final_boundary_plan(
             "model_load_skipped": "no boundary contexts need completeness evidence",
         }
         write_json(worker_path, worker_result)
+    if (
+        worker_result.get("backend") != "whisperx_alignment"
+        or worker_result.get("language") != language_profile.whisperx_language
+    ):
+        raise FinalRenderError(
+            "WhisperX completeness evidence has incompatible language provenance"
+        )
+    requested_model = worker_result.get("requested_model")
+    if requested_model != language_profile.whisperx_model:
+        raise FinalRenderError(
+            "WhisperX completeness evidence has incompatible model provenance"
+        )
     completeness_contexts = _collect_completeness_evidence(
         jobs=completeness_jobs,
         worker_result=worker_result,
@@ -4608,6 +4654,8 @@ def build_final_boundary_plan(
                 cache_root=mfa_cache_root,
                 micromamba=mfa_micromamba,
                 num_jobs=mfa_num_jobs,
+                language=language_profile.code,
+                model_id=language_profile.mfa_model,
             )
         mfa_context_by_key, mfa_context_errors = _validated_mfa_contexts(
             payload=mfa_result,
@@ -4615,6 +4663,8 @@ def build_final_boundary_plan(
             requests=mfa_requests,
             source_audio_sha256=sha256_file(audio_path),
             sample_rate=sample_rate,
+            expected_model_id=language_profile.mfa_model,
+            expected_language=language_profile.code,
         )
     except (
         FinalRenderError,
@@ -5427,9 +5477,10 @@ def build_final_boundary_plan(
         "schema_version": 2,
         "planner": "authoritative_single_pass_boundary_plan_v2",
         "status": plan_status,
+        "language": language_profile.code,
         "alignment_backend": "mfa",
         "mfa_version": MFA_VERSION,
-        "mfa_model": MFA_MODEL_ID,
+        "mfa_model": language_profile.mfa_model,
         "mfa_fine_tune": True,
         "source_audio": str(audio_path),
         "source_audio_sha256": sha256_file(audio_path),
@@ -5449,14 +5500,17 @@ def build_final_boundary_plan(
         "pause_degraded_batches": pause_degraded_batches,
         "configuration": {
             "alignment_backend": "mfa",
+            "language": language_profile.code,
             "mfa_version": MFA_VERSION,
-            "mfa_model": MFA_MODEL_ID,
+            "mfa_model": language_profile.mfa_model,
             "mfa_fine_tune": True,
             "mfa_prefix": str(mfa_prefix.resolve()),
             "mfa_cache_root": str(mfa_cache_root.resolve()),
             "mfa_num_jobs": mfa_num_jobs,
             "whisperx_purpose": "retained_word_completeness_veto",
             "whisperx_coordinate_authority": False,
+            "whisperx_language": language_profile.whisperx_language,
+            "whisperx_model": language_profile.whisperx_model,
             "protected_speech_margin_ms": PROTECTED_SPEECH_MARGIN_MS,
             "minimum_verified_quiet_ms": MINIMUM_VERIFIED_QUIET_MS,
             "quiet_fade_ms": QUIET_FADE_MS,
@@ -5553,10 +5607,16 @@ def _intervals_overlap(
 
 
 def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
+    try:
+        language_profile = get_language_profile(
+            str(boundary_plan.get("language", "en"))
+        )
+    except ValueError as error:
+        raise FinalRenderError("boundary plan has an unsupported language") from error
     if (
         boundary_plan.get("alignment_backend") != "mfa"
         or boundary_plan.get("mfa_version") != MFA_VERSION
-        or boundary_plan.get("mfa_model") != MFA_MODEL_ID
+        or boundary_plan.get("mfa_model") != language_profile.mfa_model
         or boundary_plan.get("mfa_fine_tune") is not True
     ):
         raise FinalRenderError("boundary plan has no authoritative MFA provenance")
@@ -6359,6 +6419,7 @@ def _full_source_passthrough_boundary_plan(
     through the normal immutable-plan renderer.
     """
 
+    language_profile = get_language_profile(str(unsafe_plan.get("language", "en")))
     source_info = sf.info(audio_path)
     sample_rate = int(source_info.samplerate)
     total_samples = int(source_info.frames)
@@ -6405,9 +6466,10 @@ def _full_source_passthrough_boundary_plan(
         {
             "status": "safe",
             "planner": "authoritative_single_pass_boundary_plan_v2",
+            "language": language_profile.code,
             "alignment_backend": "mfa",
             "mfa_version": MFA_VERSION,
-            "mfa_model": MFA_MODEL_ID,
+            "mfa_model": language_profile.mfa_model,
             "mfa_fine_tune": True,
             "source_audio": str(audio_path),
             "source_audio_sha256": sha256_file(audio_path),
@@ -6483,6 +6545,7 @@ def render_final_cut(
     output_dir: Path,
     pause_plan_path: Path | None = None,
     alignment_python: Path = DEFAULT_ALIGNMENT_PYTHON,
+    language: str = ALIGNMENT_LANGUAGE,
     alignment_backend: str = "mfa",
     mfa_prefix: Path = DEFAULT_MFA_PREFIX,
     mfa_cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
@@ -6513,6 +6576,7 @@ def render_final_cut(
 ) -> dict[str, Any]:
     """Build one immutable boundary plan, then render canonical samples once."""
 
+    language_profile = get_language_profile(language)
     audio_path = audio_path.resolve()
     plan_path = plan_path.resolve()
     output_dir = output_dir.resolve()
@@ -6542,6 +6606,7 @@ def render_final_cut(
     plan, grounding_path, selected_range_count = _validate_grounded_plan(
         audio_path=audio_path,
         plan_path=plan_path,
+        language=language_profile.code,
     )
     original_selected_word_ids = _selected_source_word_ids(plan)
     original_source_word_count = len(plan.get("words", []))
@@ -6612,6 +6677,7 @@ def render_final_cut(
                 pause_plan_path=effective_pause_path,
                 output_dir=evidence_dir,
                 alignment_python=alignment_python,
+                language=language_profile.code,
                 alignment_backend=alignment_backend,
                 mfa_prefix=mfa_prefix,
                 mfa_cache_root=mfa_cache_root,
@@ -6729,6 +6795,7 @@ def render_final_cut(
             ) = _validate_grounded_plan(
                 audio_path=audio_path,
                 plan_path=repaired_path,
+                language=language_profile.code,
             )
             if effective_plan != repaired:
                 raise FinalRenderError(
@@ -6819,6 +6886,7 @@ def render_final_cut(
                 ) = _validate_grounded_plan(
                     audio_path=audio_path,
                     plan_path=fallback_plan_path,
+                    language=language_profile.code,
                 )
                 if candidate_plan != fallback_plan:
                     raise FinalRenderError(
@@ -6875,6 +6943,7 @@ def render_final_cut(
                     pause_plan_path=effective_pause_path,
                     output_dir=pass_dir / "boundary_evidence",
                     alignment_python=alignment_python,
+                    language=language_profile.code,
                     alignment_backend=alignment_backend,
                     mfa_prefix=mfa_prefix,
                     mfa_cache_root=mfa_cache_root,
@@ -7115,10 +7184,13 @@ def render_final_cut(
         "pause_degraded_batch_count": len(
             boundary_plan.get("pause_degraded_batches", [])
         ),
+        "language": language_profile.code,
         "alignment_backend": "mfa",
         "mfa_version": MFA_VERSION,
-        "mfa_model": MFA_MODEL_ID,
+        "mfa_model": language_profile.mfa_model,
         "mfa_fine_tune": True,
+        "whisperx_completeness_language": language_profile.whisperx_language,
+        "whisperx_completeness_model": language_profile.whisperx_model,
         "pause_policy": pause_policy,
         "breath_cleanup_mode": breath_cleanup,
         "breath_threshold": breath_threshold,
@@ -7286,6 +7358,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--pause-plan", type=Path)
     parser.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGE_CODES,
+        default="en",
+        help="Source narration language (default: en).",
+    )
+    parser.add_argument(
         "--pause-policy",
         choices=PAUSE_POLICIES,
         default="semantic",
@@ -7320,11 +7398,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--breath-cleanup",
         choices=BREATH_CLEANUP_MODES,
-        default="replace",
+        default=None,
         help=(
             "Respiro-en cleanup and ambience screening inside MFA-confirmed "
-            "non-speech; off suppresses unverified inserted ambience "
-            "(default: replace)."
+            "non-speech. Defaults to replace for English and off for Russian; "
+            "an explicit selection overrides the language default."
         ),
     )
     parser.add_argument(
@@ -7374,6 +7452,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    language_profile = get_language_profile(args.language)
+    breath_cleanup = (
+        language_profile.default_breath_cleanup
+        if args.breath_cleanup is None
+        else args.breath_cleanup
+    )
     if not args.render_plan:
         raise SystemExit("final plan rendering requires --render-plan")
     if args.max_acoustic_retries < 0:
@@ -7390,12 +7474,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         output_dir=args.output_dir,
         pause_plan_path=args.pause_plan,
         alignment_python=args.alignment_python,
+        language=args.language,
         alignment_backend=args.alignment_backend,
         mfa_prefix=args.mfa_prefix,
         mfa_cache_root=args.mfa_cache_root,
         mfa_micromamba=args.mfa_micromamba,
         mfa_num_jobs=args.mfa_num_jobs,
-        breath_cleanup=args.breath_cleanup,
+        breath_cleanup=breath_cleanup,
         breath_threshold=args.breath_threshold,
         breath_min_duration_ms=args.breath_min_duration_ms,
         respiro_cache_root=args.respiro_cache_root,
@@ -7430,7 +7515,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "status": manifest["status"],
                 "final_cut": manifest["final_cut_wav"],
                 "manifest": str(
-                    (args.output_dir.resolve() / "final_render_manifest.json")
+                    args.output_dir.resolve() / "final_render_manifest.json"
                 ),
                 "cached_pause_plan": manifest["pause_plan"],
             },

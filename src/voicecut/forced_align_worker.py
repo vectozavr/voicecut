@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import traceback
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -27,6 +28,7 @@ def run_alignment_jobs(
     jobs_path: Path,
     output_path: Path,
     language: str,
+    align_model: str | None = None,
     device: str,
 ) -> dict[str, Any]:
     if device != "cpu":
@@ -40,15 +42,19 @@ def run_alignment_jobs(
     import whisperx
 
     try:
-        model_a, metadata = whisperx.load_align_model(
-            language_code=language,
-            device=device,
-        )
+        load_arguments: dict[str, Any] = {
+            "language_code": language,
+            "device": device,
+        }
+        if align_model:
+            load_arguments["model_name"] = align_model
+        model_a, metadata = whisperx.load_align_model(**load_arguments)
     except Exception as error:
         result = {
             "schema_version": 1,
             "backend": "whisperx_alignment",
             "language": language,
+            "requested_model": align_model,
             "device": device,
             "fatal_error": f"{type(error).__name__}: {error}",
             "fatal_traceback": traceback.format_exc(),
@@ -125,10 +131,12 @@ def run_alignment_jobs(
         "schema_version": 1,
         "backend": "whisperx_alignment",
         "language": language,
+        "requested_model": align_model,
         "device": device,
         "model_metadata": {
             "language": metadata.get("language"),
             "type": metadata.get("type"),
+            "requested_model": align_model,
         },
         "jobs": aligned_jobs,
     }
@@ -146,6 +154,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--language", default="en")
+    parser.add_argument("--align-model")
     parser.add_argument("--device", default="cpu")
     return parser
 
@@ -156,6 +165,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         jobs_path=args.jobs.resolve(),
         output_path=args.output.resolve(),
         language=args.language,
+        align_model=args.align_model,
         device=args.device,
     )
     failed = sum(bool(job.get("error")) for job in result["jobs"])

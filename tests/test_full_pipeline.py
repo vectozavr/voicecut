@@ -395,6 +395,170 @@ def test_public_parser_is_one_input_to_one_output(tmp_path: Path) -> None:
     assert parsed.debug_artifacts is False
 
 
+def test_russian_profile_bypasses_english_ctc_and_propagates_language(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "russian.wav"
+    source.write_bytes(b"russian source media")
+    args = _args(tmp_path, source)
+    args.language = "ru"
+    calls: list[list[str]] = []
+    russian_mfa_model = (
+        "MontrealCorpusTools/russian_mfa@88b81ae3eaf3bd8163bb3f7c43e1ae61478595af"
+    )
+
+    def fake_media_preparer(input_path: Path, output_dir: Path):
+        output_dir.mkdir(parents=True)
+        canonical = output_dir / "source_audio.wav"
+        canonical.write_bytes(b"canonical russian audio")
+        manifest = {
+            "status": "complete",
+            "source_media": str(input_path.resolve()),
+            "source_media_sha256": sha256_file(input_path),
+            "source_kind": "audio",
+            "canonical_audio": str(canonical.resolve()),
+            "canonical_audio_sha256": sha256_file(canonical),
+        }
+        write_json(output_dir / "media_input.json", manifest)
+        return manifest
+
+    def fake_runner(command: list[str], **_: object) -> None:
+        calls.append(command)
+        module = command[command.index("-m") + 1]
+        audio = args.work_dir / "00_media/source_audio.wav"
+        audio_sha = sha256_file(audio)
+        if module == "voicecut.analyze":
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            write_json(output_dir / "analysis.json", {"audio_sha256": audio_sha})
+        elif module == "voicecut.transcribe_mlx":
+            assert command[command.index("--language") + 1] == "ru"
+            write_json(
+                Path(command[command.index("--output") + 1]),
+                {"audio_sha256": audio_sha, "language": "ru", "atoms": []},
+            )
+        elif module == "voicecut.streaming_narration":
+            assert command[command.index("--language") + 1] == "ru"
+            transcript = Path(command[command.index("--transcript") + 1])
+            assert transcript == (
+                args.work_dir / "02_transcription/source_transcript.json"
+            )
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            write_json(
+                output_dir / "streaming_plan.json",
+                {
+                    "status": "complete",
+                    "backend": "gemini",
+                    "model": "gemini-3.6-flash",
+                    "transcript": str(transcript.resolve()),
+                    "transcript_sha256": sha256_file(transcript),
+                },
+            )
+        elif module == "voicecut.final_render":
+            assert command[command.index("--language") + 1] == "ru"
+            assert command[command.index("--breath-cleanup") + 1] == "off"
+            output_dir = Path(command[command.index("--output-dir") + 1])
+            output_dir.mkdir(parents=True)
+            final_cut = output_dir / "final_cut.wav"
+            final_cut.write_bytes(b"rendered russian audio")
+            boundary_plan = output_dir / "final_boundary_plan.json"
+            write_json(boundary_plan, {"status": "safe", "language": "ru"})
+            plan = Path(command[command.index("--plan") + 1])
+            write_json(
+                output_dir / "final_render_manifest.json",
+                {
+                    "status": "complete",
+                    "renderer": "authoritative_single_pass_final_render_v3",
+                    "alignment_backend": "mfa",
+                    "mfa_version": "3.4.1",
+                    "mfa_model": russian_mfa_model,
+                    "mfa_fine_tune": True,
+                    "pause_policy": "semantic",
+                    "breath_cleanup_mode": "off",
+                    "breath_threshold": 0.5,
+                    "breath_min_duration_ms": 80,
+                    "respiro_upstream_commit": (
+                        "70e01c60c2f582c41092730680f2894ab24d6467"
+                    ),
+                    "respiro_checkpoint_sha256": (
+                        "1f4a9b96f96645c480bf0e07b1e18cd68878ac0b4bb5dc920ad93f9b17df858a"
+                    ),
+                    "source_audio_sha256": audio_sha,
+                    "streaming_plan": str(plan.resolve()),
+                    "streaming_plan_sha256": sha256_file(plan),
+                    "effective_streaming_plan": str(plan.resolve()),
+                    "effective_streaming_plan_sha256": sha256_file(plan),
+                    "pause_planner_backend": "gemini",
+                    "pause_planner_model": "gemini-3.6-flash",
+                    "final_cut_wav": str(final_cut.resolve()),
+                    "final_cut_wav_sha256": sha256_file(final_cut),
+                    "final_boundary_plan": str(boundary_plan.resolve()),
+                    "final_boundary_plan_sha256": sha256_file(boundary_plan),
+                    "duration_seconds": 1.0,
+                },
+            )
+        else:
+            raise AssertionError(command)
+
+    def fake_audio_publisher(
+        final_wav: Path,
+        output_path: Path,
+        *,
+        manifest_path: Path,
+        overwrite: bool,
+    ) -> dict[str, object]:
+        assert final_wav.read_bytes() == b"rendered russian audio"
+        assert overwrite is False
+        output_path.write_bytes(b"published russian audio")
+        write_json(manifest_path, {"status": "complete"})
+        return {"status": "complete", "output_audio": str(output_path)}
+
+    result = run_full_pipeline(
+        args,
+        runner=fake_runner,
+        media_preparer=fake_media_preparer,
+        audio_publisher=fake_audio_publisher,
+        planner_preflight=_fake_gemini_preflight,
+    )
+
+    modules = [command[command.index("-m") + 1] for command in calls]
+    assert "voicecut.ctc_enrich" not in modules
+    assert args.breath_cleanup == "off"
+    assert result["language"] == "ru"
+    assert result["mfa_model"] == russian_mfa_model
+    assert result["semantic_transcript"] == str(
+        args.work_dir / "02_transcription/source_transcript.json"
+    )
+    assert result["enriched_transcript"] is None
+    assert result["ctc_enrichment_status"] == "skipped_unsupported_language"
+    assert result["stages"]["hidden_retry_recovery"] == ("skipped_language_policy")
+    report = read_json(args.work_dir / "03_ctc_enrichment/ctc_enrichment_report.json")
+    assert report["status"] == "skipped_unsupported_language"
+    assert report["language"] == "ru"
+    assert report["ctc_enrichment_supported"] is False
+    assert not (
+        args.work_dir / "03_ctc_enrichment/source_transcript_ctc_enriched.json"
+    ).exists()
+    configuration = read_json(args.work_dir / "pipeline_config.json")
+    assert configuration["language"] == "ru"
+    assert configuration["language_profile"]["mfa_model"] == russian_mfa_model
+    assert configuration["language_profile"]["whisperx_language"] == "ru"
+    assert configuration["breath_cleanup"] == "off"
+
+
+def test_explicit_russian_breath_cleanup_override_is_preserved(tmp_path: Path) -> None:
+    parsed = build_parser().parse_args(
+        [
+            str(tmp_path / "russian.wav"),
+            "--language",
+            "ru",
+            "--breath-cleanup",
+            "replace",
+        ]
+    )
+    assert parsed.language == "ru"
+    assert parsed.breath_cleanup == "replace"
+
+
 def test_optional_ctc_process_failure_completes_with_whisper_passthrough(
     tmp_path: Path,
 ) -> None:

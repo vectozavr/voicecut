@@ -1877,6 +1877,140 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertEqual(first_validation["unsupported_tokens"], [])
             self.assertEqual(first_validation["status"], "valid")
 
+    def test_russian_grounding_preserves_yo_and_rejects_english_fuzzy_match(
+        self,
+    ) -> None:
+        words = [
+            TranscriptWord(0, "Ещё", 0.0, 0.2),
+            TranscriptWord(1, "модель", 0.2, 0.5),
+        ]
+        valid = response(
+            finalized=[
+                thought(
+                    "Ещё модель",
+                    (0, 1, "Ещё", "модель", "Ещё модель"),
+                )
+            ],
+            pending_start_word_id=None,
+        )
+
+        decision = validate_decision(
+            valid,
+            pending_words=words,
+            final_pass=True,
+            committed_source_end=0,
+            language="ru",
+        )
+
+        self.assertEqual(decision.finalized[0].canonical_text, "Ещё модель")
+        fuzzy_content_change = response(
+            finalized=[
+                thought(
+                    "Ещё модуль",
+                    (0, 1, "Ещё", "модель", "Ещё модуль"),
+                )
+            ],
+            pending_start_word_id=None,
+        )
+        with self.assertRaises(SourceGroundingValidationError):
+            validate_decision(
+                fuzzy_content_change,
+                pending_words=words,
+                final_pass=True,
+                committed_source_end=0,
+                language="ru",
+            )
+
+    def test_russian_grounding_allows_only_the_common_e_yo_asr_correction(
+        self,
+    ) -> None:
+        words = [
+            TranscriptWord(0, "Еще", 0.0, 0.2),
+            TranscriptWord(1, "один", 0.2, 0.5),
+        ]
+        corrected = response(
+            finalized=[
+                thought(
+                    "Ещё один",
+                    (0, 1, "Еще", "один", "Ещё один"),
+                )
+            ],
+            pending_start_word_id=None,
+        )
+
+        decision = validate_decision(
+            corrected,
+            pending_words=words,
+            final_pass=True,
+            committed_source_end=0,
+            language="ru",
+        )
+
+        self.assertEqual(decision.finalized[0].canonical_text, "Ещё один")
+
+    def test_russian_planner_prompt_and_provenance_remain_russian(self) -> None:
+        transcript = transcript_with_word_groups([(0.0, ["Это", "ещё", "тест."])])
+        transcript["language"] = "ru"
+        backend = FakeStreamingBackend(
+            [
+                response(finalized=[], pending_start_word_id=0),
+                response(
+                    finalized=[
+                        thought(
+                            "Это ещё тест.",
+                            (0, 2, "Это", "тест.", "Это ещё тест."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            output_dir = root / "plan"
+
+            plan = run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=output_dir,
+                backend=backend,
+                language="ru",
+            )
+
+            self.assertEqual(plan["language"], "ru")
+            self.assertEqual(
+                plan["language_provenance"],
+                {
+                    "planner_language": "ru",
+                    "source_transcript_language": "ru",
+                },
+            )
+            self.assertEqual(plan["reconstructed_narration"], "Это ещё тест.")
+            self.assertIn("SOURCE LANGUAGE: Russian (ru)", backend.prompts[0])
+            self.assertIn("ё", backend.prompts[0])
+            grounding = read_json(output_dir / "grounding_validation.json")
+            self.assertEqual(grounding["language"], "ru")
+            self.assertEqual(grounding["thoughts"][0]["language"], "ru")
+
+    def test_planner_rejects_transcript_language_mismatch(self) -> None:
+        transcript = transcript_with_word_groups([(0.0, ["Тест."])])
+        transcript["language"] = "ru"
+        backend = FakeStreamingBackend([])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                run_streaming_planner(
+                    transcript_path=transcript_path,
+                    output_dir=root / "plan",
+                    backend=backend,
+                    language="en",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -43,6 +43,46 @@ NUMBER_WORDS = {
     "100": "hundred",
 }
 
+RUSSIAN_NUMBER_WORDS = {
+    0: "ноль",
+    1: "один",
+    2: "два",
+    3: "три",
+    4: "четыре",
+    5: "пять",
+    6: "шесть",
+    7: "семь",
+    8: "восемь",
+    9: "девять",
+    10: "десять",
+    11: "одиннадцать",
+    12: "двенадцать",
+    13: "тринадцать",
+    14: "четырнадцать",
+    15: "пятнадцать",
+    16: "шестнадцать",
+    17: "семнадцать",
+    18: "восемнадцать",
+    19: "девятнадцать",
+    20: "двадцать",
+    30: "тридцать",
+    40: "сорок",
+    50: "пятьдесят",
+    60: "шестьдесят",
+    70: "семьдесят",
+    80: "восемьдесят",
+    90: "девяносто",
+    100: "сто",
+    200: "двести",
+    300: "триста",
+    400: "четыреста",
+    500: "пятьсот",
+    600: "шестьсот",
+    700: "семьсот",
+    800: "восемьсот",
+    900: "девятьсот",
+}
+
 CONTRACTIONS = {
     "arent": ["are", "not"],
     "cant": ["can", "not"],
@@ -100,31 +140,104 @@ SPOKEN_EQUIVALENTS = {
 }
 
 
-def integer_to_words(value: int) -> list[str]:
+def _russian_below_thousand(value: int) -> list[str]:
+    if not 0 <= value < 1000:
+        raise ValueError("Russian number chunk must be between 0 and 999")
+    if value == 0:
+        return [RUSSIAN_NUMBER_WORDS[0]]
+    result: list[str] = []
+    hundreds, remainder = divmod(value, 100)
+    if hundreds:
+        result.append(RUSSIAN_NUMBER_WORDS[hundreds * 100])
+    if remainder in RUSSIAN_NUMBER_WORDS:
+        if remainder:
+            result.append(RUSSIAN_NUMBER_WORDS[remainder])
+        return result
+    tens, units = divmod(remainder, 10)
+    if tens:
+        result.append(RUSSIAN_NUMBER_WORDS[tens * 10])
+    if units:
+        result.append(RUSSIAN_NUMBER_WORDS[units])
+    return result
+
+
+def _integer_to_russian_words(value: int) -> list[str]:
+    """Return conservative nominative Russian cardinals through 999,999."""
+
     if value < 0:
-        return ["minus", *integer_to_words(-value)]
+        return ["минус", *_integer_to_russian_words(-value)]
+    if value < 1000:
+        return _russian_below_thousand(value)
+    if value >= 1_000_000:
+        # Large values have substantially more inflectional ambiguity. Keep
+        # the source token literal rather than claiming an unsafe equivalence.
+        return [str(value)]
+    thousands, remainder = divmod(value, 1000)
+    thousands_words = _russian_below_thousand(thousands)
+    if thousands_words[-1] == "один":
+        thousands_words[-1] = "одна"
+    elif thousands_words[-1] == "два":
+        thousands_words[-1] = "две"
+    last_two = thousands % 100
+    last_digit = thousands % 10
+    if 11 <= last_two <= 14:
+        thousands_noun = "тысяч"
+    elif last_digit == 1:
+        thousands_noun = "тысяча"
+    elif 2 <= last_digit <= 4:
+        thousands_noun = "тысячи"
+    else:
+        thousands_noun = "тысяч"
+    result = [*thousands_words, thousands_noun]
+    if remainder:
+        result.extend(_russian_below_thousand(remainder))
+    return result
+
+
+def integer_to_words(value: int, language: str = "en") -> list[str]:
+    if language == "ru":
+        return _integer_to_russian_words(value)
+    if language != "en":
+        raise ValueError(f"unsupported tokenization language: {language}")
+    if value < 0:
+        return ["minus", *integer_to_words(-value, language=language)]
     if value <= 20 or value in {30, 40, 50, 60, 70, 80, 90}:
         return [NUMBER_WORDS[str(value)]]
     if value < 100:
         tens, remainder = divmod(value, 10)
-        return [NUMBER_WORDS[str(tens * 10)], *integer_to_words(remainder)]
+        return [
+            NUMBER_WORDS[str(tens * 10)],
+            *integer_to_words(remainder, language=language),
+        ]
     if value < 1000:
         hundreds, remainder = divmod(value, 100)
-        result = [*integer_to_words(hundreds), "hundred"]
-        return result + (integer_to_words(remainder) if remainder else [])
+        result = [*integer_to_words(hundreds, language=language), "hundred"]
+        return result + (
+            integer_to_words(remainder, language=language) if remainder else []
+        )
     if value < 1_000_000:
         thousands, remainder = divmod(value, 1000)
-        result = [*integer_to_words(thousands), "thousand"]
-        return result + (integer_to_words(remainder) if remainder else [])
+        result = [*integer_to_words(thousands, language=language), "thousand"]
+        return result + (
+            integer_to_words(remainder, language=language) if remainder else []
+        )
     return [str(value)]
 
 
-def numeric_tokens(token: str) -> list[str]:
+def numeric_tokens(token: str, language: str = "en") -> list[str]:
     if "." not in token:
-        return integer_to_words(int(token))
+        return integer_to_words(int(token), language=language)
     integer, fraction = token.split(".", 1)
+    if language == "ru":
+        return [
+            *integer_to_words(int(integer or "0"), language=language),
+            "точка",
+            *(RUSSIAN_NUMBER_WORDS[int(digit)] for digit in fraction),
+        ]
+    if language != "en":
+        raise ValueError(f"unsupported tokenization language: {language}")
     return [
-        *integer_to_words(int(integer or "0")),
+        *integer_to_words(int(integer or "0"), language=language),
         "point",
         *(NUMBER_WORDS[digit] for digit in fraction),
     ]
@@ -169,17 +282,32 @@ def lightly_stem(token: str) -> str:
     return token
 
 
-def tokenize(text: str, aliases: dict[str, list[str]] | None = None) -> list[str]:
+def tokenize(
+    text: str,
+    aliases: dict[str, list[str]] | None = None,
+    language: str = "en",
+) -> list[str]:
+    if language not in {"en", "ru"}:
+        raise ValueError(f"unsupported tokenization language: {language}")
     aliases = aliases or {}
-    normalized = "".join(
-        character
-        for character in unicodedata.normalize("NFKD", text).casefold()
-        if not unicodedata.combining(character)
-    )
+    if language == "ru":
+        # NFKC keeps Russian letters such as ё and й intact. The English
+        # path deliberately retains its historic accent-insensitive NFKD
+        # behavior for backward compatibility.
+        normalized = unicodedata.normalize("NFKC", text).casefold()
+    else:
+        normalized = "".join(
+            character
+            for character in unicodedata.normalize("NFKD", text).casefold()
+            if not unicodedata.combining(character)
+        )
     normalized = normalized.replace("’", "'").replace("–", "-").replace("—", "-")
     # ASR may emit the percent sign as a separate timed "word".  Retain that
     # timing and meaning instead of dropping it during tokenization.
-    normalized = normalized.replace("%", " percent ")
+    normalized = normalized.replace(
+        "%",
+        " процент " if language == "ru" else " percent ",
+    )
     raw = re.findall(
         r"\d+(?:\.\d+)?|[^\W\d_]+(?:'[^\W\d_]+)?",
         normalized,
@@ -188,18 +316,22 @@ def tokenize(text: str, aliases: dict[str, list[str]] | None = None) -> list[str
     result: list[str] = []
     for item in raw:
         token = item.replace("'", "")
-        if item in APOSTROPHE_CONTRACTIONS:
+        if language == "en" and item in APOSTROPHE_CONTRACTIONS:
             expansion = APOSTROPHE_CONTRACTIONS[item]
         elif token in aliases:
             expansion = aliases[token]
-        elif token in CONTRACTIONS:
+        elif language == "en" and token in CONTRACTIONS:
             expansion = CONTRACTIONS[token]
         elif re.fullmatch(r"\d+(?:\.\d+)?", token):
-            expansion = numeric_tokens(token)
+            expansion = numeric_tokens(token, language=language)
         else:
             expansion = [token]
         result.extend(
-            lightly_stem(SPOKEN_EQUIVALENTS.get(part, part))
+            (
+                lightly_stem(SPOKEN_EQUIVALENTS.get(part, part))
+                if language == "en"
+                else part
+            )
             for part in expansion
             if part
         )

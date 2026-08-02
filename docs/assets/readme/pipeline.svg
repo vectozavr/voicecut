@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="590" viewBox="0 0 1500 590" role="img">
+  <style>
+    text { font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#64748b"/></marker>
+  </defs>
+  <rect width="1500" height="590" rx="24" fill="#f8fafc"/>
+  <text x="48" y="57" font-size="30" font-weight="700" fill="#172033">One semantic plan, one final render</text>
+  <text x="48" y="90" font-size="16" fill="#64748b">Production path reflected by voicecut.full_pipeline and voicecut.final_render</text>
+  <rect x="45" y="135" width="205" height="105" rx="16" fill="#ffffff" stroke="#dbe4ef" stroke-width="1"/>
+  <text x="63" y="174" font-size="18" font-weight="700" fill="#172033">Audio / video</text>
+  <text x="63" y="205" font-size="14" fill="#64748b">Canonical source WAV</text>
+  <rect x="285" y="135" width="205" height="105" rx="16" fill="#ffffff" stroke="#dbe4ef" stroke-width="1"/>
+  <text x="303" y="174" font-size="18" font-weight="700" fill="#172033">Whisper</text>
+  <text x="303" y="205" font-size="14" fill="#64748b">Words + time anchors</text>
+  <rect x="525" y="135" width="245" height="105" rx="16" fill="#e8e7ff" stroke="#625bf6" stroke-width="2"/>
+  <text x="543" y="174" font-size="18" font-weight="700" fill="#172033">Streaming planner</text>
+  <text x="543" y="205" font-size="14" fill="#64748b">Gemini selects source IDs</text>
+  <rect x="805" y="135" width="215" height="105" rx="16" fill="#ffffff" stroke="#dbe4ef" stroke-width="1"/>
+  <text x="823" y="174" font-size="18" font-weight="700" fill="#172033">Grounding</text>
+  <text x="823" y="205" font-size="14" fill="#64748b">Exact source occurrences</text>
+  <rect x="1055" y="135" width="220" height="105" rx="16" fill="#ffffff" stroke="#dbe4ef" stroke-width="1"/>
+  <text x="1073" y="174" font-size="18" font-weight="700" fill="#172033">Completeness veto</text>
+  <text x="1073" y="205" font-size="14" fill="#64748b">WhisperX · no cuts</text>
+  <rect x="925" y="350" width="255" height="115" rx="16" fill="#e8e7ff" stroke="#625bf6" stroke-width="2"/>
+  <text x="943" y="389" font-size="18" font-weight="700" fill="#172033">MFA 3.4.1</text>
+  <text x="943" y="420" font-size="14" fill="#64748b">Phone-safe boundaries</text>
+  <rect x="610" y="350" width="270" height="115" rx="16" fill="#ffffff" stroke="#dbe4ef" stroke-width="1"/>
+  <text x="628" y="389" font-size="18" font-weight="700" fill="#172033">Pause + ambience</text>
+  <text x="628" y="420" font-size="14" fill="#64748b">Breath-safe source tone</text>
+  <rect x="300" y="350" width="265" height="115" rx="16" fill="#e8e7ff" stroke="#625bf6" stroke-width="2"/>
+  <text x="318" y="389" font-size="18" font-weight="700" fill="#172033">Immutable plan</text>
+  <text x="318" y="420" font-size="14" fill="#64748b">All samples resolved first</text>
+  <rect x="45" y="350" width="210" height="115" rx="16" fill="#e8e7ff" stroke="#625bf6" stroke-width="2"/>
+  <text x="63" y="389" font-size="18" font-weight="700" fill="#172033">Single render</text>
+  <text x="63" y="420" font-size="14" fill="#64748b">Canonical samples once</text>
+  <path d="M 250 188 L 277 188" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 490 188 L 517 188" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 770 188 L 797 188" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 1020 188 L 1047 188" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 1165 240 L 1165 294 Q 1165 320 1135 320 L 1060 320 L 1060 342" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 925 407 L 888 407" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 610 407 L 573 407" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M 300 407 L 263 407" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <text x="48" y="520" font-size="14" fill="#64748b">Whisper timestamps are crop anchors. MFA phone alignment owns final cut coordinates.</text>
+  <text x="48" y="546" font-size="14" fill="#64748b">One immutable plan is rendered once; video publication uses clear cuts without inserted pauses.</text>
+</svg>

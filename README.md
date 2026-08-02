@@ -16,8 +16,7 @@ recordings on Apple Silicon Macs.
 
 ## Examples
 
-[Play the original and edited English audio, Russian audio, and video on the
-VoiceCut demo page.](https://vectozavr.github.io/voicecut/)
+[![Open the VoiceCut demo](https://img.shields.io/badge/Open_the_VoiceCut_demo-087b65?style=for-the-badge&logo=githubpages&logoColor=white)](https://vectozavr.github.io/voicecut/)
 
 ## Quick start
 

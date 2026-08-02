@@ -258,6 +258,30 @@ def _normalized_anchor(text: str) -> str:
     )
 
 
+def _anchors_match(actual: str, expected: str) -> bool:
+    """Compare lexical anchors while preserving exact non-lexical anchors.
+
+    Whisper occasionally emits standalone punctuation occurrences such as
+    ``-``.  Those occurrences have no alphanumeric normalization, but they are
+    still real ordered source IDs that a conservative source-preservation plan
+    may need to span.  Requiring a non-empty lexical normalization made an
+    exact ``-``/``-`` pair paradoxically fail validation.
+
+    Lexical anchors retain the existing punctuation-insensitive comparison.
+    Non-lexical anchors are accepted only when both sides are the same
+    non-empty NFKC-normalized literal, so punctuation can never stand in for a
+    spoken word.
+    """
+
+    actual_lexical = _normalized_anchor(actual)
+    expected_lexical = _normalized_anchor(expected)
+    if actual_lexical or expected_lexical:
+        return bool(actual_lexical) and actual_lexical == expected_lexical
+    actual_literal = unicodedata.normalize("NFKC", actual).casefold().strip()
+    expected_literal = unicodedata.normalize("NFKC", expected).casefold().strip()
+    return bool(actual_literal) and actual_literal == expected_literal
+
+
 def _compact_canonical_text(text: str) -> str:
     """Normalize punctuation, case, whitespace, and joined/split forms."""
 
@@ -858,16 +882,12 @@ def validate_decision(
                     )
             expected_first = pending_word_by_id[first_word_id].text
             expected_last = pending_word_by_id[last_word_id].text
-            if not _normalized_anchor(first_word) or _normalized_anchor(
-                first_word
-            ) != _normalized_anchor(expected_first):
+            if not _anchors_match(first_word, expected_first):
                 raise DecisionValidationError(
                     f'first_word anchor "{first_word}" does not match source '
                     f'word {first_word_id} "{expected_first}"'
                 )
-            if not _normalized_anchor(last_word) or _normalized_anchor(
-                last_word
-            ) != _normalized_anchor(expected_last):
+            if not _anchors_match(last_word, expected_last):
                 raise DecisionValidationError(
                     f'last_word anchor "{last_word}" does not match source '
                     f'word {last_word_id} "{expected_last}"'
@@ -1255,11 +1275,10 @@ def _source_passthrough_decision(
     window_seconds: float,
     iteration: int,
     attempts: Sequence[dict[str, Any]],
-    trigger: str,
     reason: str,
     grounding_failure: dict[str, Any] | None,
 ) -> tuple[PlannerDecision, list[dict[str, Any]], dict[str, Any]]:
-    """Preserve exact source while retaining one new look-ahead window."""
+    """Fail soft after a request failure while retaining one look-ahead window."""
 
     if not pending_words:
         raise StreamingPlanError("source passthrough has no pending words")
@@ -1296,23 +1315,16 @@ def _source_passthrough_decision(
             if passthrough_words
             else "source_passthrough_deferred_for_lookahead"
         )
-        if trigger == "request_failure":
-            pending_reason = (
-                "The planner exhausted both attempts. A bounded older prefix was "
-                "preserved exactly while the newest look-ahead window remains pending."
-                if passthrough_words
-                else (
-                    "The planner exhausted both attempts in the first visible "
-                    "window; the complete window remains pending for additional "
-                    "look-ahead."
-                )
+        pending_reason = (
+            "The planner exhausted both attempts. A bounded older prefix was "
+            "preserved exactly while the newest look-ahead window remains pending."
+            if passthrough_words
+            else (
+                "The planner exhausted both attempts in the first visible "
+                "window; the complete window remains pending for additional "
+                "look-ahead."
             )
-        else:
-            pending_reason = (
-                "The planner repeatedly made no chronological progress. A bounded "
-                "older prefix was preserved exactly while the newest look-ahead "
-                "window remains pending."
-            )
+        )
 
     finalized = (
         (_exact_source_passthrough_thought(passthrough_words),)
@@ -1342,7 +1354,7 @@ def _source_passthrough_decision(
     fallback = {
         "iteration": iteration,
         "status": status,
-        "trigger": trigger,
+        "trigger": "request_failure",
         "reason": reason,
         "final_pass": final_pass,
         "source_ranges": selected_ranges,
@@ -1392,7 +1404,6 @@ def _passthrough_after_request_failure(
         window_seconds=window_seconds,
         iteration=iteration,
         attempts=attempts,
-        trigger="request_failure",
         reason=str(failure.get("validation_error", "planner request failed")),
         grounding_failure=(
             grounding_failure if isinstance(grounding_failure, dict) else None
@@ -1681,18 +1692,47 @@ def repair_plan_for_acoustic_safety(
     repairable_statuses = {
         "unsafe_dense_boundary",
         "weak_retained_word_alignment",
+        "completeness_alignment_failed",
         "mfa_word_mapping_failed",
     }
-    unsafe = [
+    acoustic_constraints = [
         boundary
         for boundary in boundary_plan.get("boundaries", [])
         if isinstance(boundary, dict)
         and boundary.get("safety_status") in repairable_statuses
     ]
-    if not unsafe:
+    raw_active_boundary_ids = boundary_plan.get("active_repair_boundary_ids")
+    if raw_active_boundary_ids is None:
+        active_constraints = [
+            boundary
+            for boundary in acoustic_constraints
+            if boundary.get("repair_constraint_role") != "historical"
+        ]
+    else:
+        if not isinstance(raw_active_boundary_ids, list) or not all(
+            isinstance(boundary_id, str) and boundary_id
+            for boundary_id in raw_active_boundary_ids
+        ):
+            raise StreamingPlanError(
+                "active acoustic repair boundary IDs must be non-empty strings"
+            )
+        active_ids = set(raw_active_boundary_ids)
+        active_constraints = [
+            boundary
+            for boundary in acoustic_constraints
+            if boundary.get("boundary_id") in active_ids
+        ]
+        found_active_ids = {
+            str(boundary.get("boundary_id")) for boundary in active_constraints
+        }
+        if found_active_ids != active_ids:
+            raise StreamingPlanError(
+                "active acoustic repair boundary IDs do not match the boundary ledger"
+            )
+    if not active_constraints:
         raise StreamingPlanError("boundary plan has no repairable acoustic boundary")
-    by_thought: dict[int, list[dict[str, Any]]] = {}
-    for boundary in unsafe:
+
+    def affected_thoughts(boundary: dict[str, Any]) -> set[int]:
         role_ids = boundary.get("source_word_ids")
         affected = {
             thought_index
@@ -1724,12 +1764,23 @@ def repair_plan_for_acoustic_safety(
                     for word_id in relevant_word_ids
                 ):
                     affected.add(thought_index)
-        for thought_index in affected:
+        return affected
+
+    by_thought: dict[int, list[dict[str, Any]]] = {}
+    for boundary in active_constraints:
+        for thought_index in affected_thoughts(boundary):
             by_thought.setdefault(thought_index, []).append(boundary)
     if not by_thought:
         raise StreamingPlanError("unsafe boundaries map to no committed thought")
 
+    constraints_by_thought: dict[int, list[dict[str, Any]]] = {}
+    for boundary in acoustic_constraints:
+        for thought_index in affected_thoughts(boundary):
+            constraints_by_thought.setdefault(thought_index, []).append(boundary)
+
     repair_records: list[dict[str, Any]] = []
+    repair_failure_records: list[dict[str, Any]] = []
+    last_repair_error: StreamingPlanError | None = None
     for thought_index in sorted(by_thought):
         original_thought = json.loads(json.dumps(committed[thought_index]))
         original_start, original_end = _thought_source_bounds(original_thought)
@@ -1746,11 +1797,15 @@ def repair_plan_for_acoustic_safety(
         context_start = max(lower_bound, original_start - context_words)
         context_end = min(upper_bound, original_end + context_words)
         local_words = words[context_start:context_end]
+        thought_constraints = constraints_by_thought.get(
+            thought_index,
+            by_thought[thought_index],
+        )
         prompt = _acoustic_repair_prompt(
             thought_index=thought_index,
             original_thought=original_thought,
             local_words=local_words,
-            unsafe_boundaries=by_thought[thought_index],
+            unsafe_boundaries=thought_constraints,
             previous_context=(
                 str(committed[thought_index - 1]["canonical_text"])
                 if thought_index > 0
@@ -1763,27 +1818,61 @@ def repair_plan_for_acoustic_safety(
             ),
         )
         request_iteration = 10_000 + retry_index * 100 + thought_index
-        decision, attempts = _request_validated_decision(
-            backend=backend,
-            prompt=prompt,
-            pending_words=local_words,
-            final_pass=True,
-            committed_source_end=context_start,
-            iteration=request_iteration,
-            output_dir=output_dir,
-            decision_validator=lambda value, original=original_thought, boundaries=(tuple(by_thought[thought_index])): (
-                _validate_acoustic_repair_decision(
-                    value,
-                    original_thought=original,
-                    unsafe_boundaries=boundaries,
-                )
-            ),
-        )
+        try:
+            decision, attempts = _request_validated_decision(
+                backend=backend,
+                prompt=prompt,
+                pending_words=local_words,
+                final_pass=True,
+                committed_source_end=context_start,
+                iteration=request_iteration,
+                output_dir=output_dir,
+                decision_validator=lambda value, original=original_thought, constraints=(tuple(thought_constraints)): (
+                    _validate_acoustic_repair_decision(
+                        value,
+                        original_thought=original,
+                        unsafe_boundaries=constraints,
+                    )
+                ),
+            )
+        except StreamingPlanError as error:
+            last_repair_error = error
+            failure_path = (
+                output_dir / f"iteration_{request_iteration:04d}_failure.json"
+            )
+            failure_payload = (
+                read_json(failure_path) if failure_path.is_file() else None
+            )
+            repair_failure_records.append(
+                {
+                    "retry_index": retry_index,
+                    "thought_index": thought_index,
+                    "original_canonical_text": original_thought["canonical_text"],
+                    "original_source_ranges": original_thought["source_ranges"],
+                    "active_boundary_ids": [
+                        boundary["boundary_id"]
+                        for boundary in by_thought[thought_index]
+                    ],
+                    "constraint_boundary_ids": [
+                        boundary["boundary_id"] for boundary in thought_constraints
+                    ],
+                    "error": f"{type(error).__name__}: {error}",
+                    "failure_ledger": (
+                        str(failure_path.resolve()) if failure_path.is_file() else None
+                    ),
+                    "attempts": (
+                        failure_payload.get("attempts", [])
+                        if isinstance(failure_payload, dict)
+                        else []
+                    ),
+                }
+            )
+            continue
         replacement = _serialize_decision(decision)["finalized"][0]
         replacement["committed_iteration"] = original_thought.get("committed_iteration")
         replacement["grounding_validation"]["thought_index"] = thought_index
         committed[thought_index] = replacement
-        thought_boundaries = by_thought[thought_index]
+        thought_boundaries = thought_constraints
         forbidden_word_ids = sorted(
             {
                 word_id
@@ -1816,6 +1905,9 @@ def repair_plan_for_acoustic_safety(
                 "unsafe_boundary_ids": [
                     boundary["boundary_id"] for boundary in by_thought[thought_index]
                 ],
+                "constraint_boundary_ids": [
+                    boundary["boundary_id"] for boundary in thought_constraints
+                ],
                 "forbidden_word_ids": forbidden_word_ids,
                 "forbidden_source_edges": forbidden_source_edges,
                 "failure_reasons": failure_reasons,
@@ -1831,6 +1923,11 @@ def repair_plan_for_acoustic_safety(
                 "attempts": attempts,
             }
         )
+
+    if not repair_records:
+        if last_repair_error is None:
+            raise StreamingPlanError("acoustic repair produced no repaired thoughts")
+        raise last_repair_error
 
     selected_ranges = _flatten_ranges(committed)
     committed_word_ids = [
@@ -1864,6 +1961,15 @@ def repair_plan_for_acoustic_safety(
                 *plan.get("acoustic_repairs", []),
                 *repair_records,
             ],
+            "acoustic_repair_failures": [
+                *(
+                    plan.get("acoustic_repair_failures", [])
+                    if isinstance(plan.get("acoustic_repair_failures"), list)
+                    else []
+                ),
+                *repair_failure_records,
+            ],
+            "acoustic_repair_partial": bool(repair_failure_records),
         }
     )
     grounding = _grounding_validation_document(
@@ -1877,12 +1983,21 @@ def repair_plan_for_acoustic_safety(
     )
     grounding["acoustic_repair_index"] = retry_index
     grounding["acoustic_repairs"] = repair_records
+    grounding["acoustic_repair_failures"] = repair_failure_records
     write_json(output_dir / "grounding_validation.json", grounding)
-    write_json(output_dir / "acoustic_repair.json", {"repairs": repair_records})
+    write_json(
+        output_dir / "acoustic_repair.json",
+        {
+            "repairs": repair_records,
+            "failures": repair_failure_records,
+            "partial": bool(repair_failure_records),
+        },
+    )
     write_json(output_dir / "streaming_plan.json", repaired)
     print("\nACOUSTIC SAFETY REPAIR COMPLETE")
     print(f"retry index: {retry_index}")
     print(f"thoughts revised: {len(repair_records)}")
+    print(f"thoughts unresolved: {len(repair_failure_records)}")
     for record in repair_records:
         print(f"thought {record['thought_index']}: {record['revised_canonical_text']}")
     return repaired
@@ -2417,9 +2532,10 @@ def run_streaming_planner(
                 )
                 fallback_records.append(fallback)
             if request_failed:
-                # The newest look-ahead has already been exposed once. Keep
-                # that age so another stalled iteration commits an old window
-                # instead of allowing pending input to grow indefinitely.
+                # Keep request failures visible in diagnostics. The actual
+                # fail-soft source passthrough above remains bounded to the
+                # older window; valid model decisions must never trigger that
+                # fallback merely because they ask for more look-ahead.
                 pending_no_progress_age = 1
             elif _incremental_decision_makes_progress(
                 decision,
@@ -2428,25 +2544,11 @@ def run_streaming_planner(
                 pending_no_progress_age = 0
             else:
                 pending_no_progress_age += 1
-                if pending_no_progress_age >= 2:
-                    decision, attempts, fallback = _source_passthrough_decision(
-                        pending_words=complete_pending_input,
-                        final_pass=False,
-                        lookahead_start_word_id=new_words[0].id,
-                        window_seconds=window_seconds,
-                        iteration=iteration,
-                        attempts=attempts,
-                        trigger="valid_no_progress",
-                        reason=(
-                            "The planner returned a valid decision without "
-                            "consuming source input in two consecutive windows."
-                        ),
-                        grounding_failure=None,
-                    )
-                    fallback_records.append(fallback)
-                    # The retained look-ahead was visible in this iteration,
-                    # preserving the one-thought delay while bounding growth.
-                    pending_no_progress_age = 1
+                # A valid empty decision means the final visible thought is
+                # still unresolved. Keep every pending occurrence available
+                # for later semantic look-ahead. Copying the raw window into
+                # the narration here would preserve abandoned attempts and
+                # repetitions precisely when the planner is asking us to wait.
             if _fingerprint(committed_thoughts) != committed_before:
                 raise StreamingPlanError(
                     "committed source ranges changed during model request"
@@ -2559,22 +2661,9 @@ def run_streaming_planner(
                 output_dir=output_dir,
             )
             fallback_records.append(fallback)
-        if not request_failed and not decision.finalized:
-            decision, attempts, fallback = _source_passthrough_decision(
-                pending_words=final_pending_input,
-                final_pass=True,
-                lookahead_start_word_id=None,
-                window_seconds=window_seconds,
-                iteration=iteration,
-                attempts=attempts,
-                trigger="valid_eof_no_progress",
-                reason=(
-                    "The planner returned a valid EOF response without finalizing "
-                    "any remaining source words."
-                ),
-                grounding_failure=None,
-            )
-            fallback_records.append(fallback)
+        # A valid empty EOF decision is an intentional semantic decision: the
+        # remaining pending source is abandoned material. Honor it. Exact
+        # source passthrough is reserved for an actual failed model request.
         if _fingerprint(committed_thoughts) != committed_before:
             raise StreamingPlanError(
                 "committed source ranges changed during final model request"

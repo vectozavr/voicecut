@@ -78,6 +78,278 @@ class StaticRepairBackend:
         raise AssertionError("a caller-owned repair backend must not be closed")
 
 
+@pytest.mark.parametrize("source_text", ["1.", "-1.", "4.", "60.", "80%"])
+def test_numeric_retained_word_defers_character_completeness_to_mfa(
+    source_text: str,
+) -> None:
+    support = final_render_module.evaluate_retained_word_support(
+        {
+            "word_id": 7,
+            "text": source_text,
+            "word_score": 0.97,
+            "characters": [],
+        },
+        [],
+        edge="terminal",
+    )
+
+    assert support["status"] == "nonalphabetic_token_deferred_to_mfa"
+    assert support["completeness_check_applicable"] is False
+    assert support["support_basis"] == "mfa_phone_alignment_required"
+    assert support["expected_alignable_character_count"] == 0
+    assert support["character_records"] == []
+
+
+def test_punctuation_only_retained_token_is_not_implicitly_accepted() -> None:
+    support = final_render_module.evaluate_retained_word_support(
+        {
+            "word_id": 7,
+            "text": "...",
+            "word_score": 0.97,
+            "characters": [],
+        },
+        [],
+        edge="terminal",
+    )
+
+    assert support["status"] == "incomplete_character_coverage"
+    assert support["completeness_check_applicable"] is True
+
+
+def test_alignment_context_stops_before_optional_zero_duration_hallucination_run(
+    tmp_path: Path,
+) -> None:
+    words = [
+        final_render_module.PlanWord(0, "stable", 0.50, 0.60),
+        final_render_module.PlanWord(1, "prefix", 0.60, 0.72),
+        final_render_module.PlanWord(2, "kept", 0.72, 0.82),
+        final_render_module.PlanWord(3, "word", 0.82, 0.90),
+        *[
+            final_render_module.PlanWord(word_id, "phantom", 1.00, 1.00)
+            for word_id in range(4, 9)
+        ],
+        final_render_module.PlanWord(9, "grounded", 1.20, 1.40),
+    ]
+    jobs = final_render_module._prepare_alignment_jobs(
+        specs=[
+            {
+                "event_key": "source_gap_0000_left",
+                "event_kind": "source_gap_left",
+                "role_word_ids": {
+                    "last_retained_left": 2,
+                    "first_omitted": 3,
+                },
+            }
+        ],
+        words=words,
+        ranges=[
+            final_render_module.MergedRange(
+                start_word_id=0,
+                end_word_id=3,
+                original_ranges=(),
+            )
+        ],
+        source_audio=np.zeros((2_000, 1), dtype=np.float32),
+        sample_rate=SAMPLE_RATE,
+        output_dir=tmp_path,
+    )
+
+    assert [word["id"] for word in jobs[0]["local_words"]] == [0, 1, 2, 3]
+    assert jobs[0]["crop_end_sample"] == 1_200
+    assert "phantom" not in jobs[0]["local_source_text"]
+
+
+def test_alignment_context_stops_after_leading_zero_duration_hallucination_run(
+    tmp_path: Path,
+) -> None:
+    words = [
+        final_render_module.PlanWord(0, "grounded", 0.20, 0.40),
+        *[
+            final_render_module.PlanWord(word_id, "phantom", 1.00, 1.00)
+            for word_id in range(1, 6)
+        ],
+        final_render_module.PlanWord(6, "kept", 1.20, 1.35),
+        final_render_module.PlanWord(7, "word", 1.35, 1.50),
+        final_render_module.PlanWord(8, "continues", 1.50, 1.70),
+    ]
+    jobs = final_render_module._prepare_alignment_jobs(
+        specs=[
+            {
+                "event_key": "source_gap_0000_right",
+                "event_kind": "source_gap_right",
+                "role_word_ids": {
+                    "last_omitted": 6,
+                    "first_retained_right": 7,
+                },
+            }
+        ],
+        words=words,
+        ranges=[
+            final_render_module.MergedRange(
+                start_word_id=7,
+                end_word_id=9,
+                original_ranges=(),
+            )
+        ],
+        source_audio=np.zeros((2_000, 1), dtype=np.float32),
+        sample_rate=SAMPLE_RATE,
+        output_dir=tmp_path,
+    )
+
+    assert [word["id"] for word in jobs[0]["local_words"]] == [6, 7, 8]
+    assert "phantom" not in jobs[0]["local_source_text"]
+
+
+def test_alignment_context_adds_distinctive_word_after_adjacent_retry_phrase(
+    tmp_path: Path,
+) -> None:
+    tokens = [
+        "might",
+        "be",
+        "tied",
+        "to",
+        "increasingly",
+        "might",
+        "be",
+        "tied",
+        "to",
+        "increasingly",
+        "all",
+    ]
+    starts = [0.50, 0.70, 0.90, 1.10, 1.30, 1.70, 1.90, 2.10, 2.20, 2.30, 2.74]
+    ends = [0.70, 0.90, 1.10, 1.30, 1.50, 1.90, 2.10, 2.20, 2.30, 2.74, 2.90]
+    words = [
+        final_render_module.PlanWord(word_id, token, starts[word_id], ends[word_id])
+        for word_id, token in enumerate(tokens)
+    ]
+    jobs = final_render_module._prepare_alignment_jobs(
+        specs=[
+            {
+                "event_key": "source_gap_0000_right",
+                "event_kind": "source_gap_right",
+                "role_word_ids": {
+                    "last_omitted": 4,
+                    "first_retained_right": 5,
+                },
+            }
+        ],
+        words=words,
+        ranges=[
+            final_render_module.MergedRange(
+                start_word_id=5,
+                end_word_id=11,
+                original_ranges=(),
+            )
+        ],
+        source_audio=np.zeros((4_000, 1), dtype=np.float32),
+        sample_rate=SAMPLE_RATE,
+        output_dir=tmp_path,
+    )
+
+    assert [word["id"] for word in jobs[0]["local_words"]] == list(range(11))
+    assert jobs[0]["local_source_text"].endswith("increasingly all")
+
+
+def test_mfa_requests_split_required_roles_across_long_untranscribed_gap() -> None:
+    job = {
+        "event_key": "source_gap_0152_left",
+        "role_word_ids": {
+            "last_retained_left": 2,
+            "first_omitted": 3,
+        },
+        "boundary_ids": ["source_gap_0152_left"],
+        "crop_start_seconds": 0.1,
+        "crop_end_seconds": 10.8,
+        "local_words": [
+            {"id": 0, "text": "the", "start": 0.5, "end": 0.7, "selected": True},
+            {"id": 1, "text": "first", "start": 0.7, "end": 0.9, "selected": True},
+            {"id": 2, "text": "batch", "start": 0.9, "end": 1.1, "selected": True},
+            {"id": 3, "text": "one", "start": 10.0, "end": 10.2, "selected": False},
+            {"id": 4, "text": "could", "start": 10.2, "end": 10.4, "selected": False},
+        ],
+    }
+
+    requests = final_render_module._mfa_context_requests([job])
+
+    assert [request["context_id"] for request in requests] == [
+        "source_gap_0152_left__part_00",
+        "source_gap_0152_left__part_01",
+    ]
+    assert [[word["word_id"] for word in request["words"]] for request in requests] == [
+        [0, 1, 2],
+        [3, 4],
+    ]
+    assert requests[0]["crop_source_end_seconds"] <= 1.5
+    assert requests[1]["crop_source_start_seconds"] >= 9.6
+    assert all(request["split_at_long_gap"] for request in requests)
+
+
+def test_mfa_validation_rejects_gross_required_role_anchor_drift() -> None:
+    words = [
+        {"id": 0, "text": "kept", "start": 1.0, "end": 1.2},
+        {"id": 1, "text": "omitted", "start": 1.2, "end": 1.4},
+        {"id": 2, "text": "context", "start": 3.9, "end": 4.1},
+    ]
+    job = {
+        "event_key": "source_gap_0000_left",
+        "role_word_ids": {
+            "last_retained_left": 0,
+            "first_omitted": 1,
+        },
+        "boundary_ids": ["source_gap_0000_left"],
+        "crop_start_seconds": 0.6,
+        "crop_end_seconds": 4.5,
+        "local_words": [{**word, "selected": word["id"] == 0} for word in words],
+    }
+    requests = final_render_module._mfa_context_requests([job])
+    payload = _mfa_payload(
+        words=words,
+        contexts=[
+            (
+                "source_gap_0000_left",
+                range(3),
+                (600, 4_500),
+                {0: (3.2, 3.4), 1: (3.4, 3.6)},
+            )
+        ],
+        selected_word_ids={0},
+        source_audio_sha256="source-hash",
+    )
+
+    contexts, errors = final_render_module._validated_mfa_contexts(
+        payload=payload,
+        jobs=[job],
+        requests=requests,
+        source_audio_sha256="source-hash",
+        sample_rate=SAMPLE_RATE,
+    )
+
+    assert contexts == {}
+    error = errors["source_gap_0000_left"]
+    assert error["code"] == "mfa_word_mapping_failed"
+    assert "drifted 2.200s" in error["error"]
+
+
+def test_split_mfa_context_does_not_verify_unaligned_gap_as_silence() -> None:
+    context = {
+        "phones": [],
+        "component_crop_intervals": [
+            {"start_sample": 0, "end_sample": 1_500},
+            {"start_sample": 9_600, "end_sample": 10_800},
+        ],
+    }
+
+    assert (
+        final_render_module._mfa_non_speech_interval(
+            context=context,
+            start_sample=1_100,
+            end_sample=10_000,
+            sample_rate=SAMPLE_RATE,
+        )
+        is None
+    )
+
+
 def _speech(
     audio: np.ndarray,
     start: int,
@@ -169,20 +441,21 @@ def _completeness_job(
                 "score": word_score,
             }
         )
-        duration = (end - start) / len(alphabetic)
-        for character_index, (character, score) in enumerate(
-            zip(alphabetic, scores, strict=True)
-        ):
-            character_start = start + character_index * duration
-            character_end = start + (character_index + 1) * duration
-            chars.append(
-                {
-                    "char": character,
-                    "start": character_start,
-                    "end": character_end,
-                    "score": score,
-                }
-            )
+        if alphabetic:
+            duration = (end - start) / len(alphabetic)
+            for character_index, (character, score) in enumerate(
+                zip(alphabetic, scores, strict=True)
+            ):
+                character_start = start + character_index * duration
+                character_end = start + (character_index + 1) * duration
+                chars.append(
+                    {
+                        "char": character,
+                        "start": character_start,
+                        "end": character_end,
+                        "score": score,
+                    }
+                )
         if index < len(selected_words) - 1:
             chars.append({"char": " "})
     return {
@@ -512,6 +785,144 @@ def _grounded_fixture(
         },
     )
     return audio_path, plan_path, pause_plan_path, grounding
+
+
+def _multi_gap_grounded_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, dict[str, Any]]:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    plan = read_json(plan_path)
+    words = [
+        {"id": 0, "text": "zero", "start": 0.10, "end": 0.30},
+        {"id": 1, "text": "one", "start": 0.40, "end": 0.60},
+        {"id": 2, "text": "two", "start": 0.70, "end": 0.90},
+        {"id": 3, "text": "three", "start": 1.00, "end": 1.20},
+        {"id": 4, "text": "four", "start": 1.30, "end": 1.50},
+    ]
+    committed = [
+        _thought(
+            thought_index=thought_index,
+            source_range=_range_payload(
+                first_word_id=word_id,
+                last_word_id=word_id,
+                first_word=str(words[word_id]["text"]),
+                last_word=str(words[word_id]["text"]),
+                canonical_text=str(words[word_id]["text"]),
+            ),
+        )
+        for thought_index, word_id in enumerate((0, 2, 4))
+    ]
+    grounding_path = Path(plan["grounding_validation"])
+    plan.update(
+        {
+            "word_count": len(words),
+            "words": words,
+            "committed": committed,
+            "selected_source_ranges": [
+                {"start_word_id": 0, "end_word_id": 1},
+                {"start_word_id": 2, "end_word_id": 3},
+                {"start_word_id": 4, "end_word_id": 5},
+            ],
+            "reconstructed_narration": "zero two four",
+        }
+    )
+    write_json(plan_path, plan)
+    grounding = {
+        "schema_version": 1,
+        "validator": "strict_bidirectional_range_source_grounding_v2",
+        "status": "valid",
+        "finalized_thoughts": 3,
+        "source_ranges": 3,
+        "canonical_tokens": 3,
+        "supported_tokens": 3,
+        "unsupported_tokens": [],
+        "unrepresented_source_tokens": [],
+        "planner_retries": 0,
+        "plan_accepted": True,
+        "error": None,
+        "thoughts": [
+            copy.deepcopy(thought["grounding_validation"]) for thought in committed
+        ],
+    }
+    write_json(grounding_path, grounding)
+    pause_plan = {
+        "schema_version": 1,
+        "planner": "semantic_pause_planner_v1",
+        "backend": "gemini",
+        "model": "cached-test-model",
+        "streaming_plan": str(plan_path),
+        "streaming_plan_sha256": sha256_file(plan_path),
+        "thought_count": 3,
+        "transition_count": 2,
+        "transitions": [
+            {
+                "after_thought_index": index,
+                "before_thought_index": index + 1,
+                "pause_type": "continuation",
+            }
+            for index in range(2)
+        ],
+        "attempts": [],
+    }
+    write_json(pause_plan_path, pause_plan)
+    return audio_path, plan_path, pause_plan_path, grounding
+
+
+def _orchestration_boundary_plan(
+    *,
+    source_intervals: list[dict[str, Any]],
+    boundaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    unsafe = any(boundary["safety_status"] != "safe" for boundary in boundaries)
+    return {
+        "status": "unsafe" if unsafe else "safe",
+        "delivery_status": "complete",
+        "delivery_fallback": None,
+        "semantic_planner_fallbacks": [],
+        "semantic_preserved_source_fallbacks": [],
+        "pause_plan_degraded": False,
+        "pause_degraded_batches": [],
+        "source_intervals": source_intervals,
+        "boundaries": boundaries,
+        "joins": [],
+        "clean_ambience_bank": {
+            "status": "not_required",
+            "accepted_candidates": [],
+            "rejected_candidates": [],
+        },
+        "breath_cleanup": {
+            "status": "disabled",
+            "detected_events": [],
+            "replacements": [],
+            "events": [],
+        },
+        "alignment_context_count": 0,
+        "alignment_resolved_boundaries": 0,
+        "unsafe_dense_boundaries": sum(
+            boundary["safety_status"] == "unsafe_dense_boundary"
+            for boundary in boundaries
+        ),
+        "mfa_dense_phone_boundaries": 0,
+        "weak_retained_word_alignments": sum(
+            boundary["safety_status"] == "weak_retained_word_alignment"
+            for boundary in boundaries
+        ),
+        "mfa_word_mapping_failures": sum(
+            boundary["safety_status"] == "mfa_word_mapping_failed"
+            for boundary in boundaries
+        ),
+        "alignment_failures": sum(
+            boundary["safety_status"]
+            in {
+                "completeness_alignment_failed",
+                "mfa_alignment_failed",
+                "mfa_runtime_failed",
+                "mfa_word_mapping_failed",
+            }
+            for boundary in boundaries
+        ),
+        "final_boundary": {},
+    }
 
 
 def _familiar_thought(
@@ -927,6 +1338,38 @@ def _initial_familiar_completeness(
     )
 
 
+def _initial_familiar_mfa(
+    words: list[dict[str, Any]],
+    *,
+    audio_path: Path,
+) -> dict[str, Any]:
+    left, left_crop = _context_geometry(
+        words,
+        role_word_ids=(5, 6),
+        total_samples=3000,
+    )
+    right, right_crop = _context_geometry(
+        words,
+        role_word_ids=(8, 9),
+        total_samples=3000,
+    )
+    eof, eof_crop = _context_geometry(
+        words,
+        role_word_ids=(13,),
+        total_samples=3000,
+    )
+    return _mfa_payload(
+        words=words,
+        selected_word_ids={*range(6), *range(9, 14)},
+        source_audio_sha256=sha256_file(audio_path),
+        contexts=[
+            ("source_gap_0000_left", left, left_crop, None),
+            ("source_gap_0000_right", right, right_crop, None),
+            ("eof_tail", eof, eof_crop, None),
+        ],
+    )
+
+
 def _repaired_familiar_evidence(
     words: list[dict[str, Any]],
     *,
@@ -1183,19 +1626,26 @@ def test_final_render_rejects_stale_grounding_ledger_before_audio_work(
     assert not output_dir.exists()
 
 
-def test_final_render_fails_closed_on_alignment_failure(
+def test_strict_semantic_subset_is_never_published_as_full_source_passthrough(
     tmp_path: Path,
 ) -> None:
     audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
-    words = read_json(plan_path)["words"]
+    semantic_plan = read_json(plan_path)
+    words = semantic_plan["words"]
+    selected_word_ids = {
+        word_id
+        for source_range in semantic_plan["selected_source_ranges"]
+        for word_id in range(
+            int(source_range["start_word_id"]),
+            int(source_range["end_word_id"]),
+        )
+    }
+    assert len(selected_word_ids) < len(words)
     completeness, _ = _grounded_evidence(words=words, audio_path=audio_path)
     output_dir = tmp_path / "failed"
 
-    with pytest.raises(
-        FinalRenderError,
-        match="mfa_alignment_failed",
-    ):
-        render_final_cut(
+    try:
+        manifest = render_final_cut(
             audio_path=audio_path,
             plan_path=plan_path,
             output_dir=output_dir,
@@ -1211,13 +1661,20 @@ def test_final_render_fails_closed_on_alignment_failure(
                 "contexts": [],
             },
         )
+    except FinalRenderError:
+        # Failing closed is preferable to publishing the unedited recording
+        # under the name of an edited result when localized recovery cannot
+        # produce any safe cut.
+        assert not (output_dir / "final_cut.wav").exists()
+        return
 
-    assert not (output_dir / "final_cut.wav").exists()
-    assert (output_dir / "pause_plan.json").is_file()
-    boundary_plan = read_json(output_dir / "final_boundary_plan.json")
-    assert boundary_plan["status"] == "unsafe"
-    assert boundary_plan["alignment_failures"] == 3
-    assert boundary_plan["alignment_backend"] == "mfa"
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    assert boundary_plan["delivery_status"] != ("complete_with_full_source_passthrough")
+    source, _ = sf.read(audio_path, dtype="float32", always_2d=True)
+    rendered, _ = sf.read(
+        Path(manifest["final_cut_wav"]), dtype="float32", always_2d=True
+    )
+    assert rendered.shape != source.shape or not np.array_equal(rendered, source)
 
 
 def test_final_render_preserves_local_source_context_after_retry_exhaustion(
@@ -1314,6 +1771,274 @@ def test_final_render_preserves_local_source_context_after_retry_exhaustion(
         "complete_with_preserved_source_context"
     )
     assert len(boundary_plan["source_intervals"]) == 1
+
+
+def test_mixed_alignment_failures_do_not_block_repairable_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    intervals = [
+        {
+            "start_word_id": 0,
+            "end_word_id": 1,
+            "merged_original_ranges": [{"thought_index": 0}],
+        },
+        {
+            "start_word_id": 2,
+            "end_word_id": 3,
+            "merged_original_ranges": [{"thought_index": 1}],
+        },
+    ]
+    mixed = _orchestration_boundary_plan(
+        source_intervals=intervals,
+        boundaries=[
+            {
+                "boundary_id": "range_0000_end",
+                "safety_status": "weak_retained_word_alignment",
+                "retained_thought_indices": [0],
+                "source_word_ids": {
+                    "last_retained_left": 0,
+                    "first_omitted": 1,
+                },
+                "forbidden_word_ids": [0],
+                "forbidden_source_edges": [],
+            },
+            {
+                "boundary_id": "range_0001_start",
+                "safety_status": "completeness_alignment_failed",
+                "retained_thought_indices": [1],
+                "source_word_ids": {
+                    "last_omitted": 1,
+                    "first_retained_right": 2,
+                },
+                "forbidden_word_ids": [],
+                "forbidden_source_edges": [],
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        final_render_module,
+        "build_final_boundary_plan",
+        lambda **_: copy.deepcopy(mixed),
+    )
+    repair_backend = StaticRepairBackend({"invalid": "repair response"})
+    output_dir = tmp_path / "mixed_failure"
+
+    with pytest.raises(
+        FinalRenderError,
+        match="refusing to publish the complete unedited source",
+    ):
+        render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_plan_path,
+            repair_backend=repair_backend,
+            max_acoustic_retries=3,
+        )
+
+    # Each implicated thought receives its own bounded two-attempt repair.
+    # Failure of the weak-word thought must not prevent the completeness-
+    # alignment thought from receiving its independent repair opportunity.
+    assert len(repair_backend.prompts) == 4
+    rejected = read_json(
+        output_dir / "acoustic_retries/retry_01/rejected_boundary_plan.json"
+    )
+    assert [boundary["safety_status"] for boundary in rejected["boundaries"]] == [
+        "weak_retained_word_alignment",
+        "completeness_alignment_failed",
+    ]
+    fallback = read_json(
+        output_dir / "conservative_delivery_fallback/delivery_fallback.json"
+    )
+    assert fallback["status"] == "failed_refused_full_source_passthrough"
+    assert (
+        fallback["original_selected_source_word_count"]
+        < fallback["original_source_word_count"]
+    )
+    assert not (output_dir / "final_cut.wav").exists()
+
+
+def test_conservative_delivery_repeats_when_new_mapping_failure_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _multi_gap_grounded_fixture(tmp_path)
+    first_intervals = [
+        {
+            "start_word_id": word_id,
+            "end_word_id": word_id + 1,
+            "merged_original_ranges": [{"thought_index": thought_index}],
+        }
+        for thought_index, word_id in enumerate((0, 2, 4))
+    ]
+    initial = _orchestration_boundary_plan(
+        source_intervals=first_intervals,
+        boundaries=[
+            {
+                "boundary_id": "range_0000_end",
+                "safety_status": "completeness_alignment_failed",
+            }
+        ],
+    )
+    newly_revealed = _orchestration_boundary_plan(
+        source_intervals=[
+            {
+                "start_word_id": 0,
+                "end_word_id": 3,
+                "merged_original_ranges": [
+                    {"thought_index": 0},
+                    {"thought_index": 1},
+                ],
+            },
+            {
+                "start_word_id": 4,
+                "end_word_id": 5,
+                "merged_original_ranges": [{"thought_index": 2}],
+            },
+        ],
+        boundaries=[
+            {
+                "boundary_id": "range_0000_end",
+                "safety_status": "mfa_word_mapping_failed",
+            }
+        ],
+    )
+    safe = _orchestration_boundary_plan(
+        source_intervals=[
+            {
+                "start_word_id": 0,
+                "end_word_id": 5,
+                "merged_original_ranges": [
+                    {"thought_index": 0},
+                    {"thought_index": 1},
+                    {"thought_index": 2},
+                ],
+            }
+        ],
+        boundaries=[],
+    )
+    plans = iter((initial, newly_revealed, safe))
+    monkeypatch.setattr(
+        final_render_module,
+        "build_final_boundary_plan",
+        lambda **_: copy.deepcopy(next(plans)),
+    )
+    render_calls = 0
+
+    def fake_render_boundary_plan(
+        *, audio_path: Path, boundary_plan_path: Path, output_path: Path
+    ) -> dict[str, Any]:
+        del audio_path, boundary_plan_path
+        nonlocal render_calls
+        render_calls += 1
+        rendered = np.zeros((25, 1), dtype=np.float32)
+        sf.write(output_path, rendered, SAMPLE_RATE, subtype="FLOAT")
+        return {
+            "frame_count": len(rendered),
+            "sample_rate": SAMPLE_RATE,
+            "channel_count": 1,
+            "duration_seconds": len(rendered) / SAMPLE_RATE,
+            "output_sha256": sha256_file(output_path),
+        }
+
+    monkeypatch.setattr(
+        final_render_module,
+        "render_boundary_plan",
+        fake_render_boundary_plan,
+    )
+    output_dir = tmp_path / "multi_pass_delivery"
+
+    with pytest.warns(RuntimeWarning, match="conservative source preservation"):
+        manifest = render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_plan_path,
+            max_acoustic_retries=0,
+        )
+
+    assert render_calls == 1
+    assert manifest["status"] == "complete"
+    assert manifest["acoustic_repair_attempts"] == 0
+    assert manifest["conservative_delivery_pass_count"] == 2
+    assert [
+        delivery_pass["status"]
+        for delivery_pass in manifest["conservative_delivery_passes"]
+    ] == ["progress", "safe"]
+    assert manifest["conservative_delivery_passes"][0]["added_source_ranges"] == [
+        {"start_word_id": 1, "end_word_id": 2}
+    ]
+    assert manifest["conservative_delivery_passes"][1]["added_source_ranges"] == [
+        {"start_word_id": 3, "end_word_id": 4}
+    ]
+    assert manifest["delivery_fallback"]["pass_count"] == 2
+    assert len(manifest["delivery_fallback"]["preserved_intervals"]) == 2
+    assert Path(manifest["final_cut_wav"]).is_file()
+    final_plan = read_json(output_dir / "final_boundary_plan.json")
+    assert final_plan["status"] == "safe"
+    assert final_plan["delivery_status"] == ("complete_with_preserved_source_context")
+    assert len(final_plan["conservative_delivery_passes"]) == 2
+
+
+def test_conservative_delivery_stops_when_selection_does_not_expand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path, plan_path, pause_plan_path, _ = _grounded_fixture(tmp_path)
+    stuck = _orchestration_boundary_plan(
+        source_intervals=[
+            {
+                "start_word_id": 0,
+                "end_word_id": 1,
+                "merged_original_ranges": [{"thought_index": 0}],
+            },
+            {
+                "start_word_id": 2,
+                "end_word_id": 3,
+                "merged_original_ranges": [{"thought_index": 1}],
+            },
+        ],
+        boundaries=[
+            {
+                "boundary_id": "range_0000_end",
+                "safety_status": "completeness_alignment_failed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        final_render_module,
+        "build_final_boundary_plan",
+        lambda **_: copy.deepcopy(stuck),
+    )
+    output_dir = tmp_path / "stuck_delivery"
+
+    with pytest.raises(
+        FinalRenderError,
+        match="refusing to publish the complete unedited source",
+    ):
+        render_final_cut(
+            audio_path=audio_path,
+            plan_path=plan_path,
+            output_dir=output_dir,
+            pause_plan_path=pause_plan_path,
+            max_acoustic_retries=0,
+        )
+
+    fallback = read_json(
+        output_dir / "conservative_delivery_fallback/delivery_fallback.json"
+    )
+    passes = fallback["passes"]
+    assert [item["status"] for item in passes] == [
+        "progress",
+        "stopped_no_progress",
+    ]
+    assert fallback["status"] == "failed_refused_full_source_passthrough"
+    assert fallback["local_preservation_result"]["status"] == (
+        "failed_no_safe_boundary_plan"
+    )
+    assert not (output_dir / "final_cut.wav").exists()
 
 
 def test_final_render_propagates_semantic_and_pause_fallback_provenance(
@@ -1427,6 +2152,72 @@ def test_final_render_accepts_dense_mfa_phone_boundary_without_silence(
     assert leading_boundary["fade_intervals"] == []
 
 
+def test_numeric_retained_boundary_uses_mfa_without_semantic_fallback(
+    tmp_path: Path,
+) -> None:
+    audio_path, plan_path, pause_plan_path, grounding = _grounded_fixture(tmp_path)
+    plan = read_json(plan_path)
+    plan["words"][0]["text"] = "4."
+    thought = plan["committed"][0]
+    thought["canonical_text"] = "4."
+    source_range = thought["source_ranges"][0]
+    source_range.update(
+        {
+            "first_word": "4.",
+            "last_word": "4.",
+            "canonical_text": "4.",
+        }
+    )
+    validation_range = thought["grounding_validation"]["source_ranges"][0]
+    validation_range.update(
+        {
+            "first_word": "4.",
+            "last_word": "4.",
+            "canonical_text": "4.",
+        }
+    )
+    plan["reconstructed_narration"] = "4. Last."
+    write_json(plan_path, plan)
+    grounding["thoughts"][0] = copy.deepcopy(thought["grounding_validation"])
+    write_json(Path(plan["grounding_validation"]), grounding)
+    pause_plan = read_json(pause_plan_path)
+    pause_plan["streaming_plan_sha256"] = sha256_file(plan_path)
+    write_json(pause_plan_path, pause_plan)
+
+    completeness, mfa = _grounded_evidence(
+        words=plan["words"],
+        audio_path=audio_path,
+    )
+    output_dir = tmp_path / "numeric_boundary"
+    manifest = render_final_cut(
+        audio_path=audio_path,
+        plan_path=plan_path,
+        output_dir=output_dir,
+        pause_plan_path=pause_plan_path,
+        alignment_python=tmp_path / "model-must-not-run",
+        alignment_payload=completeness,
+        mfa_payload=mfa,
+        max_acoustic_retries=0,
+    )
+
+    boundary_plan = read_json(Path(manifest["final_boundary_plan"]))
+    numeric_boundary = next(
+        boundary
+        for boundary in boundary_plan["boundaries"]
+        if boundary["boundary_kind"] == "selected_to_omitted"
+    )
+    assert boundary_plan["status"] == "safe"
+    assert boundary_plan["delivery_status"] == "complete"
+    assert numeric_boundary["retained_word_support"]["status"] == (
+        "nonalphabetic_token_deferred_to_mfa"
+    )
+    assert numeric_boundary["mfa_phone_intervals"]
+    assert numeric_boundary["forbidden_word_ids"] == []
+    assert numeric_boundary["safety_status"] == "safe"
+    assert manifest["acoustic_repair_attempts"] == 0
+    assert manifest["effective_streaming_plan"] == str(plan_path.resolve())
+
+
 def test_final_boundary_plan_cannot_change_during_render(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1519,6 +2310,7 @@ def test_weak_first_familiar_is_repaired_to_complete_later_occurrence(
         words,
         audio_path=audio_path,
     )
+    initial_mfa = _initial_familiar_mfa(words, audio_path=audio_path)
 
     manifest = render_final_cut(
         audio_path=audio_path,
@@ -1531,7 +2323,7 @@ def test_weak_first_familiar_is_repaired_to_complete_later_occurrence(
             _initial_familiar_completeness(words),
             repaired_completeness,
         ],
-        mfa_payloads=[None, repaired_mfa],
+        mfa_payloads=[initial_mfa, repaired_mfa],
         max_acoustic_retries=1,
     )
 
@@ -1541,8 +2333,9 @@ def test_weak_first_familiar_is_repaired_to_complete_later_occurrence(
 
     rejected_path = Path(manifest["acoustic_repairs"][0]["rejected_boundary_plan"])
     rejected_plan = read_json(rejected_path)
-    assert rejected_plan["mfa_alignment"] is None
-    assert rejected_plan["mfa_error"] == "mfa_not_run_due_to_weak_retained_word"
+    assert rejected_plan["mfa_alignment"] is not None
+    assert rejected_plan["mfa_error"] is None
+    assert len(rejected_plan["alignment_contexts"]) == 3
     weak_boundary = next(
         boundary
         for boundary in rejected_plan["boundaries"]
@@ -1899,6 +2692,160 @@ def test_breath_detector_failure_preserves_valid_boundary_plan(
     assert production_wavs == [Path(manifest["final_cut_wav"])]
 
 
+def test_cross_context_phone_conflict_skips_only_internal_pause_and_renders(
+    tmp_path: Path,
+) -> None:
+    source = np.linspace(-0.2, 0.2, 1_000, dtype=np.float32)[:, None]
+    audio_path = tmp_path / "source.wav"
+    sf.write(audio_path, source, SAMPLE_RATE, subtype="FLOAT")
+    boundaries = [
+        {
+            "boundary_id": "source_start",
+            "safety_status": "safe",
+            "selected_source_sample": 0,
+            "protected_speech_intervals": [],
+            "fade_intervals": [],
+        },
+        {
+            "boundary_id": "source_end",
+            "safety_status": "safe",
+            "selected_source_sample": len(source),
+            "protected_speech_intervals": [],
+            "fade_intervals": [],
+        },
+    ]
+    source_intervals = [
+        {
+            "source_interval_index": 0,
+            "source_start_sample": 0,
+            "source_end_sample": len(source),
+            "start_boundary_id": "source_start",
+            "end_boundary_id": "source_end",
+        }
+    ]
+    joins = [
+        {
+            "join_id": "internal_thought_gap_0000",
+            "join_kind": "internal_thought_pause",
+            "source_interval_index": 0,
+            "pause_type": "thought",
+            "target_pause_samples": 650,
+            "source_insertion_sample": 500,
+            "verified_quiet_interval": {
+                "start_sample": 480,
+                "end_sample": 520,
+                "verification": "mfa_phone_free_interval",
+            },
+            "protected_speech_intervals": [],
+            "fade_intervals": [
+                {
+                    "source_start_sample": 495,
+                    "source_end_sample": 500,
+                    "curve": "fade_out",
+                },
+                {
+                    "source_start_sample": 500,
+                    "source_end_sample": 505,
+                    "curve": "fade_in",
+                },
+            ],
+            "estimated_existing_pause_samples": 40,
+            "inserted_pause_samples": 610,
+            "inserted_pause_ms": 610.0,
+            "safety_status": "safe",
+            "insertion_method": "mfa_confirmed_interword_gap",
+            "error": None,
+        }
+    ]
+    protected = [
+        {
+            "source_interval_index": 0,
+            "source_word_ids": [42],
+            "phone": "S",
+            "phone_start_sample": 470,
+            "phone_end_sample": 530,
+            "start_sample": 460,
+            "end_sample": 540,
+            "context_ids": ["independent_boundary_context"],
+        }
+    ]
+
+    final_render_module._cancel_internal_pauses_over_protected_speech(
+        joins=joins,
+        protected_speech_mask=protected,
+    )
+    final_render_module._initialize_pause_content(joins)
+    output_segments = final_render_module._build_output_segments(
+        source_intervals=source_intervals,
+        boundaries=boundaries,
+        joins=joins,
+    )
+
+    join = joins[0]
+    assert join["safety_status"] == (
+        "pause_not_inserted_cross_context_alignment_conflict"
+    )
+    assert join["source_insertion_sample"] is None
+    assert join["inserted_pause_samples"] == 0
+    assert join["fade_intervals"] == []
+    assert join["pause_content"]["status"] == (
+        "pause_not_inserted_cross_context_alignment_conflict"
+    )
+    assert (
+        join["cross_context_alignment_conflict"]["rejected_source_insertion_sample"]
+        == 500
+    )
+    assert output_segments == [
+        {
+            "segment_index": 0,
+            "kind": "source",
+            "source_interval_index": 0,
+            "source_start_sample": 0,
+            "source_end_sample": len(source),
+            "output_start_sample": 0,
+            "output_end_sample": len(source),
+            "gain_envelopes": [],
+            "sample_replacements": [],
+        }
+    ]
+
+    boundary_plan = {
+        "planner": "authoritative_single_pass_boundary_plan_v2",
+        "status": "safe",
+        "alignment_backend": "mfa",
+        "mfa_version": MFA_VERSION,
+        "mfa_model": MFA_MODEL_ID,
+        "mfa_fine_tune": True,
+        "source_audio_sha256": sha256_file(audio_path),
+        "source_sample_rate": SAMPLE_RATE,
+        "source_channel_count": 1,
+        "source_frame_count": len(source),
+        "boundaries": boundaries,
+        "joins": joins,
+        "protected_speech_mask": protected,
+        "clean_ambience_bank": {
+            "accepted_candidates": [],
+            "rejected_candidates": [],
+        },
+        "breath_cleanup": {"room_tone_exclusions": []},
+        "output_segments": output_segments,
+        "expected_output_frame_count": len(source),
+    }
+    plan_path = tmp_path / "boundary_plan.json"
+    output_path = tmp_path / "final.wav"
+    write_json(plan_path, boundary_plan)
+
+    final_render_module.render_boundary_plan(
+        audio_path=audio_path,
+        boundary_plan_path=plan_path,
+        output_path=output_path,
+    )
+
+    rendered, _ = sf.read(output_path, dtype="float32", always_2d=True)
+    assert np.array_equal(rendered, source)
+    assert np.array_equal(rendered[470:530], source[470:530])
+
+
 def test_all_retained_fricative_and_suffix_phones_remain_bit_identical(
     tmp_path: Path,
 ) -> None:
@@ -2041,6 +2988,9 @@ def test_transient_in_existing_mfa_pause_is_planned_for_equal_duration_replaceme
                 "duration_samples": sample_rate,
                 "stationarity_score": 0.0,
                 "noise_level_delta_db": 0.0,
+                "metrics": {
+                    "rms_db": events[0]["local_noise_floor_db"],
+                },
                 "accepted": True,
             }
         ],
@@ -2201,6 +3151,68 @@ def test_ambience_outer_tapers_are_planned_only_with_verified_source_handles() -
     assert rendered[0, 0] == 0.0
     assert rendered[-1, 0] == pytest.approx(0.0, abs=1.0e-8)
     assert joins[0]["pause_content"]["maximum_sample_discontinuity"] == 0.0
+
+
+def test_ambience_only_boundary_match_removes_hard_seam_without_touching_source() -> (
+    None
+):
+    source = np.zeros((1_000, 1), dtype=np.float32)
+    source[199, 0] = 0.25
+    source[500:700, 0] = 0.05
+    source[800, 0] = -0.20
+    before = source.copy()
+    segments = [
+        {
+            "kind": "source",
+            "source_start_sample": 0,
+            "source_end_sample": 200,
+            "gain_envelopes": [],
+        },
+        {
+            "kind": "ambience",
+            "join_id": "join",
+            "output_start_sample": 200,
+            "output_end_sample": 400,
+            "source_trace": [
+                {
+                    "source_start_sample": 500,
+                    "source_end_sample": 700,
+                }
+            ],
+        },
+        {
+            "kind": "source",
+            "source_start_sample": 800,
+            "source_end_sample": 1_000,
+            "gain_envelopes": [],
+        },
+    ]
+    joins = [{"join_id": "join", "pause_content": {}}]
+
+    final_render_module._plan_ambience_edge_transitions(
+        segments=segments,
+        joins=joins,
+        source_audio=source,
+        sample_rate=1_000,
+    )
+
+    ambience = segments[1]
+    assert [envelope["curve"] for envelope in ambience["edge_gain_envelopes"]] == [
+        "equal_power_match_from_source_edge",
+        "equal_power_match_to_source_edge",
+    ]
+    assert {record["status"] for record in ambience["outer_transitions"]} == {
+        "ambience_only_boundary_match_applied"
+    }
+    rendered = final_render_module._apply_ambience_edge_gain_envelopes(
+        source[500:700],
+        output_start_sample=200,
+        envelopes=ambience["edge_gain_envelopes"],
+    )
+    assert rendered[0, 0] == source[199, 0]
+    assert rendered[-1, 0] == source[800, 0]
+    assert joins[0]["pause_content"]["maximum_sample_discontinuity"] == 0.0
+    assert np.array_equal(source, before)
 
 
 def test_artifact_detection_includes_gap_edges() -> None:

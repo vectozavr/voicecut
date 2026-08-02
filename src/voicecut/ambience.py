@@ -31,6 +31,7 @@ class AmbienceThresholds:
     maximum_rms_burst_db: float = 8.0
     maximum_sample_discontinuity: float = 0.05
     maximum_discontinuity_to_rms_ratio: float = 12.0
+    maximum_noise_level_delta_db: float = 12.0
     spectral_band_count: int = 8
 
     def validate(self) -> None:
@@ -50,6 +51,7 @@ class AmbienceThresholds:
             or self.maximum_rms_burst_db < 0.0
             or self.maximum_sample_discontinuity < 0.0
             or self.maximum_discontinuity_to_rms_ratio <= 0.0
+            or self.maximum_noise_level_delta_db <= 0.0
         ):
             raise ValueError("ambience rejection thresholds are invalid")
         if self.spectral_band_count < 2:
@@ -237,9 +239,9 @@ def _reason(
     code: str,
     *,
     metric: str,
-    value: int | float,
-    limit: int | float,
-) -> dict[str, str | int | float]:
+    value: float,
+    limit: float,
+) -> dict[str, str | float]:
     return {
         "code": code,
         "metric": metric,
@@ -358,6 +360,18 @@ def evaluate_ambience_candidate(
         if target_rms_db is not None
         else 0.0
     )
+    if (
+        target_rms_db is not None
+        and noise_level_delta > thresholds.maximum_noise_level_delta_db
+    ):
+        reasons.append(
+            _reason(
+                "noise_level_mismatch",
+                metric="noise_level_delta_db",
+                value=noise_level_delta,
+                limit=thresholds.maximum_noise_level_delta_db,
+            )
+        )
     return {
         "candidate_id": candidate_id,
         "source_start_sample": start_sample,
@@ -427,7 +441,7 @@ def _candidate_rank(
     reference_sample: int | None,
     reference_rms_db: float | None = None,
     prior_use_count: int = 0,
-) -> tuple[float, float, int, int, int, int, str]:
+) -> tuple[int, int, float, int, float, int, int, str]:
     start = int(candidate["source_start_sample"])
     end = int(candidate["source_end_sample"])
     midpoint = (start + end) // 2
@@ -442,12 +456,18 @@ def _candidate_rank(
         if candidate_rms_db is not None and reference_rms_db is not None
         else float(candidate["noise_level_delta_db"])
     )
+    # Treat candidates within the same small level-matching band as peers.
+    # This keeps a sub-decibel difference from pinning every pause to one
+    # source occurrence while still preventing a much louder or quieter bed
+    # from winning merely because it is slightly more stationary.
+    level_match_bucket = int(level_delta // 3.0)
     return (
-        float(candidate["stationarity_score"]),
-        level_delta,
-        -(end - start),
+        level_match_bucket,
         prior_use_count,
+        level_delta,
         abs(midpoint - reference_sample) if reference_sample is not None else 0,
+        float(candidate["stationarity_score"]),
+        -(end - start),
         start,
         str(candidate["candidate_id"]),
     )
@@ -489,6 +509,7 @@ def plan_ambience_assembly(
     reference_rms_db: float | None = None,
     excluded_candidate_ids: Sequence[str] = (),
     candidate_usage_counts: Mapping[str, int] | None = None,
+    maximum_noise_level_delta_db: float | None = None,
 ) -> dict[str, Any]:
     """Plan a traceable ambience bed without repeating source inside one bed.
 
@@ -502,6 +523,19 @@ def plan_ambience_assembly(
         raise ValueError("required ambience duration cannot be negative")
     if sample_rate <= 0 or crossfade_ms < 0.0:
         raise ValueError("ambience assembly geometry is invalid")
+    bank_thresholds = bank.get("thresholds", {})
+    configured_level_limit = (
+        maximum_noise_level_delta_db
+        if maximum_noise_level_delta_db is not None
+        else (
+            float(bank_thresholds["maximum_noise_level_delta_db"])
+            if isinstance(bank_thresholds, Mapping)
+            and "maximum_noise_level_delta_db" in bank_thresholds
+            else DEFAULT_AMBIENCE_THRESHOLDS.maximum_noise_level_delta_db
+        )
+    )
+    if not math.isfinite(configured_level_limit) or configured_level_limit <= 0.0:
+        raise ValueError("maximum ambience noise-level mismatch must be positive")
     if required_samples == 0:
         return {
             "status": "complete",
@@ -513,7 +547,7 @@ def plan_ambience_assembly(
         }
     raw_accepted = bank.get("accepted_candidates", [])
     if not isinstance(raw_accepted, list):
-        raise ValueError("ambience bank has no accepted candidate list")
+        raise TypeError("ambience bank has no accepted candidate list")
     excluded = set(excluded_candidate_ids)
     accepted = [
         dict(item)
@@ -521,6 +555,56 @@ def plan_ambience_assembly(
         if item.get("accepted") is True
         and str(item.get("candidate_id", "")) not in excluded
     ]
+    local_level_rejections: list[dict[str, Any]] = []
+    if reference_rms_db is not None:
+        locally_matched: list[dict[str, Any]] = []
+        for candidate in accepted:
+            metrics = candidate.get("metrics")
+            candidate_rms_db = (
+                float(metrics["rms_db"])
+                if isinstance(metrics, Mapping) and "rms_db" in metrics
+                else None
+            )
+            if candidate_rms_db is None or not math.isfinite(candidate_rms_db):
+                local_level_rejections.append(
+                    {
+                        "candidate_id": str(candidate.get("candidate_id", "")),
+                        "status": "rejected_for_pause",
+                        "reference_noise_floor_db": reference_rms_db,
+                        "rejection_reasons": [
+                            {
+                                "code": "noise_level_unavailable",
+                                "metric": "candidate_rms_db",
+                            }
+                        ],
+                    }
+                )
+                continue
+            level_delta = abs(candidate_rms_db - reference_rms_db)
+            if level_delta > configured_level_limit:
+                local_level_rejections.append(
+                    {
+                        "candidate_id": str(candidate.get("candidate_id", "")),
+                        "status": "rejected_for_pause",
+                        "candidate_rms_db": candidate_rms_db,
+                        "reference_noise_floor_db": reference_rms_db,
+                        "noise_level_delta_db": level_delta,
+                        "rejection_reasons": [
+                            {
+                                **_reason(
+                                    "noise_level_mismatch",
+                                    metric="noise_level_delta_db",
+                                    value=level_delta,
+                                    limit=configured_level_limit,
+                                ),
+                                "source": "pause_local_reference",
+                            }
+                        ],
+                    }
+                )
+                continue
+            locally_matched.append(candidate)
+        accepted = locally_matched
     candidate_ids = [str(item.get("candidate_id", "")) for item in accepted]
     if any(not candidate_id for candidate_id in candidate_ids) or len(
         set(candidate_ids)
@@ -580,6 +664,8 @@ def plan_ambience_assembly(
             ],
             "crossfades": [],
             "source_reuse": False,
+            "local_candidate_rejections": local_level_rejections,
+            "maximum_noise_level_delta_db": configured_level_limit,
         }
 
     requested_crossfade = round(crossfade_ms * sample_rate / 1000.0)
@@ -619,6 +705,8 @@ def plan_ambience_assembly(
             "source_trace": [],
             "crossfades": [],
             "source_reuse": False,
+            "local_candidate_rejections": local_level_rejections,
+            "maximum_noise_level_delta_db": configured_level_limit,
         }
 
     trace: list[dict[str, Any]] = []
@@ -690,6 +778,8 @@ def plan_ambience_assembly(
         "source_trace": trace,
         "crossfades": crossfades,
         "source_reuse": False,
+        "local_candidate_rejections": local_level_rejections,
+        "maximum_noise_level_delta_db": configured_level_limit,
     }
 
 

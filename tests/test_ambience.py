@@ -11,7 +11,6 @@ from voicecut.ambience import (
     plan_ambience_assembly,
 )
 
-
 SAMPLE_RATE = 16_000
 
 
@@ -68,6 +67,80 @@ def test_stationary_candidate_is_accepted_without_mutating_source() -> None:
     assert evaluation["rejection_reasons"] == []
     assert evaluation["noise_level_delta_db"] < 1.0
     assert np.array_equal(source, before)
+
+
+def test_gross_noise_level_mismatch_is_explicitly_rejected() -> None:
+    source = _stationary(SAMPLE_RATE)
+
+    evaluation = evaluate_ambience_candidate(
+        source,
+        candidate_id="wrong-level",
+        start_sample=0,
+        end_sample=len(source),
+        sample_rate=SAMPLE_RATE,
+        target_rms_db=-90.0,
+        thresholds=AmbienceThresholds(maximum_noise_level_delta_db=12.0),
+    )
+
+    assert evaluation["noise_level_delta_db"] > 20.0
+    assert evaluation["accepted"] is False
+    assert "noise_level_mismatch" in _reason_codes(evaluation)
+    reason = next(
+        item
+        for item in evaluation["rejection_reasons"]
+        if item["code"] == "noise_level_mismatch"
+    )
+    assert reason["limit"] == 12.0
+
+
+def test_bank_keeps_clean_candidates_from_different_local_noise_sections() -> None:
+    clean = _stationary(SAMPLE_RATE)
+    loud = clean * 100.0
+    source = np.concatenate([clean, clean, clean, loud])
+
+    bank = build_clean_ambience_bank(
+        source,
+        candidates=[
+            {
+                "candidate_id": f"clean-{index}",
+                "source_start_sample": index * SAMPLE_RATE,
+                "source_end_sample": (index + 1) * SAMPLE_RATE,
+            }
+            for index in range(3)
+        ]
+        + [
+            {
+                "candidate_id": "loud-outlier",
+                "source_start_sample": 3 * SAMPLE_RATE,
+                "source_end_sample": 4 * SAMPLE_RATE,
+            }
+        ],
+        sample_rate=SAMPLE_RATE,
+    )
+
+    assert bank["target_rms_db"] is None
+    assert [item["candidate_id"] for item in bank["accepted_candidates"]] == [
+        "clean-0",
+        "clean-1",
+        "clean-2",
+        "loud-outlier",
+    ]
+
+    quiet_plan = plan_ambience_assembly(
+        bank,
+        required_samples=SAMPLE_RATE // 2,
+        sample_rate=SAMPLE_RATE,
+        reference_rms_db=float(bank["accepted_candidates"][0]["metrics"]["rms_db"]),
+    )
+    loud_plan = plan_ambience_assembly(
+        bank,
+        required_samples=SAMPLE_RATE // 2,
+        sample_rate=SAMPLE_RATE,
+        reference_rms_db=float(bank["accepted_candidates"][-1]["metrics"]["rms_db"]),
+    )
+
+    assert quiet_plan["candidate_ids"][0].startswith("clean-")
+    assert loud_plan["candidate_ids"] == ["loud-outlier"]
 
 
 def test_metrics_include_every_required_deterministic_feature() -> None:
@@ -373,6 +446,82 @@ def test_assembly_rotates_candidates_used_by_earlier_pauses() -> None:
     assert plan["status"] == "complete"
     assert plan["candidate_ids"] == ["unused"]
     assert plan["source_trace"][0]["prior_use_count"] == 0
+
+
+def test_assembly_rotates_level_matched_candidates_before_stationarity() -> None:
+    more_stationary = _accepted_candidate(
+        "already-used",
+        0,
+        2_000,
+        stationarity=0.01,
+        level_delta=0.2,
+    )
+    more_stationary["metrics"] = {"rms_db": -60.2}
+    unused = _accepted_candidate(
+        "unused",
+        3_000,
+        5_000,
+        stationarity=0.20,
+        level_delta=0.5,
+    )
+    unused["metrics"] = {"rms_db": -60.5}
+
+    plan = plan_ambience_assembly(
+        {"accepted_candidates": [more_stationary, unused]},
+        required_samples=1_000,
+        sample_rate=1_000,
+        reference_rms_db=-60.0,
+        candidate_usage_counts={"already-used": 5, "unused": 0},
+    )
+
+    assert plan["candidate_ids"] == ["unused"]
+
+
+def test_gross_level_mismatch_cannot_win_on_stationarity() -> None:
+    loud_stationary = _accepted_candidate(
+        "loud-stationary",
+        0,
+        2_000,
+        stationarity=0.001,
+        level_delta=40.0,
+    )
+    loud_stationary["metrics"] = {"rms_db": -48.0}
+    matched = _accepted_candidate(
+        "matched",
+        3_000,
+        5_000,
+        stationarity=0.50,
+        level_delta=1.0,
+    )
+    matched["metrics"] = {"rms_db": -87.0}
+
+    plan = plan_ambience_assembly(
+        {"accepted_candidates": [loud_stationary, matched]},
+        required_samples=1_000,
+        sample_rate=1_000,
+        reference_rms_db=-88.0,
+    )
+
+    assert plan["candidate_ids"] == ["matched"]
+    assert plan["source_trace"][0]["noise_level_delta_db"] == pytest.approx(1.0)
+    assert plan["local_candidate_rejections"] == [
+        {
+            "candidate_id": "loud-stationary",
+            "status": "rejected_for_pause",
+            "candidate_rms_db": -48.0,
+            "reference_noise_floor_db": -88.0,
+            "noise_level_delta_db": 40.0,
+            "rejection_reasons": [
+                {
+                    "code": "noise_level_mismatch",
+                    "metric": "noise_level_delta_db",
+                    "value": 40.0,
+                    "limit": 12.0,
+                    "source": "pause_local_reference",
+                }
+            ],
+        }
+    ]
 
 
 def test_assembly_prefers_noise_level_matching_the_local_pause_context() -> None:

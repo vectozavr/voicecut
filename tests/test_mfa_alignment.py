@@ -17,6 +17,7 @@ from voicecut.mfa_alignment import (
     MFABatchPaths,
     MFASourceWord,
     MFATokenMapping,
+    align_mfa_contexts,
     build_mfa_align_command,
     invoke_mfa_batch,
     normalize_mfa_token,
@@ -178,14 +179,298 @@ def test_parse_preserves_success_when_another_batch_context_is_missing(
     assert result["context_errors"] == [
         {
             "context_id": "context_001",
-            "code": "mfa_word_mapping_failed",
+            "code": "mfa_utterance_unaligned",
             "error": (
-                "MFAAlignmentError: mfa_word_mapping_failed: expected exactly one "
+                "MFAAlignmentError: mfa_utterance_unaligned: expected exactly one "
                 "MFA JSON for context_001, found 0"
             ),
             "boundary_ids": ["gap_001"],
         }
     ]
+
+
+def test_align_retries_only_missing_contexts_and_preserves_batch_success(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_source(audio_path)
+    prefix = tmp_path / ".mfa-env"
+    prefix.mkdir()
+    align_calls: list[list[str]] = []
+
+    def write_output(
+        output_root: Path,
+        *,
+        context_id: str,
+        word: str,
+    ) -> None:
+        destination = output_root / "narrator" / f"{context_id}.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(
+                {
+                    "start": 0.0,
+                    "end": 2.0,
+                    "tiers": {
+                        "words": {
+                            "type": "interval",
+                            "entries": [
+                                [0.0, 0.2, "<eps>"],
+                                [0.2, 0.7, word],
+                                [0.7, 2.0, "<eps>"],
+                            ],
+                        },
+                        "phones": {
+                            "type": "interval",
+                            "entries": [
+                                [0.0, 0.2, "sil"],
+                                [0.2, 0.45, "W"],
+                                [0.45, 0.7, "D"],
+                                [0.7, 2.0, "sil"],
+                            ],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def runner(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "version":
+            return subprocess.CompletedProcess(command, 0, stdout="3.4.1\n", stderr="")
+        align_calls.append(command)
+        corpus = Path(command[6]) / "narrator"
+        output = Path(command[8])
+        context_ids = sorted(path.stem for path in corpus.glob("*.lab"))
+        if len(align_calls) == 1:
+            assert context_ids == ["context_000", "context_001"]
+            write_output(output, context_id="context_000", word="valid")
+        else:
+            assert context_ids == ["context_001"]
+            write_output(output, context_id="context_001", word="recovered")
+        return subprocess.CompletedProcess(
+            command,
+            1 if len(align_calls) == 1 else 0,
+            stdout="aligned\n",
+            stderr="one utterance failed\n" if len(align_calls) == 1 else "",
+        )
+
+    result = align_mfa_contexts(
+        audio_path=audio_path,
+        contexts=[
+            {
+                "context_id": "context_000",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [_word(0, "valid", 0.8, 1.2)],
+                "boundary_ids": ["gap_000"],
+            },
+            {
+                "context_id": "context_001",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [_word(1, "recovered", 1.3, 1.7)],
+                "boundary_ids": ["gap_001"],
+            },
+        ],
+        work_dir=tmp_path / "work",
+        prefix=prefix,
+        cache_root=tmp_path / "mfa-cache",
+        micromamba="mock-micromamba",
+        runner=runner,
+    )
+
+    assert len(align_calls) == 2
+    assert result["invocation"]["status"] == ("failed_with_possible_partial_outputs")
+    assert [context["context_id"] for context in result["contexts"]] == [
+        "context_000",
+        "context_001",
+    ]
+    assert result["context_errors"] == []
+    assert result["recovery_batches"][0]["attempted_context_ids"] == ["context_001"]
+    assert result["recovery_batches"][0]["resolved_context_ids"] == ["context_001"]
+    assert "recovery" not in result["contexts"][0]["mfa_output_json"]
+    assert "recovery" in result["contexts"][1]["mfa_output_json"]
+
+
+def test_unnormalizable_word_in_one_context_does_not_poison_mfa_batch(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_source(audio_path)
+    prefix = tmp_path / ".mfa-env"
+    prefix.mkdir()
+    aligned_context_ids: list[list[str]] = []
+
+    def runner(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "version":
+            return subprocess.CompletedProcess(command, 0, stdout="3.4.1\n", stderr="")
+        corpus = Path(command[6]) / "narrator"
+        output = Path(command[8])
+        context_ids = sorted(path.stem for path in corpus.glob("*.lab"))
+        aligned_context_ids.append(context_ids)
+        assert context_ids == ["context_valid"]
+        destination = output / "narrator" / "context_valid.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            json.dumps(
+                {
+                    "start": 0.0,
+                    "end": 2.0,
+                    "tiers": {
+                        "words": {
+                            "type": "interval",
+                            "entries": [
+                                [0.0, 0.2, "<eps>"],
+                                [0.2, 0.7, "valid"],
+                                [0.7, 2.0, "<eps>"],
+                            ],
+                        },
+                        "phones": {
+                            "type": "interval",
+                            "entries": [
+                                [0.0, 0.2, "sil"],
+                                [0.2, 0.45, "V"],
+                                [0.45, 0.7, "D"],
+                                [0.7, 2.0, "sil"],
+                            ],
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="aligned\n",
+            stderr="",
+        )
+
+    result = align_mfa_contexts(
+        audio_path=audio_path,
+        contexts=[
+            {
+                "context_id": "context_valid",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [_word(0, "valid", 0.8, 1.2)],
+                "boundary_ids": ["gap_valid"],
+            },
+            {
+                "context_id": "context_bad",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [
+                    _word(1, "before", 1.0, 1.2),
+                    _word(2, "раздомае.", 1.2, 1.5, selected=False),
+                    _word(3, "after", 1.5, 1.8),
+                ],
+                "boundary_ids": ["gap_bad"],
+            },
+        ],
+        work_dir=tmp_path / "work",
+        prefix=prefix,
+        cache_root=tmp_path / "mfa-cache",
+        micromamba="mock-micromamba",
+        runner=runner,
+    )
+
+    assert aligned_context_ids == [["context_valid"]]
+    assert [context["context_id"] for context in result["contexts"]] == [
+        "context_valid"
+    ]
+    assert len(result["context_errors"]) == 1
+    context_error = result["context_errors"][0]
+    assert context_error["context_id"] == "context_bad"
+    assert context_error["code"] == "mfa_word_mapping_failed"
+    assert "source word 2 cannot be normalized" in context_error["error"]
+    assert context_error["boundary_ids"] == ["gap_bad"]
+
+
+def test_alignment_recovery_excludes_impossible_optional_zero_anchor_run(
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_source(audio_path)
+    prefix = tmp_path / ".mfa-env"
+    prefix.mkdir()
+    align_calls = 0
+
+    def runner(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        nonlocal align_calls
+        if command[-1] == "version":
+            return subprocess.CompletedProcess(command, 0, stdout="3.4.1\n", stderr="")
+        align_calls += 1
+        corpus = Path(command[6]) / "narrator"
+        lab = corpus / "context_000.lab"
+        output = Path(command[8])
+        if align_calls == 1:
+            assert lab.read_text(encoding="utf-8").strip() == (
+                "keep phantom repeated tokens"
+            )
+        else:
+            assert lab.read_text(encoding="utf-8").strip() == "keep"
+            destination = output / "narrator" / "context_000.json"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(
+                json.dumps(
+                    {
+                        "start": 0.0,
+                        "end": 2.0,
+                        "tiers": {
+                            "words": {
+                                "type": "interval",
+                                "entries": [
+                                    [0.0, 0.2, "<eps>"],
+                                    [0.2, 0.7, "keep"],
+                                    [0.7, 2.0, "<eps>"],
+                                ],
+                            },
+                            "phones": {
+                                "type": "interval",
+                                "entries": [
+                                    [0.0, 0.2, "sil"],
+                                    [0.2, 0.45, "K"],
+                                    [0.45, 0.7, "P"],
+                                    [0.7, 2.0, "sil"],
+                                ],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="aligned\n", stderr="")
+
+    result = align_mfa_contexts(
+        audio_path=audio_path,
+        contexts=[
+            {
+                "context_id": "context_000",
+                "crop_source_start_seconds": 0.5,
+                "crop_source_end_seconds": 2.5,
+                "words": [
+                    _word(0, "keep", 0.8, 1.2),
+                    _word(1, "phantom", 1.3, 1.3, selected=False),
+                    _word(2, "repeated", 1.3, 1.3, selected=False),
+                    _word(3, "tokens", 1.3, 1.3, selected=False),
+                ],
+                "boundary_ids": ["gap_000"],
+            }
+        ],
+        work_dir=tmp_path / "work",
+        prefix=prefix,
+        cache_root=tmp_path / "mfa-cache",
+        micromamba="mock-micromamba",
+        runner=runner,
+    )
+
+    assert align_calls == 2
+    assert result["context_errors"] == []
+    assert result["recovery_batches"][0]["excluded_degenerate_optional_word_ids"] == {
+        "context_000": [1, 2, 3]
+    }
 
 
 @pytest.mark.parametrize(
@@ -374,6 +659,47 @@ def test_parse_mfa_json_maps_repeated_words_sequentially_and_preserves_phones(
     assert context["phones"][0]["is_silence"] is True
 
 
+def test_parse_ignores_duplicate_lexical_interval_backed_only_by_silence(
+    tmp_path: Path,
+) -> None:
+    paths = _prepare(
+        tmp_path,
+        words=[
+            _word(10, "could", 0.7, 1.0),
+            _word(11, "notice", 1.5, 1.9),
+        ],
+    )
+    _write_mfa_json(
+        paths,
+        word_entries=[
+            [0.0, 0.20, "<eps>"],
+            [0.20, 0.50, "could"],
+            [0.50, 1.20, "could"],
+            [1.20, 1.60, "notice"],
+            [1.60, 2.0, "<eps>"],
+        ],
+        phone_entries=[
+            [0.0, 0.20, "sil"],
+            [0.20, 0.35, "K"],
+            [0.35, 0.50, "D"],
+            [0.50, 1.20, "sil"],
+            [1.20, 1.40, "N"],
+            [1.40, 1.60, "S"],
+            [1.60, 2.0, "sil"],
+        ],
+    )
+
+    result = parse_mfa_batch(paths)
+    context = result["contexts"][0]
+
+    assert result["context_errors"] == []
+    assert [word["mfa_token"] for word in context["words"]] == ["could", "notice"]
+    assert [
+        interval["label"] for interval in context["ignored_silence_only_word_intervals"]
+    ] == ["could"]
+    assert source_word_alignment(context, 11)["last_non_silence_phone"]["phone"] == "S"
+
+
 def test_parse_mfa_json_keeps_lexical_word_silence(tmp_path: Path) -> None:
     paths = _prepare(
         tmp_path,
@@ -526,10 +852,7 @@ def test_parse_reports_final_mapped_word_without_non_silence_phone(
 
     assert result["contexts"] == []
     assert result["context_errors"][0]["context_id"] == "context_000"
-    assert (
-        "mapped word 'missing' has no non-silence phone"
-        in result["context_errors"][0]["error"]
-    )
+    assert "expected 'missing'" in result["context_errors"][0]["error"]
 
 
 @pytest.mark.parametrize(

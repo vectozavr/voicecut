@@ -35,6 +35,7 @@ MFA_SPEAKER = "narrator"
 MFA_PHONE_ROUNDING_TOLERANCE_SECONDS = 0.002
 MFA_TIME_BOUNDARY_TOLERANCE_SECONDS = 0.002
 MFA_INTERVAL_ORDER_TOLERANCE_SECONDS = 0.000001
+MFA_CONTEXT_RECOVERY_ATTEMPTS = 1
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MFA_PREFIX = REPOSITORY_ROOT / ".mfa-env"
@@ -806,6 +807,29 @@ def _normalized_output_token(label: str) -> str:
     return tokens[0]
 
 
+def _word_interval_has_non_silence_phone(
+    word_interval: Mapping[str, Any],
+    phone_intervals: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Reject lexical word-tier artifacts that cover only MFA silence.
+
+    MFA can occasionally duplicate a lexical label across a long silent span.
+    Such an interval is not word evidence even though its label looks valid;
+    accepting it shifts every following ordered token mapping.  Keep a word
+    interval only when at least one non-silence phone genuinely overlaps it.
+    """
+
+    word_start = float(word_interval["relative_start_seconds"])
+    word_end = float(word_interval["relative_end_seconds"])
+    return any(
+        str(phone.get("label", "")).strip()
+        and not is_mfa_silence_phone(str(phone["label"]))
+        and float(phone["relative_end_seconds"]) > word_start
+        and float(phone["relative_start_seconds"]) < word_end
+        for phone in phone_intervals
+    )
+
+
 def _word_phones(
     word_interval: Mapping[str, Any],
     phone_intervals: Sequence[Mapping[str, Any]],
@@ -920,7 +944,7 @@ def _find_output_json(paths: MFABatchPaths, context_id: str) -> Path:
     candidates = sorted(paths.output.rglob(f"{context_id}.json"))
     if len(candidates) != 1:
         raise MFAAlignmentError(
-            "mfa_word_mapping_failed",
+            "mfa_utterance_unaligned",
             f"expected exactly one MFA JSON for {context_id}, found {len(candidates)}",
         )
     return candidates[0]
@@ -965,10 +989,20 @@ def _parse_mfa_context(
         crop_duration_seconds=crop_duration,
         sample_rate=sample_rate,
     )
-    lexical_words = [
+    lexical_word_candidates = [
         interval
         for interval in word_intervals
         if not _is_mfa_silence_word(str(interval["label"]))
+    ]
+    ignored_silence_only_words = [
+        dict(interval)
+        for interval in lexical_word_candidates
+        if not _word_interval_has_non_silence_phone(interval, phone_intervals)
+    ]
+    lexical_words = [
+        interval
+        for interval in lexical_word_candidates
+        if _word_interval_has_non_silence_phone(interval, phone_intervals)
     ]
     raw_mappings = raw_context.get("token_mappings")
     if not isinstance(raw_mappings, list):
@@ -1008,6 +1042,7 @@ def _parse_mfa_context(
         "boundary_ids": list(raw_context["boundary_ids"]),
         "words": mapped_words,
         "phones": all_phones,
+        "ignored_silence_only_word_intervals": ignored_silence_only_words,
         "mfa_output_json": str(output_path),
     }
 
@@ -1158,6 +1193,81 @@ def source_word_alignment(
     }
 
 
+def _recovery_context_without_degenerate_optional_runs(
+    context: MFAContextSpec,
+) -> tuple[MFAContextSpec, list[int]]:
+    """Drop only impossible optional anchor runs from an MFA recovery crop.
+
+    Long-form Whisper can emit many omitted words at one identical
+    zero-duration anchor.  Feeding such a transcript to MFA makes the local
+    utterance acoustically impossible and can prevent it from exporting any
+    alignment.  A single approximate/zero anchor is preserved; only runs of
+    at least two consecutive *omitted* zero-duration occurrences at the same
+    anchor are excluded on the recovery attempt.  Selected occurrences are
+    never removed here.
+
+    This transformation affects the reference transcript only.  It does not
+    create coordinates or authorize a cut; all required retained words still
+    need valid MFA word and phone evidence downstream.
+    """
+
+    words = list(context.words)
+    excluded_ids: set[int] = set()
+    run_start = 0
+    while run_start < len(words):
+        word = words[run_start]
+        is_optional_zero = (
+            not word.selected
+            and abs(word.end_seconds - word.start_seconds)
+            <= MFA_INTERVAL_ORDER_TOLERANCE_SECONDS
+        )
+        if not is_optional_zero:
+            run_start += 1
+            continue
+        anchor = word.start_seconds
+        run_end = run_start + 1
+        while run_end < len(words):
+            candidate = words[run_end]
+            if (
+                candidate.selected
+                or abs(candidate.end_seconds - candidate.start_seconds)
+                > MFA_INTERVAL_ORDER_TOLERANCE_SECONDS
+                or abs(candidate.start_seconds - anchor)
+                > MFA_INTERVAL_ORDER_TOLERANCE_SECONDS
+            ):
+                break
+            run_end += 1
+        if run_end - run_start >= 2:
+            excluded_ids.update(item.word_id for item in words[run_start:run_end])
+        run_start = run_end
+
+    if not excluded_ids:
+        return context, []
+    retained_words = tuple(
+        word for word in context.words if word.word_id not in excluded_ids
+    )
+    retained_mappings = (
+        tuple(
+            mapping
+            for mapping in context.token_mappings
+            if not set(mapping.source_word_ids) & excluded_ids
+        )
+        if context.token_mappings is not None
+        else None
+    )
+    return (
+        MFAContextSpec(
+            context_id=context.context_id,
+            crop_source_start_seconds=context.crop_source_start_seconds,
+            crop_source_end_seconds=context.crop_source_end_seconds,
+            words=retained_words,
+            boundary_ids=context.boundary_ids,
+            token_mappings=retained_mappings,
+        ),
+        sorted(excluded_ids),
+    )
+
+
 def align_mfa_contexts(
     *,
     audio_path: Path,
@@ -1167,24 +1277,226 @@ def align_mfa_contexts(
     cache_root: Path = DEFAULT_MFA_CACHE_ROOT,
     micromamba: str | Path = "micromamba",
     num_jobs: int = 1,
+    context_recovery_attempts: int = MFA_CONTEXT_RECOVERY_ATTEMPTS,
     runner: Runner = subprocess.run,
 ) -> dict[str, Any]:
-    """Prepare, align, and parse all local contexts with one MFA batch call."""
+    """Align local contexts, retrying only utterances MFA did not export.
+
+    MFA can exit successfully after aligning almost an entire long-form batch
+    while omitting JSON for a handful of utterances.  Throwing away hundreds
+    of valid contexts and rerunning the whole recording is both expensive and
+    unnecessary.  Preserve the successful evidence and retry the missing
+    utterances together in one small recovery batch.
+
+    Recovery never changes the alignment backend and never substitutes
+    Whisper coordinates.  If a context remains unaligned it stays an explicit
+    fail-closed context error for the semantic/source-preservation policy.
+    """
+
+    if context_recovery_attempts < 0:
+        raise ValueError("context_recovery_attempts must be non-negative")
+    coerced_contexts = tuple(_coerce_context(context) for context in contexts)
+
+    # One malformed ASR occurrence must not poison every otherwise independent
+    # alignment context in a long recording.  Validate contexts before creating
+    # the shared MFA corpus and retain failures as context-local, fail-closed
+    # evidence.  The valid contexts still use exactly one batched MFA call.
+    valid_contexts: list[MFAContextSpec] = []
+    preflight_errors: dict[str, dict[str, Any]] = {}
+    for context in coerced_contexts:
+        try:
+            _validated_context_mappings(context)
+        except (MFAAlignmentError, TypeError, ValueError) as error:
+            preflight_errors[context.context_id] = {
+                "context_id": context.context_id,
+                "code": (
+                    error.code
+                    if isinstance(error, MFAAlignmentError)
+                    else "mfa_word_mapping_failed"
+                ),
+                "error": f"{type(error).__name__}: {error}",
+                "boundary_ids": list(context.boundary_ids),
+                "stage": "context_preflight",
+            }
+        else:
+            valid_contexts.append(context)
+
+    if not valid_contexts:
+        paths = MFABatchPaths(
+            root=(work_dir.resolve() / "mfa_alignment"),
+            corpus=(work_dir.resolve() / "mfa_alignment" / "corpus"),
+            metadata=(work_dir.resolve() / "mfa_alignment" / "metadata"),
+            output=(work_dir.resolve() / "mfa_alignment" / "output"),
+            temporary=(work_dir.resolve() / "mfa_alignment" / "temp"),
+        )
+        _reset_batch_directories(paths)
+        with sf.SoundFile(audio_path.resolve()) as source:
+            sample_rate = int(source.samplerate)
+        result = {
+            "schema_version": 1,
+            "backend": "mfa",
+            "mfa_version": MFA_VERSION,
+            "model_id": MFA_MODEL_ID,
+            "fine_tune": True,
+            "sample_rate": sample_rate,
+            "source_audio": str(audio_path.resolve()),
+            "source_audio_sha256": sha256_file(audio_path.resolve()),
+            "contexts": [],
+            "context_errors": [
+                preflight_errors[context.context_id] for context in coerced_contexts
+            ],
+            "preflight_context_errors": [
+                preflight_errors[context.context_id] for context in coerced_contexts
+            ],
+            "invocation": {
+                "status": "skipped_no_valid_contexts",
+                "reason": "all MFA contexts failed independent preflight",
+            },
+            "recovery_batches": [],
+        }
+        write_json(paths.metadata / "mfa_alignment.json", result)
+        return result
 
     paths = prepare_mfa_batch(
         audio_path=audio_path,
-        contexts=contexts,
+        contexts=valid_contexts,
         work_dir=work_dir,
     )
-    invocation = invoke_mfa_batch(
-        paths=paths,
-        prefix=prefix,
-        cache_root=cache_root,
-        micromamba=micromamba,
-        num_jobs=num_jobs,
-        runner=runner,
-    )
+    try:
+        invocation = invoke_mfa_batch(
+            paths=paths,
+            prefix=prefix,
+            cache_root=cache_root,
+            micromamba=micromamba,
+            num_jobs=num_jobs,
+            runner=runner,
+        )
+        invocation["status"] = "complete"
+    except MFAAlignmentError as error:
+        # MFA can return a non-zero process status even when it exported valid
+        # JSON for some utterances.  Parse and retain independently validated
+        # outputs instead of discarding them.  Missing contexts remain
+        # fail-closed and are eligible for the bounded recovery batch below.
+        invocation = {
+            "schema_version": 1,
+            "backend": "mfa",
+            "mfa_version": MFA_VERSION,
+            "model_id": MFA_MODEL_ID,
+            "fine_tune": True,
+            "status": "failed_with_possible_partial_outputs",
+            "error_code": error.code,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        write_json(paths.metadata / "mfa_invocation.json", invocation)
     result = parse_mfa_batch(paths)
     result["invocation"] = invocation
+    recovery_batches: list[dict[str, Any]] = []
+    contexts_by_id = {
+        str(context["context_id"]): context for context in result["contexts"]
+    }
+    errors_by_id = {
+        str(error["context_id"]): error for error in result["context_errors"]
+    }
+    specs_by_id = {context.context_id: context for context in valid_contexts}
+
+    for recovery_index in range(1, context_recovery_attempts + 1):
+        retry_ids = [
+            context.context_id
+            for context in valid_contexts
+            if context.context_id in errors_by_id
+            and errors_by_id[context.context_id].get("code")
+            == "mfa_utterance_unaligned"
+        ]
+        if not retry_ids:
+            break
+        retry_contexts: list[MFAContextSpec] = []
+        excluded_anchor_words: dict[str, list[int]] = {}
+        for context_id in retry_ids:
+            recovery_context, excluded_ids = (
+                _recovery_context_without_degenerate_optional_runs(
+                    specs_by_id[context_id]
+                )
+            )
+            retry_contexts.append(recovery_context)
+            if excluded_ids:
+                excluded_anchor_words[context_id] = excluded_ids
+        retry_work_dir = paths.root / "recovery" / f"retry_{recovery_index:02d}"
+        retry_paths = prepare_mfa_batch(
+            audio_path=audio_path,
+            contexts=retry_contexts,
+            work_dir=retry_work_dir,
+        )
+        try:
+            retry_invocation = invoke_mfa_batch(
+                paths=retry_paths,
+                prefix=prefix,
+                cache_root=cache_root,
+                micromamba=micromamba,
+                num_jobs=min(num_jobs, len(retry_contexts)),
+                runner=runner,
+            )
+            retry_invocation["status"] = "complete"
+        except MFAAlignmentError as error:
+            retry_invocation = {
+                "schema_version": 1,
+                "backend": "mfa",
+                "mfa_version": MFA_VERSION,
+                "model_id": MFA_MODEL_ID,
+                "fine_tune": True,
+                "status": "failed_with_possible_partial_outputs",
+                "error_code": error.code,
+                "error": f"{type(error).__name__}: {error}",
+            }
+            write_json(
+                retry_paths.metadata / "mfa_invocation.json",
+                retry_invocation,
+            )
+        retry_result = parse_mfa_batch(retry_paths)
+        resolved_ids: list[str] = []
+        for context in retry_result["contexts"]:
+            context_id = str(context["context_id"])
+            contexts_by_id[context_id] = context
+            errors_by_id.pop(context_id, None)
+            resolved_ids.append(context_id)
+        retry_errors = {
+            str(error["context_id"]): error for error in retry_result["context_errors"]
+        }
+        for context_id in retry_ids:
+            if context_id in retry_errors:
+                errors_by_id[context_id] = retry_errors[context_id]
+        recovery_batches.append(
+            {
+                "recovery_index": recovery_index,
+                "attempted_context_ids": retry_ids,
+                "resolved_context_ids": resolved_ids,
+                "remaining_context_errors": [
+                    errors_by_id[context_id]
+                    for context_id in retry_ids
+                    if context_id in errors_by_id
+                ],
+                "excluded_degenerate_optional_word_ids": excluded_anchor_words,
+                "invocation": retry_invocation,
+                "artifact_root": str(retry_paths.root),
+            }
+        )
+
+    errors_by_id.update(preflight_errors)
+    ordered_ids = [context.context_id for context in coerced_contexts]
+    result["contexts"] = [
+        contexts_by_id[context_id]
+        for context_id in ordered_ids
+        if context_id in contexts_by_id
+    ]
+    result["context_errors"] = [
+        errors_by_id[context_id]
+        for context_id in ordered_ids
+        if context_id in errors_by_id
+    ]
+    result["recovery_batches"] = recovery_batches
+    result["preflight_context_errors"] = [
+        preflight_errors[context_id]
+        for context_id in ordered_ids
+        if context_id in preflight_errors
+    ]
     write_json(paths.metadata / "mfa_alignment.json", result)
     return result

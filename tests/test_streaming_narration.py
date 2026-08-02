@@ -197,6 +197,91 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertEqual(grounding["unsupported_tokens"], [])
             self.assertEqual(grounding["unrepresented_source_tokens"], [])
 
+    def test_conservative_delivery_accepts_exact_punctuation_only_anchor(
+        self,
+    ) -> None:
+        words = [
+            {"id": 0, "text": "Alpha", "start": 0.0, "end": 0.2},
+            {"id": 1, "text": "-", "start": 0.2, "end": 0.3},
+            {"id": 2, "text": "Beta", "start": 0.4, "end": 0.6},
+        ]
+        plan = {
+            "status": "complete",
+            "words": words,
+            "committed": [
+                {
+                    "canonical_text": "Alpha",
+                    "source_ranges": [
+                        {
+                            "start_word_id": 0,
+                            "end_word_id": 1,
+                            "first_word_id": 0,
+                            "last_word_id": 0,
+                            "first_word": "Alpha",
+                            "last_word": "Alpha",
+                            "canonical_text": "Alpha",
+                        }
+                    ],
+                },
+                {
+                    "canonical_text": "Beta",
+                    "source_ranges": [
+                        {
+                            "start_word_id": 2,
+                            "end_word_id": 3,
+                            "first_word_id": 2,
+                            "last_word_id": 2,
+                            "first_word": "Beta",
+                            "last_word": "Beta",
+                            "canonical_text": "Beta",
+                        }
+                    ],
+                },
+            ],
+        }
+        unsafe = {
+            "status": "unsafe",
+            "source_intervals": [
+                {
+                    "start_word_id": 0,
+                    "end_word_id": 1,
+                    "merged_original_ranges": [{"thought_index": 0}],
+                },
+                {
+                    "start_word_id": 2,
+                    "end_word_id": 3,
+                    "merged_original_ranges": [{"thought_index": 1}],
+                },
+            ],
+            "boundaries": [
+                {
+                    "boundary_id": "range_0000_end",
+                    "safety_status": "mfa_word_mapping_failed",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "streaming_plan.json"
+            unsafe_path = root / "unsafe_boundary_plan.json"
+            write_json(plan_path, plan)
+            write_json(unsafe_path, unsafe)
+
+            fallback = build_conservative_delivery_plan(
+                plan_path=plan_path,
+                boundary_plan_path=unsafe_path,
+                output_dir=root / "fallback",
+            )
+
+            first = fallback["committed"][0]
+            self.assertEqual(first["canonical_text"], "Alpha -")
+            self.assertEqual(first["source_ranges"][0]["last_word"], "-")
+            self.assertEqual(first["source_ranges"][0]["end_word_id"], 2)
+            grounding = read_json(root / "fallback" / "grounding_validation.json")
+            self.assertEqual(grounding["status"], "valid")
+            self.assertEqual(grounding["unsupported_tokens"], [])
+            self.assertEqual(grounding["unrepresented_source_tokens"], [])
+
     def test_acoustic_repair_reselects_thought_without_reusing_unsafe_cut(
         self,
     ) -> None:
@@ -385,6 +470,314 @@ class StreamingNarrationTests(unittest.TestCase):
             self.assertEqual(
                 repair_record["failure_reasons"], ["weak_terminal_word_support"]
             )
+
+    def test_acoustic_repair_persists_successful_thoughts_when_a_later_one_fails(
+        self,
+    ) -> None:
+        transcript = transcript_with_word_groups(
+            [
+                (
+                    0.0,
+                    [
+                        "Alpha",
+                        "complete.",
+                        "Alpha",
+                        "complete.",
+                        "Beta",
+                        "complete.",
+                        "Beta",
+                        "complete.",
+                    ],
+                )
+            ]
+        )
+        initial_backend = FakeStreamingBackend(
+            [
+                response(
+                    finalized=[
+                        thought(
+                            "Alpha complete.",
+                            (0, 1, "Alpha", "complete.", "Alpha complete."),
+                        )
+                    ],
+                    pending_start_word_id=4,
+                ),
+                response(
+                    finalized=[
+                        thought(
+                            "Beta complete.",
+                            (4, 5, "Beta", "complete.", "Beta complete."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+        invalid_second_thought = response(
+            finalized=[
+                thought(
+                    "Beta complete.",
+                    (4, 5, "Beta", "complete.", "Beta complete."),
+                )
+            ],
+            pending_start_word_id=None,
+        )
+        repair_backend = FakeStreamingBackend(
+            [
+                response(
+                    finalized=[
+                        thought(
+                            "Alpha complete.",
+                            (2, 3, "Alpha", "complete.", "Alpha complete."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+                invalid_second_thought,
+                invalid_second_thought,
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            initial_dir = root / "initial"
+            run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=initial_dir,
+                backend=initial_backend,
+            )
+            boundary_path = root / "rejected_boundary_plan.json"
+            write_json(
+                boundary_path,
+                {
+                    "status": "unsafe",
+                    "active_repair_boundary_ids": ["alpha_edge", "beta_edge"],
+                    "boundaries": [
+                        {
+                            "boundary_id": "alpha_edge",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "weak_retained_word_alignment",
+                            "retained_thought_indices": [0],
+                            "source_word_ids": {
+                                "last_retained_left": 1,
+                                "first_omitted": 2,
+                            },
+                            "forbidden_word_ids": [1],
+                            "failure_reason": "weak_terminal_word_support",
+                        },
+                        {
+                            "boundary_id": "beta_edge",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "weak_retained_word_alignment",
+                            "retained_thought_indices": [1],
+                            "source_word_ids": {
+                                "last_retained_left": 5,
+                                "first_omitted": 6,
+                            },
+                            "forbidden_word_ids": [5],
+                            "failure_reason": "weak_terminal_word_support",
+                        },
+                    ],
+                },
+            )
+
+            repaired = repair_plan_for_acoustic_safety(
+                plan_path=initial_dir / "streaming_plan.json",
+                boundary_plan_path=boundary_path,
+                output_dir=root / "repair",
+                backend=repair_backend,
+                retry_index=1,
+            )
+
+            self.assertEqual(
+                repaired["committed"][0]["source_ranges"][0]["start_word_id"],
+                2,
+            )
+            self.assertEqual(
+                repaired["committed"][1]["source_ranges"][0]["start_word_id"],
+                4,
+            )
+            self.assertTrue(repaired["acoustic_repair_partial"])
+            self.assertEqual(len(repaired["acoustic_repairs"]), 1)
+            self.assertEqual(len(repaired["acoustic_repair_failures"]), 1)
+            self.assertEqual(
+                repaired["acoustic_repair_failures"][0]["thought_index"],
+                1,
+            )
+            self.assertEqual(
+                read_json(root / "repair/streaming_plan.json"),
+                repaired,
+            )
+            self.assertEqual(
+                read_json(root / "repair/grounding_validation.json")["status"],
+                "valid",
+            )
+            ledger = read_json(root / "repair/acoustic_repair.json")
+            self.assertTrue(ledger["partial"])
+            self.assertEqual(len(ledger["repairs"]), 1)
+            self.assertEqual(len(ledger["failures"]), 1)
+            self.assertEqual(len(repair_backend.prompts), 3)
+            self.assertEqual(list((root / "repair").glob("*.wav")), [])
+
+    def test_acoustic_repair_uses_history_as_a_constraint_not_a_new_target(
+        self,
+    ) -> None:
+        transcript = transcript_with_word_groups(
+            [
+                (
+                    0.0,
+                    [
+                        "Alpha",
+                        "complete.",
+                        "unused",
+                        "material",
+                        "Beta",
+                        "complete.",
+                        "Beta",
+                        "complete.",
+                        "Beta",
+                        "complete.",
+                    ],
+                )
+            ]
+        )
+        initial_backend = FakeStreamingBackend(
+            [
+                response(
+                    finalized=[
+                        thought(
+                            "Alpha complete.",
+                            (0, 1, "Alpha", "complete.", "Alpha complete."),
+                        )
+                    ],
+                    pending_start_word_id=2,
+                ),
+                response(
+                    finalized=[
+                        thought(
+                            "Beta complete.",
+                            (6, 7, "Beta", "complete.", "Beta complete."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+        repair_backend = FakeStreamingBackend(
+            [
+                response(
+                    finalized=[
+                        thought(
+                            "Beta complete.",
+                            (4, 5, "Beta", "complete.", "Beta complete."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+                response(
+                    finalized=[
+                        thought(
+                            "Beta complete.",
+                            (8, 9, "Beta", "complete.", "Beta complete."),
+                        )
+                    ],
+                    pending_start_word_id=None,
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript_path = root / "source_transcript.json"
+            write_json(transcript_path, transcript)
+            initial_dir = root / "initial"
+            run_streaming_planner(
+                transcript_path=transcript_path,
+                output_dir=initial_dir,
+                backend=initial_backend,
+            )
+            boundary_path = root / "rejected_boundary_plan.json"
+            write_json(
+                boundary_path,
+                {
+                    "status": "unsafe",
+                    "active_repair_boundary_ids": ["current_beta_edge"],
+                    "boundaries": [
+                        {
+                            "boundary_id": "current_beta_edge",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "weak_retained_word_alignment",
+                            "retained_thought_indices": [1],
+                            "source_word_ids": {
+                                "last_retained_left": 7,
+                                "first_omitted": 8,
+                            },
+                            "forbidden_word_ids": [7],
+                            "failure_reason": "weak_terminal_word_support",
+                        },
+                        {
+                            "boundary_id": "retry_01:old_beta_edge",
+                            "repair_constraint_role": "historical",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "weak_retained_word_alignment",
+                            "retained_thought_indices": [1],
+                            "source_word_ids": {
+                                "last_retained_left": 5,
+                                "first_omitted": 6,
+                            },
+                            "forbidden_word_ids": [5],
+                            "failure_reason": "weak_terminal_word_support",
+                        },
+                        {
+                            "boundary_id": "retry_01:old_alpha_edge",
+                            "repair_constraint_role": "historical",
+                            "boundary_kind": "selected_to_omitted",
+                            "safety_status": "weak_retained_word_alignment",
+                            "retained_thought_indices": [0],
+                            "source_word_ids": {
+                                "last_retained_left": 1,
+                                "first_omitted": 2,
+                            },
+                            "forbidden_word_ids": [1],
+                            "failure_reason": "weak_terminal_word_support",
+                        },
+                    ],
+                },
+            )
+
+            repaired = repair_plan_for_acoustic_safety(
+                plan_path=initial_dir / "streaming_plan.json",
+                boundary_plan_path=boundary_path,
+                output_dir=root / "repair",
+                backend=repair_backend,
+                retry_index=2,
+            )
+
+            self.assertEqual(
+                repaired["committed"][0]["source_ranges"][0]["start_word_id"],
+                0,
+            )
+            self.assertEqual(
+                repaired["committed"][1]["source_ranges"][0]["start_word_id"],
+                8,
+            )
+            self.assertEqual(len(repair_backend.prompts), 2)
+            self.assertIn("retry_01:old_beta_edge", repair_backend.prompts[0])
+            self.assertNotIn("retry_01:old_alpha_edge", repair_backend.prompts[0])
+            self.assertIn("forbidden weak source word 5", repair_backend.prompts[1])
+            repair_record = read_json(root / "repair/acoustic_repair.json")["repairs"][
+                0
+            ]
+            self.assertEqual(
+                repair_record["unsafe_boundary_ids"], ["current_beta_edge"]
+            )
+            self.assertEqual(
+                repair_record["constraint_boundary_ids"],
+                ["current_beta_edge", "retry_01:old_beta_edge"],
+            )
+            self.assertEqual(repair_record["forbidden_word_ids"], [5, 7])
 
     def test_streaming_delay_replaces_attempt_and_preserves_future_thoughts(
         self,
@@ -864,21 +1257,33 @@ class StreamingNarrationTests(unittest.TestCase):
                 )
             )
 
-    def test_repeated_valid_no_progress_is_bounded_and_preserves_source(self) -> None:
+    def test_repeated_valid_no_progress_waits_for_later_successful_take(self) -> None:
         transcript = transcript_with_word_groups(
             [
-                (0.0, ["Window", "zero."]),
-                (35.0, ["Window", "one."]),
-                (70.0, ["Window", "two."]),
-                (105.0, ["Window", "three."]),
+                (0.0, ["I", "want", "to", "explain", "text."]),
+                (35.0, ["I", "want", "to", "explain", "the", "audio."]),
+                (70.0, ["Next", "topic", "starts."]),
             ]
         )
         backend = FakeStreamingBackend(
             [
                 response(finalized=[], pending_start_word_id=0),
                 response(finalized=[], pending_start_word_id=0),
-                response(finalized=[], pending_start_word_id=2),
-                response(finalized=[], pending_start_word_id=4),
+                response(
+                    finalized=[
+                        thought(
+                            "I want to explain the audio.",
+                            (
+                                5,
+                                10,
+                                "I",
+                                "audio.",
+                                "I want to explain the audio.",
+                            ),
+                        )
+                    ],
+                    pending_start_word_id=11,
+                ),
                 response(finalized=[], pending_start_word_id=None),
             ]
         )
@@ -896,38 +1301,34 @@ class StreamingNarrationTests(unittest.TestCase):
             )
 
             self.assertEqual(plan["status"], "complete")
-            self.assertEqual(plan["committed_words"], list(range(8)))
+            self.assertEqual(
+                plan["reconstructed_narration"], "I want to explain the audio."
+            )
+            self.assertEqual(plan["committed_words"], list(range(5, 11)))
             self.assertEqual(
                 plan["selected_source_ranges"],
-                [
-                    {"start_word_id": 0, "end_word_id": 2},
-                    {"start_word_id": 2, "end_word_id": 4},
-                    {"start_word_id": 4, "end_word_id": 6},
-                    {"start_word_id": 6, "end_word_id": 8},
-                ],
+                [{"start_word_id": 5, "end_word_id": 11}],
             )
+            self.assertEqual(plan["fallbacks"], [])
+            self.assertEqual(plan["source_passthrough_count"], 0)
             self.assertEqual(
-                [fallback["trigger"] for fallback in plan["fallbacks"]],
                 [
-                    "valid_no_progress",
-                    "valid_no_progress",
-                    "valid_no_progress",
-                    "valid_eof_no_progress",
-                ],
-            )
-            self.assertIsNone(plan["iterations"][0]["fallback"])
-            self.assertLessEqual(
-                max(
                     len(iteration["complete_pending_input"])
                     for iteration in plan["iterations"][:-1]
-                ),
-                4,
+                ],
+                [5, 11, 14],
             )
+            self.assertEqual(plan["iterations"][0]["pending_no_progress_age"], 1)
+            self.assertEqual(plan["iterations"][1]["pending_no_progress_age"], 2)
+            self.assertIsNone(plan["iterations"][0]["fallback"])
+            self.assertIsNone(plan["iterations"][1]["fallback"])
+            self.assertNotIn(0, plan["committed_words"])
+            self.assertNotIn(4, plan["committed_words"])
             self.assertTrue(
                 all(len(iteration["attempts"]) == 1 for iteration in plan["iterations"])
             )
 
-    def test_valid_empty_eof_response_preserves_pending_source(self) -> None:
+    def test_valid_empty_eof_response_discards_abandoned_pending_source(self) -> None:
         transcript = transcript_with_word_groups(
             [(0.0, ["Do", "not", "drop", "this."])]
         )
@@ -950,25 +1351,19 @@ class StreamingNarrationTests(unittest.TestCase):
                 backend=backend,
             )
 
-            self.assertEqual(plan["reconstructed_narration"], "Do not drop this.")
-            self.assertEqual(plan["committed_words"], [0, 1, 2, 3])
-            self.assertEqual(len(plan["fallbacks"]), 1)
-            fallback = plan["fallbacks"][0]
-            self.assertEqual(fallback["trigger"], "valid_eof_no_progress")
-            self.assertEqual(fallback["status"], "eof_source_passthrough")
-            self.assertEqual(
-                fallback["source_ranges"],
-                [{"start_word_id": 0, "end_word_id": 4}],
-            )
+            self.assertEqual(plan["reconstructed_narration"], "")
+            self.assertEqual(plan["committed_words"], [])
+            self.assertEqual(plan["selected_source_ranges"], [])
+            self.assertEqual(plan["fallbacks"], [])
+            self.assertEqual(plan["fallback_status"], "not_used")
+            self.assertEqual(plan["source_passthrough_count"], 0)
             self.assertNotIn(
                 "iteration_0002_failure.json", {p.name for p in output_dir.iterdir()}
             )
             grounding = read_json(output_dir / "grounding_validation.json")
             self.assertEqual(grounding["status"], "valid")
-            self.assertEqual(
-                grounding["fallbacks"][0]["trigger"],
-                "valid_eof_no_progress",
-            )
+            self.assertEqual(grounding["fallbacks"], [])
+            self.assertEqual(grounding["source_passthrough_count"], 0)
 
     def test_validation_rejects_unsafe_range_geometry(self) -> None:
         words = [

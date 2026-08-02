@@ -1122,6 +1122,19 @@ def run_full_pipeline(
         final_manifest.get("semantic_planner_fallback_count", 0)
     )
     pause_fallback_count = int(final_manifest.get("pause_degraded_batch_count", 0))
+    delivery_status = str(final_manifest.get("delivery_status", "complete"))
+    if delivery_status == "complete_with_full_source_passthrough":
+        pipeline_warnings.append(
+            {
+                "stage": "final_render",
+                "status": delivery_status,
+                "message": (
+                    "No safe edited boundary plan could be completed. VoiceCut "
+                    "returned the complete canonical source instead of failing "
+                    "or guessing an acoustic cut."
+                ),
+            }
+        )
     if semantic_fallback_count:
         pipeline_warnings.append(
             {

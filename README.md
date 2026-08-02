@@ -460,7 +460,10 @@ chronological source words—including retained and omitted attempts—not the
 LLM's polished narration. Whisper timestamps are used only as approximate
 anchors for generous local crops. All contexts for a render attempt are sent
 through one batched MFA 3.4.1 CLI invocation (the variables below are paths
-inside the current VoiceCut run):
+inside the current VoiceCut run). If MFA exports most contexts but omits a few
+utterances, VoiceCut keeps every validated success and retries only the missing
+contexts together in one small recovery batch; it does not repeat the full
+long-form alignment:
 
 ```bash
 MFA_ROOT_DIR="$MFA_CACHE_ROOT" \
@@ -493,6 +496,16 @@ context across it. The WAV is still delivered, with
 `delivery_status=complete_with_preserved_source_context` and the exact affected
 word intervals in the manifest; that small region may retain an abandoned
 attempt, but no guessed coordinate can clip speech.
+
+If bounded local preservation still cannot produce a safe edit, and the
+original validated semantic plan already selected the complete source,
+VoiceCut removes every internal cut and publishes the canonical source. This
+last-resort output is marked
+`delivery_status=complete_with_full_source_passthrough`. It is intentionally
+unedited, but playable and sample-identical to the input; the rejected boundary
+evidence remains in the work directory for diagnosis. When the semantic plan
+selected only a strict subset, VoiceCut fails closed instead of falsely
+publishing the unedited recording as a successful edit.
 
 When MFA confirms a phone-free or silence-phone interval, waveform energy and
 zero crossings may choose a convenient splice only inside that interval. They

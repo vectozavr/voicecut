@@ -84,12 +84,29 @@ from .streaming_narration import (
 DEFAULT_ALIGNMENT_PYTHON = Path(sys.executable)
 CONTEXT_WORDS_PER_SIDE = 3
 CROP_CONTEXT_MS = 400.0
+MFA_CONTEXT_SPLIT_GAP_SECONDS = 3.0
+MFA_MAX_ANCHOR_DRIFT_SECONDS = 2.0
 PROTECTED_SPEECH_MARGIN_MS = 10.0
 MINIMUM_VERIFIED_QUIET_MS = 20.0
 QUIET_FADE_MS = 5.0
 MFA_ZERO_CROSSING_SNAP_MS = 2.0
 ALIGNMENT_LANGUAGE = "en"
 DEFAULT_MAX_ACOUSTIC_RETRIES = 3
+DEFAULT_MAX_CONSERVATIVE_DELIVERY_PASSES = 4
+REPAIRABLE_ACOUSTIC_STATUSES = frozenset(
+    {
+        "unsafe_dense_boundary",
+        "weak_retained_word_alignment",
+        "completeness_alignment_failed",
+        "mfa_word_mapping_failed",
+    }
+)
+ACCEPTED_RETAINED_WORD_SUPPORT_STATUSES = frozenset(
+    {
+        "supported_complete_word",
+        "nonalphabetic_token_deferred_to_mfa",
+    }
+)
 RETAINED_WORD_EDGE_CHARACTER_COUNT = 3
 RETAINED_WORD_LOCAL_CONTEXT_CHARACTER_COUNT = 8
 RETAINED_WORD_NEARBY_RETRY_DISTANCE = 4
@@ -417,6 +434,64 @@ def _flatten_character_word_groups(
     return groups
 
 
+def _character_groups_by_local_word(
+    *,
+    local_words: Sequence[dict[str, Any]],
+    character_groups: Sequence[Sequence[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    """Keep character evidence aligned when WhisperX omits numeric tokens.
+
+    WhisperX can return a word interval for a spoken numeric token while
+    returning no character entries for that token.  Positional zipping then
+    shifts every following character group onto the wrong source word, or the
+    previous all-or-nothing length check discards valid character evidence for
+    the entire context.  Match the surviving groups monotonically by their
+    alphabetic content instead.  A missing alphabetic group remains empty and
+    is evaluated (and normally rejected) by the existing completeness gate;
+    digit-only source tokens are explicitly deferred to MFA elsewhere.
+    """
+
+    groups = [list(group) for group in character_groups]
+    if len(groups) == len(local_words):
+        return groups
+
+    expected_tokens = [
+        "".join(
+            character.casefold()
+            for character in str(word.get("text", ""))
+            if character.isalpha()
+        )
+        for word in local_words
+    ]
+    actual_tokens = [
+        "".join(
+            str(character.get("char", "")).casefold()
+            for character in group
+            if str(character.get("char", "")).isalpha()
+        )
+        for group in groups
+    ]
+    mapped: list[list[dict[str, Any]]] = [[] for _ in local_words]
+    group_index = 0
+    for word_index, expected in enumerate(expected_tokens):
+        if not expected or group_index >= len(groups):
+            continue
+        actual = actual_tokens[group_index]
+        if actual == expected:
+            mapped[word_index] = groups[group_index]
+            group_index += 1
+            continue
+        if actual in expected_tokens[word_index + 1 :]:
+            # The current word has no character group.  Leave it empty and
+            # preserve the current group for the later matching occurrence.
+            continue
+        # Preserve mismatching evidence on the current word so the strict
+        # coverage check fails that occurrence instead of hiding the problem.
+        mapped[word_index] = groups[group_index]
+        group_index += 1
+    return mapped
+
+
 def _alignment_character_records(
     group: Sequence[dict[str, Any]],
     *,
@@ -605,11 +680,11 @@ def evaluate_retained_word_support(
 
     if edge not in {"initial", "terminal"}:
         raise ValueError("retained-word edge must be initial or terminal")
-    expected = [
-        character.lower()
-        for character in str(span.get("text", ""))
-        if character.isalpha()
-    ]
+    source_text = str(span.get("text", ""))
+    expected = [character.lower() for character in source_text if character.isalpha()]
+    numeric_without_letters = any(
+        character.isdigit() for character in source_text
+    ) and (not expected)
     alphabetic = _alphabetic_records(span)
     aligned_text = [
         str(character.get("character", "")).lower() for character in alphabetic
@@ -678,7 +753,15 @@ def evaluate_retained_word_support(
         edge=edge,
     )
 
-    if not complete_coverage:
+    if numeric_without_letters:
+        # WhisperX character vocabularies generally cannot represent a source
+        # token such as ``4.``, ``-1`` or ``80%`` as the alphabetic phones that
+        # were spoken.  Treating the resulting empty character ledger as an
+        # incomplete word creates a false semantic veto.  MFA remains required
+        # and authoritative for the word/phone coordinates; this status merely
+        # says that the character-confidence veto is not applicable.
+        status = "nonalphabetic_token_deferred_to_mfa"
+    elif not complete_coverage:
         status = "incomplete_character_coverage"
     elif not monotonic:
         status = "invalid_alignment_geometry"
@@ -721,7 +804,7 @@ def evaluate_retained_word_support(
 
     return {
         "word_id": int(span["word_id"]),
-        "source_text": str(span.get("text", "")),
+        "source_text": source_text,
         "edge": edge,
         "status": status,
         "complete_character_coverage": complete_coverage,
@@ -737,6 +820,12 @@ def evaluate_retained_word_support(
         "edge_to_context_score_ratio": score_ratio,
         "median_edge_to_context_score_ratio": median_score_ratio,
         "nearby_same_word_retry": nearby_same_word_retry,
+        "completeness_check_applicable": not numeric_without_letters,
+        "support_basis": (
+            "mfa_phone_alignment_required"
+            if numeric_without_letters
+            else "whisperx_character_alignment"
+        ),
         "character_records": [dict(character) for character in alphabetic],
         "thresholds": {
             "edge_character_count": RETAINED_WORD_EDGE_CHARACTER_COUNT,
@@ -770,8 +859,10 @@ def _alignment_spans(
             "aligned word count does not match the local transcript: "
             f"{len(aligned_words)} != {len(local_words)}"
         )
-    character_groups = _flatten_character_word_groups(aligned)
-    use_characters = len(character_groups) == len(local_words)
+    character_groups = _character_groups_by_local_word(
+        local_words=local_words,
+        character_groups=_flatten_character_word_groups(aligned),
+    )
     crop_start = float(job["crop_start_seconds"])
     crop_end = float(job["crop_end_seconds"])
     spans: dict[int, dict[str, Any]] = {}
@@ -781,7 +872,7 @@ def _alignment_spans(
         relative: tuple[float, float] | None = None
         granularity = "words"
         character_records: list[dict[str, Any]] = []
-        if use_characters:
+        if character_groups[index]:
             character_records, relative = _alignment_character_records(
                 character_groups[index],
                 crop_start=crop_start,
@@ -1196,8 +1287,26 @@ def _prepare_alignment_jobs(
     jobs: list[dict[str, Any]] = []
     for context_index, spec in enumerate(specs):
         role_ids = [int(value) for value in spec["role_word_ids"].values()]
+        role_id_set = set(role_ids)
         context_start_id = max(0, min(role_ids) - CONTEXT_WORDS_PER_SIDE)
         context_end_id = min(len(words), max(role_ids) + CONTEXT_WORDS_PER_SIDE + 1)
+        # Whisper occasionally emits a whole hallucinated phrase at one
+        # zero-duration anchor.  Such optional neighbors cannot all have
+        # acoustic support and make the MFA transcript/crop infeasible.  Keep
+        # every required role word, but trim a degenerate optional run from a
+        # context edge instead of expanding through it.
+        while (
+            context_start_id < min(role_ids)
+            and context_start_id not in role_id_set
+            and words[context_start_id].end <= words[context_start_id].start
+        ):
+            context_start_id += 1
+        while (
+            context_end_id > max(role_ids) + 1
+            and context_end_id - 1 not in role_id_set
+            and words[context_end_id - 1].end <= words[context_end_id - 1].start
+        ):
+            context_end_id -= 1
         crop_start = max(
             0,
             math.floor(words[context_start_id].start * sample_rate) - context_samples,
@@ -1208,25 +1317,84 @@ def _prepare_alignment_jobs(
         )
         while context_start_id > 0:
             previous = words[context_start_id - 1]
+            if (
+                context_start_id - 1 not in role_id_set
+                and previous.end <= previous.start
+            ):
+                previous_grounded_id = context_start_id - 2
+                while (
+                    previous_grounded_id >= 0
+                    and words[previous_grounded_id].end
+                    <= words[previous_grounded_id].start
+                ):
+                    previous_grounded_id -= 1
+                if previous_grounded_id >= 0:
+                    crop_start = max(
+                        crop_start,
+                        math.ceil(words[previous_grounded_id].end * sample_rate),
+                    )
+                break
             if math.ceil(previous.end * sample_rate) <= crop_start:
                 break
             context_start_id -= 1
             crop_start = min(crop_start, math.floor(previous.start * sample_rate))
         while context_end_id < len(words):
             following = words[context_end_id]
+            if context_end_id not in role_id_set and following.end <= following.start:
+                next_grounded_id = context_end_id + 1
+                while (
+                    next_grounded_id < len(words)
+                    and words[next_grounded_id].end <= words[next_grounded_id].start
+                ):
+                    next_grounded_id += 1
+                if next_grounded_id < len(words):
+                    crop_end = min(
+                        crop_end,
+                        math.floor(words[next_grounded_id].start * sample_rate),
+                    )
+                break
             if math.floor(following.start * sample_rate) >= crop_end:
                 break
             crop_end = max(crop_end, math.ceil(following.end * sample_rate))
             context_end_id += 1
+        # When a crop ends on two identical adjacent retry phrases, MFA has no
+        # distinctive right-hand evidence and may decline to align either
+        # occurrence.  Include the first following grounded word so the
+        # ordered occurrences become identifiable.  This is still transcript
+        # context only; it never supplies a cut coordinate.
+        context_tokens = [
+            "".join(
+                character.casefold()
+                for character in words[word_id].text
+                if character.isalnum()
+            )
+            for word_id in range(context_start_id, context_end_id)
+        ]
+        repeated_suffix = any(
+            context_tokens[-2 * width : -width] == context_tokens[-width:]
+            for width in range(3, len(context_tokens) // 2 + 1)
+        )
+        if repeated_suffix and context_end_id < len(words):
+            following = words[context_end_id]
+            if following.end > following.start:
+                crop_end = max(crop_end, math.ceil(following.end * sample_rate))
+                context_end_id += 1
         # Expanding the transcript to cover words that overlap the requested
         # handles used to collapse the crop back onto the first/last word. MFA
         # then received no acoustic lead-in or tail and could omit otherwise
         # valid utterances in large batches. Restore only the portion of each
         # handle that does not cross a neighboring, untranscribed word.
         first_word_start = math.floor(words[context_start_id].start * sample_rate)
+        previous_grounded_id = context_start_id - 1
+        while (
+            previous_grounded_id >= 0
+            and previous_grounded_id not in role_id_set
+            and words[previous_grounded_id].end <= words[previous_grounded_id].start
+        ):
+            previous_grounded_id -= 1
         previous_word_end = (
-            math.ceil(words[context_start_id - 1].end * sample_rate)
-            if context_start_id > 0
+            math.ceil(words[previous_grounded_id].end * sample_rate)
+            if previous_grounded_id >= 0
             else 0
         )
         crop_start = min(
@@ -1234,9 +1402,16 @@ def _prepare_alignment_jobs(
             max(previous_word_end, first_word_start - context_samples),
         )
         last_word_end = math.ceil(words[context_end_id - 1].end * sample_rate)
+        next_grounded_id = context_end_id
+        while (
+            next_grounded_id < len(words)
+            and next_grounded_id not in role_id_set
+            and words[next_grounded_id].end <= words[next_grounded_id].start
+        ):
+            next_grounded_id += 1
         next_word_start = (
-            math.floor(words[context_end_id].start * sample_rate)
-            if context_end_id < len(words)
+            math.floor(words[next_grounded_id].start * sample_rate)
+            if next_grounded_id < len(words)
             else total_samples
         )
         crop_end = max(
@@ -1495,6 +1670,22 @@ def _mfa_non_speech_interval(
 ) -> dict[str, Any] | None:
     if end_sample <= start_sample:
         return None
+    component_intervals = context.get("component_crop_intervals")
+    if isinstance(component_intervals, list) and component_intervals:
+        # A context assembled from independently aligned speech islands says
+        # nothing about the source samples between those crops.  Treat a gap
+        # as MFA-confirmed non-speech only when one actual component covered
+        # the complete candidate interval.  The boundary resolver can still
+        # use the authoritative phone edge as a dense cut, without pretending
+        # the unaligned recording gap was verified silence.
+        covered_by_one_component = any(
+            isinstance(component, dict)
+            and int(component.get("start_sample", -1)) <= start_sample
+            and int(component.get("end_sample", -1)) >= end_sample
+            for component in component_intervals
+        )
+        if not covered_by_one_component:
+            return None
     for phone in context.get("phones", []):
         if not isinstance(phone, dict) or bool(phone.get("is_silence")):
             continue
@@ -1626,7 +1817,7 @@ def _resolve_mfa_cut(
             "failure_reason": "completeness_alignment_failed",
             "error": completeness_error or "retained-word support is missing",
         }
-    if retained_support["status"] != "supported_complete_word":
+    if retained_support["status"] not in ACCEPTED_RETAINED_WORD_SUPPORT_STATUSES:
         return {
             **common,
             "forbidden_word_ids": [retained_id],
@@ -1827,7 +2018,7 @@ def _resolve_mfa_eof_boundary(
             "failure_reason": "completeness_alignment_failed",
             "error": completeness_error or "retained-word support is missing",
         }
-    if retained_support["status"] != "supported_complete_word":
+    if retained_support["status"] not in ACCEPTED_RETAINED_WORD_SUPPORT_STATUSES:
         return {
             **common,
             "forbidden_word_ids": [word_id],
@@ -2137,31 +2328,104 @@ def _completeness_support_by_context(
 
 
 def _mfa_context_requests(jobs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "context_id": str(job["event_key"]),
-            "crop_source_start_seconds": float(job["crop_start_seconds"]),
-            "crop_source_end_seconds": float(job["crop_end_seconds"]),
-            "words": [
+    """Build speech-island-local MFA requests for every boundary job.
+
+    Word IDs remain chronological across arbitrarily long recording pauses.
+    Treating ``N`` neighboring IDs as one utterance therefore does not imply
+    that they form one local acoustic context.  MFA can distribute later words
+    across a long untranscribed gap, producing internally valid but grossly
+    wrong phone coordinates.  Split only at large timestamp gaps (timestamps
+    remain crop anchors, never cut coordinates) and keep the islands containing
+    required boundary roles.  All resulting requests still run in one MFA
+    batch.
+    """
+
+    requests: list[dict[str, Any]] = []
+    handle_seconds = CROP_CONTEXT_MS / 1000.0
+    for job in jobs:
+        local_words = list(job["local_words"])
+        if not local_words:
+            raise FinalRenderError(
+                f"MFA context {job['event_key']} has no source words"
+            )
+        islands: list[list[dict[str, Any]]] = [[local_words[0]]]
+        for word in local_words[1:]:
+            previous = islands[-1][-1]
+            gap = float(word["start"]) - float(previous["end"])
+            if gap > MFA_CONTEXT_SPLIT_GAP_SECONDS:
+                islands.append([word])
+            else:
+                islands[-1].append(word)
+
+        role_ids = {int(value) for value in job["role_word_ids"].values()}
+        relevant = [
+            (island_index, island)
+            for island_index, island in enumerate(islands)
+            if role_ids & {int(word["id"]) for word in island}
+        ]
+        if not relevant:
+            raise FinalRenderError(
+                f"MFA context {job['event_key']} lost every required role word"
+            )
+        parent_context_id = str(job["event_key"])
+        for part_index, (island_index, island) in enumerate(relevant):
+            context_id = (
+                parent_context_id
+                if len(relevant) == 1
+                else f"{parent_context_id}__part_{part_index:02d}"
+            )
+            previous_island_end = (
+                float(islands[island_index - 1][-1]["end"])
+                if island_index > 0
+                else float(job["crop_start_seconds"])
+            )
+            next_island_start = (
+                float(islands[island_index + 1][0]["start"])
+                if island_index + 1 < len(islands)
+                else float(job["crop_end_seconds"])
+            )
+            crop_start = max(
+                float(job["crop_start_seconds"]),
+                previous_island_end,
+                float(island[0]["start"]) - handle_seconds,
+            )
+            crop_end = min(
+                float(job["crop_end_seconds"]),
+                next_island_start,
+                float(island[-1]["end"]) + handle_seconds,
+            )
+            if crop_end <= crop_start:
+                raise FinalRenderError(
+                    f"MFA context {context_id} has no local acoustic crop"
+                )
+            requests.append(
                 {
-                    "word_id": int(word["id"]),
-                    "text": str(word["text"]),
-                    "start_seconds": float(word["start"]),
-                    "end_seconds": float(word["end"]),
-                    "selected": bool(word["selected"]),
+                    "context_id": context_id,
+                    "parent_context_id": parent_context_id,
+                    "crop_source_start_seconds": crop_start,
+                    "crop_source_end_seconds": crop_end,
+                    "words": [
+                        {
+                            "word_id": int(word["id"]),
+                            "text": str(word["text"]),
+                            "start_seconds": float(word["start"]),
+                            "end_seconds": float(word["end"]),
+                            "selected": bool(word["selected"]),
+                        }
+                        for word in island
+                    ],
+                    "boundary_ids": list(job["boundary_ids"]),
+                    "split_at_long_gap": len(islands) > 1,
                 }
-                for word in job["local_words"]
-            ],
-            "boundary_ids": list(job["boundary_ids"]),
-        }
-        for job in jobs
-    ]
+            )
+    return requests
 
 
 def _validated_mfa_contexts(
     *,
     payload: dict[str, Any],
     jobs: Sequence[dict[str, Any]],
+    requests: Sequence[dict[str, Any]] | None = None,
     source_audio_sha256: str,
     sample_rate: int,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -2201,49 +2465,70 @@ def _validated_mfa_contexts(
             )
         code = str(raw.get("code", ""))
         error = str(raw.get("error", ""))
-        if code != "mfa_word_mapping_failed" or not error:
+        if (
+            code
+            not in {
+                "mfa_word_mapping_failed",
+                "mfa_utterance_unaligned",
+            }
+            or not error
+        ):
             raise FinalRenderError("MFA context error has invalid failure evidence")
         errors_by_id[context_id] = raw
-    expected = {str(job["event_key"]) for job in jobs}
+    request_list = (
+        list(requests) if requests is not None else _mfa_context_requests(jobs)
+    )
+    request_by_id: dict[str, dict[str, Any]] = {}
+    for request in request_list:
+        context_id = str(request.get("context_id", ""))
+        if not context_id or context_id in request_by_id:
+            raise FinalRenderError("MFA request IDs are empty or duplicated")
+        request_by_id[context_id] = request
+    expected = set(request_by_id)
     if set(context_by_id) | set(errors_by_id) != expected:
         raise FinalRenderError(
             "MFA payload contexts do not exactly match this boundary attempt"
         )
-    for job in jobs:
-        context_id = str(job["event_key"])
+    for context_id, request in request_by_id.items():
         if context_id in errors_by_id:
-            if errors_by_id[context_id].get("boundary_ids") != job["boundary_ids"]:
+            if errors_by_id[context_id].get("boundary_ids") != request["boundary_ids"]:
                 raise FinalRenderError(
                     f"MFA context error {context_id} has stale boundary ownership"
                 )
             continue
         context = context_by_id[context_id]
+        expected_crop_start = seconds_to_sample(
+            float(request["crop_source_start_seconds"]), sample_rate
+        )
+        expected_crop_end = seconds_to_sample(
+            float(request["crop_source_end_seconds"]), sample_rate
+        )
         if (
-            context.get("crop_source_start_sample") != job["crop_start_sample"]
-            or context.get("crop_source_end_sample") != job["crop_end_sample"]
+            context.get("crop_source_start_sample") != expected_crop_start
+            or context.get("crop_source_end_sample") != expected_crop_end
         ):
             raise FinalRenderError(
                 f"MFA context {context_id} has stale crop sample coordinates"
             )
-        expected_ids = [int(word["id"]) for word in job["local_words"]]
+        expected_words = list(request["words"])
+        expected_ids = [int(word["word_id"]) for word in expected_words]
         if context.get("ordered_source_word_ids") != expected_ids:
             raise FinalRenderError(
                 f"MFA context {context_id} has stale source-word ordering"
             )
-        if context.get("boundary_ids") != job["boundary_ids"]:
+        if context.get("boundary_ids") != request["boundary_ids"]:
             raise FinalRenderError(
                 f"MFA context {context_id} has stale boundary ownership"
             )
         originals = context.get("original_source_words")
-        if not isinstance(originals, list) or len(originals) != len(job["local_words"]):
+        if not isinstance(originals, list) or len(originals) != len(expected_words):
             raise FinalRenderError(
                 f"MFA context {context_id} has stale source-word metadata"
             )
-        for expected_word, actual_word in zip(
-            job["local_words"], originals, strict=True
-        ):
+        for expected_word, actual_word in zip(expected_words, originals, strict=True):
             if not isinstance(actual_word, dict) or (
-                actual_word.get("word_id", actual_word.get("id")) != expected_word["id"]
+                actual_word.get("word_id", actual_word.get("id"))
+                != expected_word["word_id"]
                 or actual_word.get("text") != expected_word["text"]
                 or actual_word.get("selected") is not expected_word["selected"]
                 or abs(
@@ -2253,7 +2538,7 @@ def _validated_mfa_contexts(
                             actual_word.get("start"),
                         )
                     )
-                    - float(expected_word["start"])
+                    - float(expected_word["start_seconds"])
                 )
                 > ALIGNMENT_GEOMETRY_EPSILON_SECONDS
                 or abs(
@@ -2263,14 +2548,178 @@ def _validated_mfa_contexts(
                             actual_word.get("end"),
                         )
                     )
-                    - float(expected_word["end"])
+                    - float(expected_word["end_seconds"])
                 )
                 > ALIGNMENT_GEOMETRY_EPSILON_SECONDS
             ):
                 raise FinalRenderError(
                     f"MFA context {context_id} has stale source-word metadata"
                 )
-    return context_by_id, errors_by_id
+
+    jobs_by_id = {str(job["event_key"]): job for job in jobs}
+    requests_by_parent: dict[str, list[dict[str, Any]]] = {
+        context_id: [] for context_id in jobs_by_id
+    }
+    for request in request_list:
+        parent_id = str(request.get("parent_context_id", request["context_id"]))
+        if parent_id not in requests_by_parent:
+            raise FinalRenderError(
+                f"MFA request {request['context_id']} has unknown parent {parent_id}"
+            )
+        requests_by_parent[parent_id].append(request)
+    if any(not parts for parts in requests_by_parent.values()):
+        raise FinalRenderError("an MFA boundary job has no alignment request")
+
+    validated_contexts: dict[str, dict[str, Any]] = {}
+    validated_errors: dict[str, dict[str, Any]] = {}
+    for parent_id, job in jobs_by_id.items():
+        part_requests = requests_by_parent[parent_id]
+        failed_parts = [
+            errors_by_id[str(request["context_id"])]
+            for request in part_requests
+            if str(request["context_id"]) in errors_by_id
+        ]
+        if failed_parts:
+            first_error = failed_parts[0]
+            validated_errors[parent_id] = {
+                "context_id": parent_id,
+                "code": str(first_error["code"]),
+                "error": (
+                    "one or more speech-island MFA contexts failed: "
+                    + "; ".join(
+                        f"{error['context_id']}: {error['error']}"
+                        for error in failed_parts
+                    )
+                ),
+                "boundary_ids": list(job["boundary_ids"]),
+                "component_errors": [dict(error) for error in failed_parts],
+            }
+            continue
+
+        parts = [context_by_id[str(request["context_id"])] for request in part_requests]
+        ordered_pairs = sorted(
+            zip(part_requests, parts, strict=True),
+            key=lambda pair: int(pair[1]["crop_source_start_sample"]),
+        )
+        component_intervals = [
+            {
+                "context_id": str(request["context_id"]),
+                "start_sample": int(part["crop_source_start_sample"]),
+                "end_sample": int(part["crop_source_end_sample"]),
+                "start_seconds": float(part["crop_source_start_seconds"]),
+                "end_seconds": float(part["crop_source_end_seconds"]),
+            }
+            for request, part in ordered_pairs
+        ]
+        for component_index in range(1, len(component_intervals)):
+            left = component_intervals[component_index - 1]
+            right = component_intervals[component_index]
+            if int(right["start_sample"]) < int(left["end_sample"]):
+                raise FinalRenderError(
+                    f"MFA context {parent_id} has overlapping speech-island crops"
+                )
+        combined: dict[str, Any] = {
+            "context_id": parent_id,
+            "crop_source_start_seconds": float(component_intervals[0]["start_seconds"]),
+            "crop_source_end_seconds": float(component_intervals[-1]["end_seconds"]),
+            "crop_source_start_sample": int(component_intervals[0]["start_sample"]),
+            "crop_source_end_sample": int(component_intervals[-1]["end_sample"]),
+            "ordered_source_word_ids": [
+                int(word_id)
+                for _request, part in ordered_pairs
+                for word_id in part["ordered_source_word_ids"]
+            ],
+            "original_source_words": [
+                dict(word)
+                for _request, part in ordered_pairs
+                for word in part["original_source_words"]
+            ],
+            "boundary_ids": list(job["boundary_ids"]),
+            "words": sorted(
+                [
+                    dict(word)
+                    for _request, part in ordered_pairs
+                    for word in part.get("words", [])
+                ],
+                key=lambda word: (
+                    float(word["start_seconds"]),
+                    tuple(int(value) for value in word.get("source_word_ids", [])),
+                ),
+            ),
+            "phones": sorted(
+                [
+                    dict(phone)
+                    for _request, part in ordered_pairs
+                    for phone in part.get("phones", [])
+                ],
+                key=lambda phone: (
+                    float(phone["start_seconds"]),
+                    float(phone["end_seconds"]),
+                ),
+            ),
+            "mfa_output_json": (
+                str(ordered_pairs[0][1].get("mfa_output_json", ""))
+                if len(ordered_pairs) == 1
+                else None
+            ),
+            "component_mfa_output_json": [
+                str(part.get("mfa_output_json", "")) for _request, part in ordered_pairs
+            ],
+            "component_context_ids": [
+                str(request["context_id"]) for request, _part in ordered_pairs
+            ],
+            "component_crop_intervals": component_intervals,
+            "split_at_long_gap": len(ordered_pairs) > 1
+            or any(
+                bool(request.get("split_at_long_gap")) for request, _ in ordered_pairs
+            ),
+        }
+
+        local_words_by_id = {int(word["id"]): word for word in job["local_words"]}
+        drift_evidence: dict[str, dict[str, Any]] = {}
+        drift_error: str | None = None
+        try:
+            for role, raw_word_id in job["role_word_ids"].items():
+                word_id = int(raw_word_id)
+                anchor = local_words_by_id[word_id]
+                aligned = source_word_alignment(combined, word_id)
+                start_drift = abs(
+                    float(aligned["start_seconds"]) - float(anchor["start"])
+                )
+                end_drift = abs(float(aligned["end_seconds"]) - float(anchor["end"]))
+                maximum_drift = max(start_drift, end_drift)
+                drift_evidence[role] = {
+                    "word_id": word_id,
+                    "source_text": str(anchor["text"]),
+                    "whisper_anchor_start_seconds": float(anchor["start"]),
+                    "whisper_anchor_end_seconds": float(anchor["end"]),
+                    "mfa_start_seconds": float(aligned["start_seconds"]),
+                    "mfa_end_seconds": float(aligned["end_seconds"]),
+                    "maximum_drift_seconds": maximum_drift,
+                }
+                if maximum_drift > MFA_MAX_ANCHOR_DRIFT_SECONDS:
+                    drift_error = (
+                        f"required role {role} word {word_id} {anchor['text']!r} "
+                        f"drifted {maximum_drift:.3f}s from its approximate "
+                        f"Whisper anchor (limit {MFA_MAX_ANCHOR_DRIFT_SECONDS:.3f}s)"
+                    )
+                    break
+        except (KeyError, MFAAlignmentError, TypeError, ValueError) as error:
+            drift_error = f"{type(error).__name__}: {error}"
+        combined["required_role_anchor_drift"] = drift_evidence
+        combined["maximum_allowed_anchor_drift_seconds"] = MFA_MAX_ANCHOR_DRIFT_SECONDS
+        if drift_error is not None:
+            validated_errors[parent_id] = {
+                "context_id": parent_id,
+                "code": "mfa_word_mapping_failed",
+                "error": drift_error,
+                "boundary_ids": list(job["boundary_ids"]),
+                "required_role_anchor_drift": drift_evidence,
+                "component_context_ids": combined["component_context_ids"],
+            }
+            continue
+        validated_contexts[parent_id] = combined
+    return validated_contexts, validated_errors
 
 
 def _selected_word_ids(ranges: Sequence[MergedRange]) -> set[int]:
@@ -2784,6 +3233,72 @@ def _suppress_fades_over_protected_speech(
             owner.setdefault("suppressed_fade_intervals", []).extend(suppressed)
 
 
+def _cancel_internal_pauses_over_protected_speech(
+    *,
+    joins: Sequence[dict[str, Any]],
+    protected_speech_mask: Sequence[dict[str, Any]],
+) -> None:
+    """Fail soft when independent MFA contexts disagree about a quiet gap.
+
+    An internal-thought context can classify a source position as an inter-word
+    silence while another context aligns a retained phone across that same
+    position.  The union retained-phone mask is authoritative.  Inserting
+    ambience there would split retained speech, so preserve the original
+    continuous source interval and skip only that optional semantic pause.
+    """
+
+    for join in joins:
+        if join.get("join_kind") != "internal_thought_pause":
+            continue
+        insertion = join.get("source_insertion_sample")
+        if (
+            type(insertion) is not int
+            or int(join.get("inserted_pause_samples", 0)) <= 0
+        ):
+            continue
+        interval_index = int(join["source_interval_index"])
+        conflicts = [
+            {
+                "source_word_ids": list(interval.get("source_word_ids", [])),
+                "phone": interval.get("phone"),
+                "phone_start_sample": interval.get("phone_start_sample"),
+                "phone_end_sample": interval.get("phone_end_sample"),
+                "start_sample": int(interval["start_sample"]),
+                "end_sample": int(interval["end_sample"]),
+                "context_ids": list(interval.get("context_ids", [])),
+            }
+            for interval in protected_speech_mask
+            if int(interval.get("source_interval_index", -1)) == interval_index
+            and int(interval["start_sample"]) <= insertion < int(interval["end_sample"])
+        ]
+        if not conflicts:
+            continue
+
+        rejected_fades = [dict(fade) for fade in join.get("fade_intervals", [])]
+        join["cross_context_alignment_conflict"] = {
+            "rejected_source_insertion_sample": insertion,
+            "rejected_inserted_pause_samples": int(join["inserted_pause_samples"]),
+            "rejected_verified_quiet_interval": (
+                dict(join["verified_quiet_interval"])
+                if isinstance(join.get("verified_quiet_interval"), dict)
+                else None
+            ),
+            "protected_intersections": conflicts,
+            "suppressed_fade_intervals": rejected_fades,
+        }
+        join["source_insertion_sample"] = None
+        join["verified_quiet_interval"] = None
+        join["fade_intervals"] = []
+        join["inserted_pause_samples"] = 0
+        join["inserted_pause_ms"] = 0.0
+        join["safety_status"] = "pause_not_inserted_cross_context_alignment_conflict"
+        join["insertion_method"] = "none"
+        join["error"] = (
+            "global retained-phone mask overlaps the locally planned semantic "
+            "pause insertion; original source audio was preserved continuously"
+        )
+
+
 def _editable_non_speech_intervals(
     *,
     gap_evidence: Sequence[dict[str, Any]],
@@ -3115,16 +3630,6 @@ def _build_verified_ambience_bank(
         thresholds=DEFAULT_AMBIENCE_THRESHOLDS,
     )
     accepted = list(bank["accepted_candidates"])
-    if accepted:
-        target_rms_db = float(
-            median(float(item["metrics"]["rms_db"]) for item in accepted)
-        )
-        for item in bank["candidates"]:
-            item["target_rms_db"] = target_rms_db
-            item["noise_level_delta_db"] = abs(
-                float(item["metrics"]["rms_db"]) - target_rms_db
-            )
-        bank["target_rms_db"] = target_rms_db
     deterministic_rejections = list(bank["rejected_candidates"])
     all_rejections = [*mask_rejections, *deterministic_rejections]
     for item in all_rejections:
@@ -3420,9 +3925,14 @@ def _initialize_pause_content(joins: Sequence[dict[str, Any]]) -> None:
             "crossfades": [],
             "stationarity_metrics": [],
             "status": (
-                "original_gap_satisfies_target"
-                if int(join["inserted_pause_samples"]) <= 0
-                else "not_planned"
+                "pause_not_inserted_cross_context_alignment_conflict"
+                if join.get("safety_status")
+                == "pause_not_inserted_cross_context_alignment_conflict"
+                else (
+                    "original_gap_satisfies_target"
+                    if int(join["inserted_pause_samples"]) <= 0
+                    else "not_planned"
+                )
             ),
         }
 
@@ -3774,38 +4284,69 @@ def _plan_ambience_edge_transitions(
         raw_right = source_audio[right_source_start]
         edge_envelopes: list[dict[str, Any]] = []
         transition_records: list[dict[str, Any]] = []
-        for side, source_fade, raw_source, raw_ambience in (
-            ("left", left_fade, raw_left, raw_ambience_start),
-            ("right", right_fade, raw_right, raw_ambience_end),
+        for side, source_fade, raw_source, raw_ambience, source_sample in (
+            (
+                "left",
+                left_fade,
+                raw_left,
+                raw_ambience_start,
+                left_source_end - 1,
+            ),
+            (
+                "right",
+                right_fade,
+                raw_right,
+                raw_ambience_end,
+                right_source_start,
+            ),
         ):
-            applied = source_fade is not None and transition_samples >= 2
+            transition_available = transition_samples >= 2
+            source_taper_applied = source_fade is not None and transition_available
+            ambience_only_match_applied = source_fade is None and transition_available
             if side == "left":
                 ambience_start = int(segment["output_start_sample"])
                 ambience_end = ambience_start + transition_samples
-                curve = "equal_power_fade_in"
+                fade_curve = "equal_power_fade_in"
+                match_curve = "equal_power_match_from_source_edge"
             else:
                 ambience_end = int(segment["output_end_sample"])
                 ambience_start = ambience_end - transition_samples
-                curve = "equal_power_fade_out"
-            if applied:
-                edge_envelopes.append(
-                    {
-                        "side": side,
-                        "curve": curve,
-                        "output_start_sample": ambience_start,
-                        "output_end_sample": ambience_end,
-                        "verified_ambience": True,
-                    }
-                )
+                fade_curve = "equal_power_fade_out"
+                match_curve = "equal_power_match_to_source_edge"
+            envelope: dict[str, Any] | None = None
+            if source_taper_applied:
+                envelope = {
+                    "side": side,
+                    "curve": fade_curve,
+                    "output_start_sample": ambience_start,
+                    "output_end_sample": ambience_end,
+                    "verified_ambience": True,
+                }
+            elif ambience_only_match_applied:
+                envelope = {
+                    "side": side,
+                    "curve": match_curve,
+                    "output_start_sample": ambience_start,
+                    "output_end_sample": ambience_end,
+                    "verified_ambience": True,
+                    "boundary_source_sample": source_sample,
+                    "boundary_source_values": [
+                        float(value) for value in np.asarray(raw_source).reshape(-1)
+                    ],
+                }
+            if envelope is not None:
+                edge_envelopes.append(envelope)
             raw_discontinuity = float(np.max(np.abs(raw_ambience - raw_source)))
+            if source_taper_applied:
+                status = "ambience_edge_taper_applied"
+            elif ambience_only_match_applied:
+                status = "ambience_only_boundary_match_applied"
+            else:
+                status = "not_applied_insufficient_ambience_handle"
             transition_records.append(
                 {
                     "side": side,
-                    "status": (
-                        "ambience_edge_taper_applied"
-                        if applied
-                        else "not_applied_no_verified_source_handle"
-                    ),
+                    "status": status,
                     "source_fade_interval": (
                         dict(source_fade) if source_fade is not None else None
                     ),
@@ -3813,14 +4354,14 @@ def _plan_ambience_edge_transitions(
                         {
                             "output_start_sample": ambience_start,
                             "output_end_sample": ambience_end,
-                            "curve": curve,
+                            "curve": str(envelope["curve"]),
                         }
-                        if applied
+                        if envelope is not None
                         else None
                     ),
                     "raw_maximum_sample_discontinuity": raw_discontinuity,
                     "planned_maximum_sample_discontinuity": (
-                        0.0 if applied else raw_discontinuity
+                        0.0 if envelope is not None else raw_discontinuity
                     ),
                 }
             )
@@ -4045,12 +4586,6 @@ def build_final_boundary_plan(
         str(context["context_id"]): context for context in completeness_contexts
     }
     completeness_support = _completeness_support_by_context(completeness_contexts)
-    completeness_blocks_mfa = any(
-        item["error"] is not None
-        or item["support"] is None
-        or item["support"]["status"] != "supported_complete_word"
-        for item in completeness_support.values()
-    )
     mfa_alignment_path = (
         output_dir / "mfa_alignment" / "metadata" / "mfa_alignment.json"
     )
@@ -4058,38 +4593,37 @@ def build_final_boundary_plan(
     mfa_context_by_key: dict[str, dict[str, Any]] = {}
     mfa_context_errors: dict[str, dict[str, Any]] = {}
     mfa_global_error: str | None = None
-    if completeness_blocks_mfa:
-        mfa_global_error = "mfa_not_run_due_to_weak_retained_word"
-    else:
-        try:
-            if mfa_payload is not None:
-                mfa_result = mfa_payload
-                mfa_alignment_path.parent.mkdir(parents=True, exist_ok=True)
-                write_json(mfa_alignment_path, mfa_result)
-            else:
-                mfa_result = align_mfa_contexts(
-                    audio_path=audio_path,
-                    contexts=_mfa_context_requests(jobs),
-                    work_dir=output_dir,
-                    prefix=mfa_prefix,
-                    cache_root=mfa_cache_root,
-                    micromamba=mfa_micromamba,
-                    num_jobs=mfa_num_jobs,
-                )
-            mfa_context_by_key, mfa_context_errors = _validated_mfa_contexts(
-                payload=mfa_result,
-                jobs=jobs,
-                source_audio_sha256=sha256_file(audio_path),
-                sample_rate=sample_rate,
+    mfa_requests = _mfa_context_requests(jobs)
+    try:
+        if mfa_payload is not None:
+            mfa_result = mfa_payload
+            mfa_alignment_path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(mfa_alignment_path, mfa_result)
+        else:
+            mfa_result = align_mfa_contexts(
+                audio_path=audio_path,
+                contexts=mfa_requests,
+                work_dir=output_dir,
+                prefix=mfa_prefix,
+                cache_root=mfa_cache_root,
+                micromamba=mfa_micromamba,
+                num_jobs=mfa_num_jobs,
             )
-        except (
-            FinalRenderError,
-            MFAAlignmentError,
-            OSError,
-            TypeError,
-            ValueError,
-        ) as error:
-            mfa_global_error = f"{type(error).__name__}: {error}"
+        mfa_context_by_key, mfa_context_errors = _validated_mfa_contexts(
+            payload=mfa_result,
+            jobs=jobs,
+            requests=mfa_requests,
+            source_audio_sha256=sha256_file(audio_path),
+            sample_rate=sample_rate,
+        )
+    except (
+        FinalRenderError,
+        MFAAlignmentError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as error:
+        mfa_global_error = f"{type(error).__name__}: {error}"
 
     def mfa_error_for(context_key: str) -> str | None:
         context_error = mfa_context_errors.get(context_key)
@@ -4533,6 +5067,10 @@ def build_final_boundary_plan(
             sample_rate=sample_rate,
             total_samples=total_samples,
         )
+        _cancel_internal_pauses_over_protected_speech(
+            joins=joins,
+            protected_speech_mask=protected_speech_mask,
+        )
         _suppress_fades_over_protected_speech(
             boundaries=boundaries,
             joins=joins,
@@ -4814,9 +5352,10 @@ def build_final_boundary_plan(
         )
         breath_cleanup_plan["room_tone_allocations"] = room_tone_allocations
         clean_ambience_bank["usage_policy"] = (
-            "rank stationarity, local noise-floor match, and duration first; "
-            "then prefer the least-used candidate; never repeat a candidate "
-            "within one pause bed; allow fully traced reuse across distinct pauses"
+            "reject candidates outside the pause-local noise-floor tolerance; "
+            "then rank by level-match band, prior use, proximity, stationarity, "
+            "and duration; never repeat a candidate within one pause bed; allow "
+            "fully traced reuse across distinct pauses"
         )
         clean_ambience_bank["usage_ledger"] = [
             {
@@ -4967,7 +5506,8 @@ def build_final_boundary_plan(
         "artifact_cleanup": artifact_cleanup_plan,
         "output_segments": output_segments,
         "expected_output_frame_count": expected_frames,
-        "alignment_context_count": len(jobs),
+        "alignment_context_count": len(mfa_requests),
+        "boundary_alignment_job_count": len(jobs),
         "alignment_resolved_boundaries": sum(
             boundary["safety_status"] == "safe"
             and boundary["alignment_context_id"] is not None
@@ -5215,16 +5755,49 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                 curve = str(envelope.get("curve"))
                 edge_start = int(envelope["output_start_sample"])
                 edge_end = int(envelope["output_end_sample"])
+                allowed_curve = {
+                    "left": {
+                        "equal_power_fade_in",
+                        "equal_power_match_from_source_edge",
+                    },
+                    "right": {
+                        "equal_power_fade_out",
+                        "equal_power_match_to_source_edge",
+                    },
+                }
                 if (
                     side in edge_sides
                     or side not in {"left", "right"}
-                    or curve != f"equal_power_fade_{'in' if side == 'left' else 'out'}"
+                    or curve not in allowed_curve[side]
                     or envelope.get("verified_ambience") is not True
                     or not output_start <= edge_start < edge_end <= output_end
                     or (side == "left" and edge_start != output_start)
                     or (side == "right" and edge_end != output_end)
                 ):
                     raise FinalRenderError("ambience edge fade geometry is invalid")
+                if curve.startswith("equal_power_match_"):
+                    adjacent = segments[
+                        expected_index - 1 if side == "left" else expected_index + 1
+                    ]
+                    expected_source_sample = (
+                        int(adjacent["source_end_sample"]) - 1
+                        if side == "left"
+                        else int(adjacent["source_start_sample"])
+                    )
+                    boundary_values = envelope.get("boundary_source_values")
+                    if (
+                        int(envelope.get("boundary_source_sample", -1))
+                        != expected_source_sample
+                        or not isinstance(boundary_values, list)
+                        or len(boundary_values)
+                        != int(boundary_plan["source_channel_count"])
+                        or any(
+                            not math.isfinite(float(value)) for value in boundary_values
+                        )
+                    ):
+                        raise FinalRenderError(
+                            "ambience boundary match provenance is invalid"
+                        )
                 edge_sides.add(side)
             outer_transitions = segment.get("outer_transitions", [])
             if not isinstance(outer_transitions, list) or len(outer_transitions) != 2:
@@ -5238,7 +5811,10 @@ def _assert_boundary_plan_invariants(boundary_plan: dict[str, Any]) -> None:
                 str(envelope["side"]): envelope for envelope in edge_envelopes
             }
             for side, record in transition_by_side.items():
-                applied = record.get("status") == "ambience_edge_taper_applied"
+                applied = record.get("status") in {
+                    "ambience_edge_taper_applied",
+                    "ambience_only_boundary_match_applied",
+                }
                 transition = record.get("ambience_transition_interval")
                 envelope = envelope_by_side.get(side)
                 if applied != (envelope is not None) or (
@@ -5507,13 +6083,36 @@ def _apply_ambience_edge_gain_envelopes(
             endpoint=True,
             dtype=np.float32,
         )[:, None]
-        if envelope["curve"] == "equal_power_fade_in":
+        curve = str(envelope["curve"])
+        if curve == "equal_power_fade_in":
             gain = np.sin(theta)
-        elif envelope["curve"] == "equal_power_fade_out":
+            output[start:end] *= gain
+        elif curve == "equal_power_fade_out":
             gain = np.cos(theta)
+            output[start:end] *= gain
+        elif curve in {
+            "equal_power_match_from_source_edge",
+            "equal_power_match_to_source_edge",
+        }:
+            boundary_values = np.asarray(
+                envelope.get("boundary_source_values", []),
+                dtype=np.float32,
+            )
+            if boundary_values.shape != (output.shape[1],):
+                raise FinalRenderError(
+                    "ambience boundary match has incompatible channel values"
+                )
+            boundary = boundary_values[None, :]
+            if curve == "equal_power_match_from_source_edge":
+                output[start:end] = boundary * np.cos(theta) + output[
+                    start:end
+                ] * np.sin(theta)
+            else:
+                output[start:end] = output[start:end] * np.cos(
+                    theta
+                ) + boundary * np.sin(theta)
         else:
             raise FinalRenderError("ambience edge fade has an unknown curve")
-        output[start:end] *= gain
     return output
 
 
@@ -5717,6 +6316,166 @@ def render_boundary_plan(
     }
 
 
+def _selected_source_word_ids(plan: dict[str, Any]) -> set[int]:
+    selected: set[int] = set()
+    for source_range in plan.get("selected_source_ranges", []):
+        if not isinstance(source_range, dict):
+            continue
+        start = source_range.get("start_word_id")
+        end = source_range.get("end_word_id")
+        if type(start) is int and type(end) is int and start < end:
+            selected.update(range(start, end))
+    return selected
+
+
+def _word_ids_to_ranges(word_ids: set[int]) -> list[dict[str, int]]:
+    if not word_ids:
+        return []
+    ordered = sorted(word_ids)
+    ranges: list[dict[str, int]] = []
+    start = ordered[0]
+    prior = ordered[0]
+    for word_id in ordered[1:]:
+        if word_id != prior + 1:
+            ranges.append({"start_word_id": start, "end_word_id": prior + 1})
+            start = word_id
+        prior = word_id
+    ranges.append({"start_word_id": start, "end_word_id": prior + 1})
+    return ranges
+
+
+def _full_source_passthrough_boundary_plan(
+    *,
+    unsafe_plan: dict[str, Any],
+    audio_path: Path,
+    word_count: int,
+    delivery_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace an unresolved edit with one intrinsically safe source span.
+
+    This is the final availability fallback.  It does not guess an acoustic
+    boundary: it removes every internal boundary and traces the complete
+    canonical WAV from sample zero through EOF.  Rendering still happens once
+    through the normal immutable-plan renderer.
+    """
+
+    source_info = sf.info(audio_path)
+    sample_rate = int(source_info.samplerate)
+    total_samples = int(source_info.frames)
+    channel_count = int(source_info.channels)
+    if sample_rate <= 0 or total_samples <= 0 or channel_count <= 0:
+        raise FinalRenderError("canonical source is empty; passthrough is impossible")
+    start_boundary = _source_edge_boundary(
+        boundary_id="source_start",
+        boundary_kind="source_start",
+        selected_sample=0,
+        sample_rate=sample_rate,
+    )
+    end_boundary = _source_edge_boundary(
+        boundary_id="end_of_file",
+        boundary_kind="canonical_end_of_file",
+        selected_sample=total_samples,
+        sample_rate=sample_rate,
+    )
+    source_intervals = [
+        {
+            "source_interval_index": 0,
+            "start_word_id": 0,
+            "end_word_id": word_count,
+            "start_boundary_id": "source_start",
+            "end_boundary_id": "end_of_file",
+            "source_start_sample": 0,
+            "source_end_sample": total_samples,
+            "merged_original_ranges": [
+                {
+                    "start_word_id": 0,
+                    "end_word_id": word_count,
+                    "thought_index": 0,
+                }
+            ],
+        }
+    ]
+    output_segments = _build_output_segments(
+        source_intervals=source_intervals,
+        boundaries=[start_boundary, end_boundary],
+        joins=[],
+    )
+    result = json.loads(json.dumps(unsafe_plan))
+    result.update(
+        {
+            "status": "safe",
+            "planner": "authoritative_single_pass_boundary_plan_v2",
+            "alignment_backend": "mfa",
+            "mfa_version": MFA_VERSION,
+            "mfa_model": MFA_MODEL_ID,
+            "mfa_fine_tune": True,
+            "source_audio": str(audio_path),
+            "source_audio_sha256": sha256_file(audio_path),
+            "source_sample_rate": sample_rate,
+            "source_channel_count": channel_count,
+            "source_frame_count": total_samples,
+            "delivery_status": "complete_with_full_source_passthrough",
+            "delivery_fallback": delivery_record,
+            "discarded_unsafe_boundary_summary": {
+                "alignment_failures": int(unsafe_plan.get("alignment_failures", 0)),
+                "unsafe_dense_boundaries": int(
+                    unsafe_plan.get("unsafe_dense_boundaries", 0)
+                ),
+                "weak_retained_word_alignments": int(
+                    unsafe_plan.get("weak_retained_word_alignments", 0)
+                ),
+                "boundary_statuses": [
+                    {
+                        "boundary_id": boundary.get("boundary_id"),
+                        "safety_status": boundary.get("safety_status"),
+                    }
+                    for boundary in unsafe_plan.get("boundaries", [])
+                    if isinstance(boundary, dict)
+                    and boundary.get("safety_status") != "safe"
+                ],
+            },
+            "source_intervals": source_intervals,
+            "boundaries": [start_boundary, end_boundary],
+            "joins": [],
+            "protected_speech_mask": [],
+            "editable_non_speech": [],
+            "mfa_non_silence_source_spans": [],
+            "room_tone_mfa_source_spans": [],
+            "clean_ambience_bank": {
+                "schema_version": 1,
+                "status": "not_required_full_source_passthrough",
+                "sample_rate": sample_rate,
+                "accepted_candidates": [],
+                "rejected_candidates": [],
+                "usage_ledger": [],
+            },
+            "breath_cleanup": {
+                "status": "preserved_full_source_passthrough",
+                "detected_events": [],
+                "events": [],
+                "replacements": [],
+                "room_tone_exclusions": [],
+            },
+            "artifact_cleanup": {
+                "status": "preserved_full_source_passthrough",
+                "events": [],
+                "replacements": [],
+            },
+            "output_segments": output_segments,
+            "expected_output_frame_count": total_samples,
+            "alignment_context_count": 0,
+            "alignment_resolved_boundaries": 0,
+            "unsafe_dense_boundaries": 0,
+            "mfa_dense_phone_boundaries": 0,
+            "weak_retained_word_alignments": 0,
+            "mfa_word_mapping_failures": 0,
+            "alignment_failures": 0,
+            "final_boundary": end_boundary,
+        }
+    )
+    return result
+
+
 def render_final_cut(
     *,
     audio_path: Path,
@@ -5784,6 +6543,8 @@ def render_final_cut(
         audio_path=audio_path,
         plan_path=plan_path,
     )
+    original_selected_word_ids = _selected_source_word_ids(plan)
+    original_source_word_count = len(plan.get("words", []))
     output_dir.mkdir(parents=True, exist_ok=True)
     cached_pause_plan = _cache_pause_plan(
         plan_path=plan_path,
@@ -5807,6 +6568,9 @@ def render_final_cut(
     effective_pause_path = cached_pause_plan
     acoustic_repair_records: list[dict[str, Any]] = []
     acoustic_repair_failures: list[dict[str, Any]] = []
+    acoustic_repair_thought_failures: list[dict[str, Any]] = []
+    acoustic_repair_skips: list[dict[str, Any]] = []
+    acoustic_repair_attempt_count = 0
     rejected_boundary_history: list[dict[str, Any]] = []
     active_repair_backend = repair_backend
     owns_repair_backend = False
@@ -5869,38 +6633,57 @@ def render_final_cut(
             mapping_failure_count = int(
                 boundary_plan.get("mfa_word_mapping_failures", 0)
             )
-            alignment_failures = int(boundary_plan["alignment_failures"])
-            if (
-                dense_count + weak_word_count + mapping_failure_count == 0
-                or alignment_failures > mapping_failure_count
-                or acoustic_attempt >= max_acoustic_retries
-            ):
+            current_rejections = [
+                json.loads(json.dumps(boundary))
+                for boundary in boundary_plan["boundaries"]
+                if boundary.get("safety_status") in REPAIRABLE_ACOUSTIC_STATUSES
+            ]
+            if not current_rejections:
+                acoustic_repair_skips.append(
+                    {
+                        "boundary_plan_attempt": acoustic_attempt,
+                        "reason": "no_repairable_acoustic_boundaries",
+                        "unsafe_dense_boundaries": dense_count,
+                        "weak_retained_word_alignments": weak_word_count,
+                        "mfa_word_mapping_failures": mapping_failure_count,
+                        "alignment_failures": int(boundary_plan["alignment_failures"]),
+                    }
+                )
+                break
+            if acoustic_attempt >= max_acoustic_retries:
+                acoustic_repair_skips.append(
+                    {
+                        "boundary_plan_attempt": acoustic_attempt,
+                        "reason": "acoustic_retry_budget_exhausted",
+                        "repairable_boundary_ids": [
+                            boundary.get("boundary_id")
+                            for boundary in current_rejections
+                        ],
+                    }
+                )
                 break
             retry_index = acoustic_attempt + 1
             retry_dir = output_dir / "acoustic_retries" / f"retry_{retry_index:02d}"
             retry_dir.mkdir(parents=True, exist_ok=True)
             rejected_path = retry_dir / "rejected_boundary_plan.json"
-            current_rejections = [
-                json.loads(json.dumps(boundary))
-                for boundary in boundary_plan["boundaries"]
-                if boundary.get("safety_status")
-                in {
-                    "unsafe_dense_boundary",
-                    "weak_retained_word_alignment",
-                    "mfa_word_mapping_failed",
-                }
-            ]
             repair_constraints = json.loads(json.dumps(boundary_plan))
+            active_repair_boundary_ids = [
+                str(boundary.get("boundary_id")) for boundary in current_rejections
+            ]
             repair_constraints["boundaries"] = [
                 *current_rejections,
                 *rejected_boundary_history,
             ]
+            repair_constraints["active_repair_boundary_ids"] = (
+                active_repair_boundary_ids
+            )
             repair_constraints["acoustic_rejection_history"] = [
                 boundary.get("boundary_id") for boundary in rejected_boundary_history
             ]
             write_json(rejected_path, repair_constraints)
             for rejection in current_rejections:
                 historical = json.loads(json.dumps(rejection))
+                historical["repair_constraint_role"] = "historical"
                 historical["boundary_id"] = (
                     f"retry_{retry_index:02d}:"
                     f"{historical.get('boundary_id', 'unsafe_boundary')}"
@@ -5919,6 +6702,7 @@ def render_final_cut(
                 )
                 owns_repair_backend = True
             semantic_retry_dir = retry_dir / "semantic_plan"
+            acoustic_repair_attempt_count += 1
             try:
                 repaired = repair_plan_for_acoustic_safety(
                     plan_path=effective_plan_path,
@@ -5950,6 +6734,25 @@ def render_final_cut(
                 raise FinalRenderError(
                     "saved acoustic repair differs from its in-memory plan"
                 )
+            repair_ledger_path = semantic_retry_dir / "acoustic_repair.json"
+            repair_ledger = read_json(repair_ledger_path)
+            if not isinstance(repair_ledger, dict):
+                raise FinalRenderError("saved acoustic repair ledger is invalid")
+            thought_failures = repair_ledger.get("failures", [])
+            if not isinstance(thought_failures, list) or not all(
+                isinstance(failure, dict) for failure in thought_failures
+            ):
+                raise FinalRenderError(
+                    "saved acoustic repair thought failures are invalid"
+                )
+            for failure in thought_failures:
+                acoustic_repair_thought_failures.append(
+                    {
+                        **json.loads(json.dumps(failure)),
+                        "rejected_boundary_plan": str(rejected_path.resolve()),
+                        "rejected_boundary_plan_sha256": sha256_file(rejected_path),
+                    }
+                )
             effective_plan_path = repaired_path
             effective_pause_path = _retarget_pause_plan(
                 source_pause_plan_path=effective_pause_path,
@@ -5963,6 +6766,12 @@ def render_final_cut(
                     "rejected_boundary_plan_sha256": sha256_file(rejected_path),
                     "repaired_streaming_plan": str(effective_plan_path.resolve()),
                     "repaired_streaming_plan_sha256": sha256_file(effective_plan_path),
+                    "repair_ledger": str(repair_ledger_path.resolve()),
+                    "repair_ledger_sha256": sha256_file(repair_ledger_path),
+                    "partial": bool(thought_failures),
+                    "failed_thought_indices": [
+                        int(failure["thought_index"]) for failure in thought_failures
+                    ],
                 }
             )
     finally:
@@ -5970,85 +6779,252 @@ def render_final_cut(
             active_repair_backend.close()
 
     delivery_fallback_record: dict[str, Any] | None = None
+    delivery_fallback_passes: list[dict[str, Any]] = []
     if boundary_plan["status"] != "safe":
         fallback_dir = output_dir / "conservative_delivery_fallback"
-        unsafe_plan_path = fallback_dir / "unsafe_boundary_plan.json"
         fallback_dir.mkdir(parents=True, exist_ok=True)
-        write_json(unsafe_plan_path, boundary_plan)
-        fallback_plan_dir = fallback_dir / "semantic_plan"
-        try:
-            fallback_plan = build_conservative_delivery_plan(
-                plan_path=effective_plan_path,
-                boundary_plan_path=unsafe_plan_path,
-                output_dir=fallback_plan_dir,
-            )
-            fallback_plan_path = fallback_plan_dir / "streaming_plan.json"
-            (
-                effective_plan,
-                effective_grounding_path,
-                effective_selected_range_count,
-            ) = _validate_grounded_plan(
-                audio_path=audio_path,
-                plan_path=fallback_plan_path,
-            )
-            if effective_plan != fallback_plan:
-                raise FinalRenderError(
-                    "saved conservative delivery plan differs from memory"
-                )
-            effective_plan_path = fallback_plan_path
-            effective_pause_path = _retarget_pause_plan(
-                source_pause_plan_path=effective_pause_path,
-                repaired_plan_path=effective_plan_path,
-                destination=fallback_dir / "pause_plan.json",
-            )
-            pause_plan = read_json(effective_pause_path)
-            if not isinstance(pause_plan, dict):
-                raise FinalRenderError("fallback pause plan root must be an object")
-            fallback_payload_index = max_acoustic_retries + 1
-            fallback_alignment_payload = (
-                alignment_payloads[fallback_payload_index]
-                if alignment_payloads is not None
-                and fallback_payload_index < len(alignment_payloads)
-                else None
-            )
-            fallback_mfa_payload = (
-                mfa_payloads[fallback_payload_index]
-                if mfa_payloads is not None
-                and fallback_payload_index < len(mfa_payloads)
-                else None
-            )
-            boundary_plan = build_final_boundary_plan(
-                audio_path=audio_path,
-                semantic_plan=effective_plan,
-                semantic_plan_path=effective_plan_path,
-                pause_plan=pause_plan,
-                pause_plan_path=effective_pause_path,
-                output_dir=fallback_dir / "boundary_evidence",
-                alignment_python=alignment_python,
-                alignment_backend=alignment_backend,
-                mfa_prefix=mfa_prefix,
-                mfa_cache_root=mfa_cache_root,
-                mfa_micromamba=mfa_micromamba,
-                mfa_num_jobs=mfa_num_jobs,
-                alignment_payload=fallback_alignment_payload,
-                mfa_payload=fallback_mfa_payload,
-                breath_cleanup=breath_cleanup,
-                breath_threshold=breath_threshold,
-                breath_min_duration_ms=breath_min_duration_ms,
-                respiro_cache_root=respiro_cache_root,
-                breath_payload=breath_payload,
-                pause_policy=pause_policy,
-            )
-            delivery_fallback_record = effective_plan.get("delivery_fallback")
-        except (FinalRenderError, StreamingPlanError, OSError, ValueError) as error:
-            delivery_fallback_record = {
-                "status": "failed",
-                "error": f"{type(error).__name__}: {error}",
+        preserved_intervals: list[dict[str, Any]] = []
+        for fallback_pass in range(1, DEFAULT_MAX_CONSERVATIVE_DELIVERY_PASSES + 1):
+            pass_dir = fallback_dir / f"pass_{fallback_pass:02d}"
+            pass_dir.mkdir(parents=True, exist_ok=True)
+            unsafe_plan_path = pass_dir / "unsafe_boundary_plan.json"
+            write_json(unsafe_plan_path, boundary_plan)
+            selected_before = _selected_source_word_ids(effective_plan)
+            pass_record: dict[str, Any] = {
+                "pass_index": fallback_pass,
+                "status": "started",
+                "unsafe_boundary_plan": str(unsafe_plan_path.resolve()),
+                "unsafe_boundary_plan_sha256": sha256_file(unsafe_plan_path),
+                "unsafe_boundary_count": sum(
+                    boundary.get("safety_status")
+                    not in {"safe", "mfa_not_run_due_to_weak_retained_word"}
+                    for boundary in boundary_plan.get("boundaries", [])
+                    if isinstance(boundary, dict)
+                ),
+                "selected_source_words_before": len(selected_before),
             }
+            delivery_fallback_passes.append(pass_record)
+            fallback_plan_dir = pass_dir / "semantic_plan"
+            try:
+                fallback_plan = build_conservative_delivery_plan(
+                    plan_path=effective_plan_path,
+                    boundary_plan_path=unsafe_plan_path,
+                    output_dir=fallback_plan_dir,
+                )
+                fallback_plan_path = fallback_plan_dir / "streaming_plan.json"
+                (
+                    candidate_plan,
+                    candidate_grounding_path,
+                    candidate_selected_range_count,
+                ) = _validate_grounded_plan(
+                    audio_path=audio_path,
+                    plan_path=fallback_plan_path,
+                )
+                if candidate_plan != fallback_plan:
+                    raise FinalRenderError(
+                        "saved conservative delivery plan differs from memory"
+                    )
+                selected_after = _selected_source_word_ids(candidate_plan)
+                added_word_ids = selected_after - selected_before
+                if not selected_before.issubset(selected_after) or not added_word_ids:
+                    pass_record.update(
+                        {
+                            "status": "stopped_no_progress",
+                            "selected_source_words_after": len(selected_after),
+                            "added_source_ranges": [],
+                        }
+                    )
+                    break
+                effective_plan = candidate_plan
+                effective_grounding_path = candidate_grounding_path
+                effective_selected_range_count = candidate_selected_range_count
+                effective_plan_path = fallback_plan_path
+                per_pass_fallback = effective_plan.get("delivery_fallback")
+                if isinstance(per_pass_fallback, dict):
+                    preserved_intervals.extend(
+                        json.loads(
+                            json.dumps(per_pass_fallback.get("preserved_intervals", []))
+                        )
+                    )
+                effective_pause_path = _retarget_pause_plan(
+                    source_pause_plan_path=effective_pause_path,
+                    repaired_plan_path=effective_plan_path,
+                    destination=pass_dir / "pause_plan.json",
+                )
+                pause_plan = read_json(effective_pause_path)
+                if not isinstance(pause_plan, dict):
+                    raise FinalRenderError("fallback pause plan root must be an object")
+                fallback_payload_index = max_acoustic_retries + fallback_pass
+                fallback_alignment_payload = (
+                    alignment_payloads[fallback_payload_index]
+                    if alignment_payloads is not None
+                    and fallback_payload_index < len(alignment_payloads)
+                    else None
+                )
+                fallback_mfa_payload = (
+                    mfa_payloads[fallback_payload_index]
+                    if mfa_payloads is not None
+                    and fallback_payload_index < len(mfa_payloads)
+                    else None
+                )
+                boundary_plan = build_final_boundary_plan(
+                    audio_path=audio_path,
+                    semantic_plan=effective_plan,
+                    semantic_plan_path=effective_plan_path,
+                    pause_plan=pause_plan,
+                    pause_plan_path=effective_pause_path,
+                    output_dir=pass_dir / "boundary_evidence",
+                    alignment_python=alignment_python,
+                    alignment_backend=alignment_backend,
+                    mfa_prefix=mfa_prefix,
+                    mfa_cache_root=mfa_cache_root,
+                    mfa_micromamba=mfa_micromamba,
+                    mfa_num_jobs=mfa_num_jobs,
+                    alignment_payload=fallback_alignment_payload,
+                    mfa_payload=fallback_mfa_payload,
+                    breath_cleanup=breath_cleanup,
+                    breath_threshold=breath_threshold,
+                    breath_min_duration_ms=breath_min_duration_ms,
+                    respiro_cache_root=respiro_cache_root,
+                    breath_payload=breath_payload,
+                    pause_policy=pause_policy,
+                )
+                pass_record.update(
+                    {
+                        "status": (
+                            "safe" if boundary_plan["status"] == "safe" else "progress"
+                        ),
+                        "streaming_plan": str(effective_plan_path.resolve()),
+                        "streaming_plan_sha256": sha256_file(effective_plan_path),
+                        "selected_source_words_after": len(selected_after),
+                        "added_source_ranges": _word_ids_to_ranges(added_word_ids),
+                        "resulting_boundary_status": boundary_plan["status"],
+                        "resulting_alignment_failures": int(
+                            boundary_plan["alignment_failures"]
+                        ),
+                    }
+                )
+                if boundary_plan["status"] == "safe":
+                    break
+            except (FinalRenderError, StreamingPlanError, OSError, ValueError) as error:
+                pass_record.update(
+                    {
+                        "status": "failed",
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                )
+                break
+
+        if boundary_plan["status"] == "safe":
+            delivery_fallback_record = {
+                "status": "complete_with_preserved_source_context",
+                "reason": (
+                    "unresolved acoustic cuts were removed without guessing coordinates"
+                ),
+                "pass_count": len(delivery_fallback_passes),
+                "preserved_intervals": preserved_intervals,
+                "passes": delivery_fallback_passes,
+            }
+            boundary_plan["delivery_status"] = "complete_with_preserved_source_context"
+            boundary_plan["delivery_fallback"] = delivery_fallback_record
+        else:
+            last_status = (
+                delivery_fallback_passes[-1]["status"]
+                if delivery_fallback_passes
+                else "not_started"
+            )
+            delivery_fallback_record = {
+                "status": "failed_no_safe_boundary_plan",
+                "reason": (
+                    "conservative source preservation exhausted its bounded "
+                    "monotonic passes without a safe boundary plan"
+                ),
+                "pass_count": len(delivery_fallback_passes),
+                "last_pass_status": last_status,
+                "preserved_intervals": preserved_intervals,
+                "passes": delivery_fallback_passes,
+            }
+            boundary_plan["delivery_status"] = "failed_unsafe_boundary_plan"
+            boundary_plan["delivery_fallback"] = delivery_fallback_record
             write_json(
                 fallback_dir / "delivery_fallback_failure.json",
                 delivery_fallback_record,
             )
+        write_json(fallback_dir / "delivery_fallback.json", delivery_fallback_record)
+        if boundary_plan["status"] != "safe":
+            final_unsafe_path = fallback_dir / "final_unsafe_boundary_plan.json"
+            write_json(final_unsafe_path, boundary_plan)
+            failed_local_fallback = json.loads(json.dumps(delivery_fallback_record))
+            selected_word_ids = _selected_source_word_ids(effective_plan)
+            source_word_count = len(effective_plan.get("words", []))
+            original_selected_all_source = original_selected_word_ids == set(
+                range(original_source_word_count)
+            )
+            if not original_selected_all_source:
+                delivery_fallback_record = {
+                    "status": "failed_refused_full_source_passthrough",
+                    "reason": (
+                        "the semantic plan selected a strict subset of the source; "
+                        "publishing the complete source would falsely report an "
+                        "unedited recording as a successful edit"
+                    ),
+                    "local_preservation_result": failed_local_fallback,
+                    "unsafe_boundary_plan": str(final_unsafe_path.resolve()),
+                    "unsafe_boundary_plan_sha256": sha256_file(final_unsafe_path),
+                    "selected_source_word_count": len(selected_word_ids),
+                    "source_word_count": source_word_count,
+                    "original_selected_source_word_count": len(
+                        original_selected_word_ids
+                    ),
+                    "original_source_word_count": original_source_word_count,
+                    "pass_count": len(delivery_fallback_passes),
+                    "preserved_intervals": preserved_intervals,
+                    "passes": delivery_fallback_passes,
+                }
+                write_json(
+                    fallback_dir / "delivery_fallback.json",
+                    delivery_fallback_record,
+                )
+                raise FinalRenderError(
+                    "localized conservative delivery could not produce a safe "
+                    "edit; refusing to publish the complete unedited source"
+                )
+            delivery_fallback_record = {
+                "status": "complete_with_full_source_passthrough",
+                "reason": (
+                    "all unresolved internal cuts were removed by tracing the "
+                    "complete canonical source; no Whisper, RMS, midpoint, or "
+                    "guessed acoustic coordinate was used"
+                ),
+                "local_preservation_result": failed_local_fallback,
+                "unsafe_boundary_plan": str(final_unsafe_path.resolve()),
+                "unsafe_boundary_plan_sha256": sha256_file(final_unsafe_path),
+                "pass_count": len(delivery_fallback_passes),
+                "preserved_intervals": preserved_intervals,
+                "passes": delivery_fallback_passes,
+            }
+            boundary_plan = _full_source_passthrough_boundary_plan(
+                unsafe_plan=boundary_plan,
+                audio_path=audio_path,
+                word_count=len(effective_plan.get("words", [])),
+                delivery_record=delivery_fallback_record,
+            )
+            write_json(
+                fallback_dir / "delivery_fallback.json",
+                delivery_fallback_record,
+            )
+    boundary_plan["acoustic_repair_orchestration"] = {
+        "configured_max_retries": max_acoustic_retries,
+        "attempted": acoustic_repair_attempt_count,
+        "successful": len(acoustic_repair_records),
+        "failed": len(acoustic_repair_failures),
+        "repairs": acoustic_repair_records,
+        "failures": acoustic_repair_failures,
+        "thought_failures": acoustic_repair_thought_failures,
+        "failed_thoughts": len(acoustic_repair_thought_failures),
+        "skips": acoustic_repair_skips,
+    }
+    boundary_plan["conservative_delivery_passes"] = delivery_fallback_passes
     boundary_plan_path = output_dir / "final_boundary_plan.json"
     write_json(boundary_plan_path, boundary_plan)
     boundary_plan_sha = sha256_file(boundary_plan_path)
@@ -6074,7 +7050,10 @@ def render_final_cut(
             f"{reason}: boundary plan has {unsafe} dense boundaries and "
             f"{weak} weak retained-word alignments and {failures} alignment "
             "failures after "
-            f"{len(acoustic_repair_records)} acoustic repair attempts; "
+            f"{acoustic_repair_attempt_count} acoustic repair attempts "
+            f"({len(acoustic_repair_records)} successful, "
+            f"{len(acoustic_repair_failures)} failed) and "
+            f"{len(delivery_fallback_passes)} conservative preservation passes; "
             "no audio was rendered"
         )
 
@@ -6211,9 +7190,14 @@ def render_final_cut(
         "duration_seconds": render_result["duration_seconds"],
         "semantic_thoughts": len(effective_plan["committed"]),
         "selected_source_ranges": effective_selected_range_count,
-        "acoustic_repair_attempts": len(acoustic_repair_records),
+        "acoustic_repair_attempts": acoustic_repair_attempt_count,
+        "acoustic_repair_successes": len(acoustic_repair_records),
         "acoustic_repairs": acoustic_repair_records,
         "acoustic_repair_failures": acoustic_repair_failures,
+        "acoustic_repair_thought_failures": acoustic_repair_thought_failures,
+        "acoustic_repair_skips": acoustic_repair_skips,
+        "conservative_delivery_passes": delivery_fallback_passes,
+        "conservative_delivery_pass_count": len(delivery_fallback_passes),
         "rendered_clips": len(boundary_plan["source_intervals"]),
         "debug_artifacts_requested": write_debug_artifacts,
         "debug_artifacts_written": (
@@ -6254,6 +7238,11 @@ def render_final_cut(
                 "planner window(s)"
             )
         delivery_record = manifest.get("delivery_fallback")
+        if manifest["delivery_status"] == "complete_with_full_source_passthrough":
+            warning_parts.append(
+                "returned the complete canonical source because no safe edited "
+                "boundary plan could be completed"
+            )
         preserved = (
             delivery_record.get("preserved_intervals", [])
             if isinstance(delivery_record, dict)

@@ -92,15 +92,12 @@ footer {
   letter-spacing: -0.02em;
 }
 
-.brand-mark {
-  display: grid;
-  width: 1.9rem;
-  height: 1.9rem;
-  place-items: center;
-  border-radius: 0.45rem;
-  color: #ffffff;
-  background: var(--accent);
-  font-size: 0.82rem;
+.brand-logo {
+  display: block;
+  width: 2.25rem;
+  height: 2.25rem;
+  flex: none;
+  object-fit: contain;
 }
 
 nav {

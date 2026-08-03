@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SITE_SOURCE = PROJECT_ROOT / "docs" / "demo"
 MEDIA_SOURCE = PROJECT_ROOT / "examples" / "media"
 README_ASSETS = PROJECT_ROOT / "docs" / "assets" / "readme"
+BRAND_SOURCE = PROJECT_ROOT / "logo.svg"
 REQUIRED_ASSETS = (
     "pipeline.svg",
     "video-before.jpg",
@@ -39,6 +40,7 @@ def build_demo(output: Path) -> None:
         SITE_SOURCE / "index.html",
         SITE_SOURCE / "styles.css",
         SITE_SOURCE / "player.js",
+        BRAND_SOURCE,
         *(README_ASSETS / name for name in REQUIRED_ASSETS),
         *required_media,
     )
@@ -60,6 +62,7 @@ def build_demo(output: Path) -> None:
     assets_output.mkdir()
     for name in REQUIRED_ASSETS:
         shutil.copy2(README_ASSETS / name, assets_output / name)
+    shutil.copy2(BRAND_SOURCE, assets_output / "logo.svg")
     (output / ".nojekyll").write_text("", encoding="utf-8")
 
     relative_output = output.relative_to(PROJECT_ROOT)

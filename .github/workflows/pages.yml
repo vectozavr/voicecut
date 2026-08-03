@@ -12,6 +12,7 @@ on:
       - "docs/assets/readme/video-before.jpg"
       - "docs/assets/readme/video-after.jpg"
       - "examples/media/**"
+      - "logo.svg"
       - "scripts/build_pages_demo.py"
       - "scripts/build_star_history.py"
   schedule:

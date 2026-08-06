@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="voicecut-cover-title voicecut-cover-description">
+  <title id="voicecut-cover-title">VoiceCut editing pipeline</title>
+  <desc id="voicecut-cover-description">Fragmented source takes pass through semantic word selection and aligned cut boundaries to become one clean audio and video edit.</desc>
+
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f8f9ff"/>
+    </linearGradient>
+    <linearGradient id="focus-panel" x1="548" y1="151" x2="1064" y2="747" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="0.5" stop-color="#f4f5ff"/>
+      <stop offset="1" stop-color="#eaedff"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#3049bc"/>
+      <stop offset="0.52" stop-color="#5269d9"/>
+      <stop offset="1" stop-color="#7667e8"/>
+    </linearGradient>
+    <linearGradient id="accent-soft" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#dce2ff"/>
+      <stop offset="1" stop-color="#ece8ff"/>
+    </linearGradient>
+    <linearGradient id="final-wave" x1="1207" y1="0" x2="1481" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3049bc"/>
+      <stop offset="0.55" stop-color="#5269d9"/>
+      <stop offset="1" stop-color="#7b5fe5"/>
+    </linearGradient>
+    <filter id="card-shadow" x="-25%" y="-25%" width="150%" height="165%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#1a285f" flood-opacity="0.11"/>
+    </filter>
+    <filter id="focus-shadow" x="-25%" y="-25%" width="150%" height="165%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="26" stdDeviation="30" flood-color="#3049bc" flood-opacity="0.19"/>
+    </filter>
+    <filter id="soft-glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <marker id="arrow" markerWidth="20" markerHeight="20" refX="17" refY="10" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M3 3L17 10L3 17" fill="none" stroke="#415ccf" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <clipPath id="source-wave-1"><rect x="126" y="389" width="258" height="56" rx="16"/></clipPath>
+    <clipPath id="source-wave-2"><rect x="126" y="463" width="214" height="56" rx="16"/></clipPath>
+    <clipPath id="source-wave-3"><rect x="170" y="537" width="214" height="56" rx="16"/></clipPath>
+    <clipPath id="aligned-wave"><rect x="570" y="558" width="460" height="104" rx="26"/></clipPath>
+  </defs>
+
+  <rect width="1600" height="900" fill="#ffffff"/>
+
+  <g opacity="0.95">
+    <path d="M440 450H500" fill="none" stroke="#415ccf" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
+    <path d="M1103 450H1163" fill="none" stroke="#415ccf" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
+  </g>
+
+  <g filter="url(#card-shadow)">
+    <rect x="78" y="234" width="350" height="432" rx="40" fill="url(#panel)" stroke="#d6dbea" stroke-width="3"/>
+  </g>
+  <g filter="url(#focus-shadow)">
+    <rect x="518" y="125" width="576" height="650" rx="48" fill="url(#focus-panel)" stroke="#6073db" stroke-width="4"/>
+  </g>
+  <g filter="url(#card-shadow)">
+    <rect x="1172" y="234" width="350" height="432" rx="40" fill="url(#panel)" stroke="#d6dbea" stroke-width="3"/>
+  </g>
+
+  <!-- Source: several abandoned or repeated takes. -->
+  <g>
+    <rect x="114" y="273" width="58" height="38" rx="19" fill="#e9edff"/>
+    <text x="143" y="301" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#415ccf">1</text>
+    <text x="114" y="357" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="4" fill="#0d1526">SOURCE</text>
+
+    <rect x="126" y="389" width="258" height="56" rx="16" fill="#f0f2f7" stroke="#dfe3ec" stroke-width="2"/>
+    <g clip-path="url(#source-wave-1)" fill="#68758c">
+      <rect x="143" y="413" width="5" height="10" rx="2.5"/><rect x="154" y="406" width="5" height="24" rx="2.5"/><rect x="165" y="399" width="5" height="38" rx="2.5"/><rect x="176" y="410" width="5" height="16" rx="2.5"/><rect x="187" y="393" width="5" height="50" rx="2.5"/><rect x="198" y="404" width="5" height="28" rx="2.5"/><rect x="209" y="412" width="5" height="12" rx="2.5"/><rect x="220" y="402" width="5" height="32" rx="2.5"/><rect x="231" y="407" width="5" height="22" rx="2.5"/><rect x="242" y="396" width="5" height="44" rx="2.5"/><rect x="253" y="411" width="5" height="14" rx="2.5"/><rect x="264" y="401" width="5" height="34" rx="2.5"/><rect x="275" y="408" width="5" height="20" rx="2.5"/>
+      <rect x="311" y="408" width="5" height="20" rx="2.5"/><rect x="322" y="397" width="5" height="42" rx="2.5"/><rect x="333" y="405" width="5" height="26" rx="2.5"/><rect x="344" y="412" width="5" height="12" rx="2.5"/><rect x="355" y="400" width="5" height="36" rx="2.5"/>
+    </g>
+    <circle cx="294" cy="417" r="5" fill="#d3d8e4"/><circle cx="294" cy="417" r="14" fill="none" stroke="#d3d8e4" stroke-width="2" stroke-dasharray="3 4"/>
+
+    <rect x="126" y="463" width="214" height="56" rx="16" fill="#f0f2f7" stroke="#dfe3ec" stroke-width="2"/>
+    <g clip-path="url(#source-wave-2)" fill="#68758c">
+      <rect x="143" y="488" width="5" height="8" rx="2.5"/><rect x="154" y="479" width="5" height="26" rx="2.5"/><rect x="165" y="471" width="5" height="42" rx="2.5"/><rect x="176" y="484" width="5" height="16" rx="2.5"/><rect x="187" y="476" width="5" height="32" rx="2.5"/><rect x="198" y="467" width="5" height="50" rx="2.5"/><rect x="209" y="481" width="5" height="22" rx="2.5"/><rect x="220" y="487" width="5" height="10" rx="2.5"/><rect x="231" y="474" width="5" height="36" rx="2.5"/><rect x="242" y="481" width="5" height="22" rx="2.5"/><rect x="253" y="469" width="5" height="46" rx="2.5"/><rect x="264" y="485" width="5" height="14" rx="2.5"/><rect x="275" y="478" width="5" height="28" rx="2.5"/><rect x="286" y="486" width="5" height="12" rx="2.5"/><rect x="297" y="475" width="5" height="34" rx="2.5"/>
+    </g>
+
+    <rect x="170" y="537" width="214" height="56" rx="16" fill="#f0f2f7" stroke="#dfe3ec" stroke-width="2"/>
+    <g clip-path="url(#source-wave-3)" fill="#68758c">
+      <rect x="187" y="562" width="5" height="8" rx="2.5"/><rect x="198" y="554" width="5" height="24" rx="2.5"/><rect x="209" y="545" width="5" height="42" rx="2.5"/><rect x="220" y="559" width="5" height="14" rx="2.5"/><rect x="231" y="550" width="5" height="32" rx="2.5"/><rect x="242" y="541" width="5" height="50" rx="2.5"/><rect x="253" y="556" width="5" height="20" rx="2.5"/><rect x="264" y="562" width="5" height="8" rx="2.5"/><rect x="275" y="548" width="5" height="36" rx="2.5"/><rect x="286" y="556" width="5" height="20" rx="2.5"/><rect x="297" y="544" width="5" height="44" rx="2.5"/><rect x="308" y="558" width="5" height="16" rx="2.5"/><rect x="319" y="551" width="5" height="30" rx="2.5"/><rect x="330" y="560" width="5" height="12" rx="2.5"/><rect x="341" y="549" width="5" height="34" rx="2.5"/>
+    </g>
+  </g>
+
+  <!-- Center: language selects the take; alignment owns the boundaries. -->
+  <g>
+    <rect x="558" y="166" width="58" height="38" rx="19" fill="#415ccf"/>
+    <text x="587" y="194" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#ffffff">2</text>
+    <text x="558" y="255" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="4" fill="#0d1526">SELECT WORDS</text>
+
+    <g>
+      <rect x="558" y="295" width="104" height="54" rx="17" fill="#eef0f6"/>
+      <rect x="579" y="315" width="62" height="13" rx="6.5" fill="#a6afbf"/>
+      <rect x="678" y="295" width="136" height="54" rx="17" fill="url(#accent-soft)" stroke="#6073db" stroke-width="2.5"/>
+      <rect x="700" y="315" width="92" height="13" rx="6.5" fill="#415ccf"/>
+      <rect x="830" y="295" width="82" height="54" rx="17" fill="#eef0f6"/>
+      <rect x="849" y="315" width="44" height="13" rx="6.5" fill="#a6afbf"/>
+      <rect x="928" y="295" width="126" height="54" rx="17" fill="url(#accent-soft)" stroke="#6073db" stroke-width="2.5"/>
+      <rect x="949" y="315" width="84" height="13" rx="6.5" fill="#415ccf"/>
+    </g>
+
+    <path d="M558 410H1054" stroke="#cfd5e5" stroke-width="2"/>
+    <circle cx="806" cy="410" r="6" fill="#6073db"/>
+
+    <text x="558" y="492" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="4" fill="#0d1526">ALIGN CUTS</text>
+    <rect x="558" y="546" width="496" height="128" rx="30" fill="#ffffff" stroke="#d8ddec" stroke-width="2.5"/>
+    <rect x="653" y="558" width="316" height="104" rx="24" fill="url(#accent-soft)"/>
+    <g clip-path="url(#aligned-wave)" fill="#64748b">
+      <rect x="580" y="604" width="6" height="12" rx="3"/><rect x="593" y="593" width="6" height="34" rx="3"/><rect x="606" y="580" width="6" height="60" rx="3"/><rect x="619" y="599" width="6" height="22" rx="3"/><rect x="632" y="588" width="6" height="44" rx="3"/>
+    </g>
+    <g clip-path="url(#aligned-wave)" fill="#415ccf">
+      <rect x="666" y="598" width="6" height="24" rx="3"/><rect x="679" y="580" width="6" height="60" rx="3"/><rect x="692" y="569" width="6" height="82" rx="3"/><rect x="705" y="591" width="6" height="38" rx="3"/><rect x="718" y="576" width="6" height="68" rx="3"/><rect x="731" y="600" width="6" height="20" rx="3"/><rect x="744" y="584" width="6" height="52" rx="3"/><rect x="757" y="572" width="6" height="76" rx="3"/><rect x="770" y="594" width="6" height="32" rx="3"/><rect x="783" y="582" width="6" height="56" rx="3"/><rect x="796" y="602" width="6" height="16" rx="3"/><rect x="809" y="589" width="6" height="42" rx="3"/><rect x="822" y="575" width="6" height="70" rx="3"/><rect x="835" y="595" width="6" height="30" rx="3"/><rect x="848" y="568" width="6" height="84" rx="3"/><rect x="861" y="588" width="6" height="44" rx="3"/><rect x="874" y="598" width="6" height="24" rx="3"/><rect x="887" y="578" width="6" height="64" rx="3"/><rect x="900" y="591" width="6" height="38" rx="3"/><rect x="913" y="574" width="6" height="72" rx="3"/><rect x="926" y="600" width="6" height="20" rx="3"/><rect x="939" y="585" width="6" height="50" rx="3"/><rect x="952" y="598" width="6" height="24" rx="3"/>
+    </g>
+    <g clip-path="url(#aligned-wave)" fill="#64748b">
+      <rect x="982" y="594" width="6" height="32" rx="3"/><rect x="995" y="582" width="6" height="56" rx="3"/><rect x="1008" y="602" width="6" height="16" rx="3"/><rect x="1021" y="590" width="6" height="40" rx="3"/>
+    </g>
+    <line x1="653" y1="535" x2="653" y2="686" stroke="#3049bc" stroke-width="7" stroke-linecap="round"/>
+    <line x1="969" y1="535" x2="969" y2="686" stroke="#3049bc" stroke-width="7" stroke-linecap="round"/>
+    <circle cx="653" cy="535" r="9" fill="#ffffff" stroke="#3049bc" stroke-width="5"/>
+    <circle cx="969" cy="535" r="9" fill="#ffffff" stroke="#3049bc" stroke-width="5"/>
+  </g>
+
+  <!-- Final: one continuous audio waveform and direct video cuts. -->
+  <g>
+    <rect x="1208" y="273" width="58" height="38" rx="19" fill="#e9edff"/>
+    <text x="1237" y="301" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#415ccf">3</text>
+    <text x="1208" y="357" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="3.5" fill="#0d1526">CLEAN EDIT</text>
+
+    <rect x="1208" y="393" width="278" height="104" rx="28" fill="#e9edff"/>
+    <g fill="url(#final-wave)">
+      <rect x="1230" y="438" width="7" height="14" rx="3.5"/><rect x="1244" y="427" width="7" height="36" rx="3.5"/><rect x="1258" y="414" width="7" height="62" rx="3.5"/><rect x="1272" y="432" width="7" height="26" rx="3.5"/><rect x="1286" y="405" width="7" height="80" rx="3.5"/><rect x="1300" y="424" width="7" height="42" rx="3.5"/><rect x="1314" y="434" width="7" height="22" rx="3.5"/><rect x="1328" y="417" width="7" height="56" rx="3.5"/><rect x="1342" y="429" width="7" height="32" rx="3.5"/><rect x="1356" y="409" width="7" height="72" rx="3.5"/><rect x="1370" y="435" width="7" height="20" rx="3.5"/><rect x="1384" y="421" width="7" height="48" rx="3.5"/><rect x="1398" y="411" width="7" height="68" rx="3.5"/><rect x="1412" y="431" width="7" height="28" rx="3.5"/><rect x="1426" y="402" width="7" height="86" rx="3.5"/><rect x="1440" y="423" width="7" height="44" rx="3.5"/><rect x="1454" y="434" width="7" height="22" rx="3.5"/>
+    </g>
+
+    <g transform="translate(1208 534)">
+      <rect width="278" height="82" rx="22" fill="#18233b"/>
+      <rect x="15" y="15" width="72" height="52" rx="10" fill="#5369d8"/>
+      <path d="M40 50L55 37L68 48L79 35V57H40Z" fill="#dfe4ff" fill-opacity="0.9"/>
+      <circle cx="57" cy="29" r="6" fill="#ffffff" fill-opacity="0.78"/>
+      <rect x="103" y="15" width="72" height="52" rx="10" fill="#6578de"/>
+      <path d="M116 52L132 38L145 48L163 31V57H116Z" fill="#e9edff" fill-opacity="0.9"/>
+      <circle cx="143" cy="29" r="6" fill="#ffffff" fill-opacity="0.78"/>
+      <rect x="191" y="15" width="72" height="52" rx="10" fill="#7868e5"/>
+      <path d="M203 50L220 36L233 46L252 29V57H203Z" fill="#f1edff" fill-opacity="0.92"/>
+      <circle cx="231" cy="27" r="6" fill="#ffffff" fill-opacity="0.8"/>
+    </g>
+  </g>
+
+  <g opacity="0.65">
+    <circle cx="479" cy="450" r="20" fill="#415ccf" fill-opacity="0.18" filter="url(#soft-glow)"/>
+    <circle cx="1142" cy="450" r="20" fill="#7667e8" fill-opacity="0.18" filter="url(#soft-glow)"/>
+  </g>
+</svg>

@@ -11,6 +11,8 @@ directions, then keeps the intended source occurrences and joins them at
 phone-safe boundaries. VoiceCut never synthesizes replacement speech and
 renders audio once from the canonical source WAV before media publication.
 
+![VoiceCut pipeline from fragmented source takes to a clean audio and video edit](docs/assets/readme/voicecut-pipeline-cover.svg)
+
 The project is in beta and currently targets narrated, single-speaker
 recordings on Apple Silicon Macs.
 

@@ -124,8 +124,15 @@ footer a:hover,
 }
 
 .hero {
-  max-width: 64rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(22rem, 0.85fr);
+  gap: clamp(1.75rem, 4vw, 3.5rem);
+  align-items: center;
   padding-block: clamp(3.5rem, 7vw, 5rem) clamp(3rem, 5vw, 4rem);
+}
+
+.hero-copy {
+  min-width: 0;
 }
 
 .eyebrow,
@@ -166,6 +173,21 @@ h1 {
   flex-wrap: wrap;
   gap: 0.7rem;
   margin-top: 1.5rem;
+}
+
+.hero-visual {
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: 1rem;
+  background: var(--surface-soft);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.hero-visual img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .button {
@@ -465,6 +487,14 @@ footer > div {
 }
 
 @media (max-width: 920px) {
+  .hero {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-visual {
+    width: min(100%, 42rem);
+  }
+
   .audio-examples {
     grid-template-columns: 1fr;
   }

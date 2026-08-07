@@ -3,15 +3,6 @@
   <desc id="voicecut-cover-description">Fragmented source takes pass through semantic word selection and aligned cut boundaries to become one clean audio and video edit.</desc>
 
   <defs>
-    <linearGradient id="background" x1="80" y1="40" x2="1510" y2="860" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#f9faff"/>
-      <stop offset="0.48" stop-color="#f2f4fc"/>
-      <stop offset="1" stop-color="#edf0fb"/>
-    </linearGradient>
-    <radialGradient id="violet-halo" cx="0" cy="0" r="1" gradientTransform="translate(797 440) rotate(90) scale(480 620)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#dfe4ff" stop-opacity="0.9"/>
-      <stop offset="1" stop-color="#e9edff" stop-opacity="0"/>
-    </radialGradient>
     <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
       <stop stop-color="#ffffff"/>
       <stop offset="1" stop-color="#f8f9ff"/>
@@ -35,9 +26,6 @@
       <stop offset="0.55" stop-color="#5269d9"/>
       <stop offset="1" stop-color="#7b5fe5"/>
     </linearGradient>
-    <pattern id="dot-grid" width="36" height="36" patternUnits="userSpaceOnUse">
-      <circle cx="2" cy="2" r="1.8" fill="#415ccf" fill-opacity="0.09"/>
-    </pattern>
     <filter id="card-shadow" x="-25%" y="-25%" width="150%" height="165%" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="20" stdDeviation="24" flood-color="#1a285f" flood-opacity="0.11"/>
     </filter>
@@ -56,12 +44,7 @@
     <clipPath id="aligned-wave"><rect x="570" y="558" width="460" height="104" rx="26"/></clipPath>
   </defs>
 
-  <rect width="1600" height="900" fill="url(#background)"/>
-  <rect width="1600" height="900" fill="url(#violet-halo)"/>
-  <rect width="1600" height="900" fill="url(#dot-grid)"/>
-
-  <path d="M80 768C223 713 340 812 475 755C612 697 705 785 823 749C954 709 1058 791 1197 742C1321 699 1425 742 1530 707" fill="none" stroke="#415ccf" stroke-opacity="0.08" stroke-width="4"/>
-  <path d="M80 794C229 745 345 827 477 780C619 730 714 804 830 772C965 735 1065 807 1200 766C1327 728 1430 763 1530 735" fill="none" stroke="#7667e8" stroke-opacity="0.07" stroke-width="2"/>
+  <rect width="1600" height="900" fill="#ffffff"/>
 
   <g opacity="0.95">
     <path d="M440 450H500" fill="none" stroke="#415ccf" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
@@ -81,7 +64,7 @@
   <!-- Source: several abandoned or repeated takes. -->
   <g>
     <rect x="114" y="273" width="58" height="38" rx="19" fill="#e9edff"/>
-    <text x="143" y="298" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18" font-weight="700" fill="#415ccf">01</text>
+    <text x="143" y="301" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#415ccf">1</text>
     <text x="114" y="357" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="4" fill="#0d1526">SOURCE</text>
 
     <rect x="126" y="389" width="258" height="56" rx="16" fill="#f0f2f7" stroke="#dfe3ec" stroke-width="2"/>
@@ -105,7 +88,7 @@
   <!-- Center: language selects the take; alignment owns the boundaries. -->
   <g>
     <rect x="558" y="166" width="58" height="38" rx="19" fill="#415ccf"/>
-    <text x="587" y="191" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18" font-weight="700" fill="#ffffff">02</text>
+    <text x="587" y="194" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#ffffff">2</text>
     <text x="558" y="255" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="4" fill="#0d1526">SELECT WORDS</text>
 
     <g>
@@ -143,7 +126,7 @@
   <!-- Final: one continuous audio waveform and direct video cuts. -->
   <g>
     <rect x="1208" y="273" width="58" height="38" rx="19" fill="#e9edff"/>
-    <text x="1237" y="298" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18" font-weight="700" fill="#415ccf">03</text>
+    <text x="1237" y="301" text-anchor="middle" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="28" font-weight="750" fill="#415ccf">3</text>
     <text x="1208" y="357" font-family="Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="34" font-weight="750" letter-spacing="3.5" fill="#0d1526">CLEAN EDIT</text>
 
     <rect x="1208" y="393" width="278" height="104" rx="28" fill="#e9edff"/>

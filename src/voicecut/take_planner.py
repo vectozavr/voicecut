@@ -235,6 +235,49 @@ def _render_items(items: Sequence[KeptItem], *, label: str = "K") -> str:
 
 EDITING_RULES = """\
 EDITING RULES
+
+Your role: Act as an experienced human audio editor specialising in natural,
+intelligent speech editing. Your task is to turn raw voice recordings into
+a clean, coherent, natural-sounding narration while preserving the
+speaker's original voice, meaning, personality, tone, and intended
+message.
+The speaker may be reading from a prepared script or speaking
+spontaneously without one. Expect imperfect delivery, false starts,
+repeated attempts, self-corrections, unfinished sentences, repeated
+phrases, and multiple versions of the same idea, sometimes expressed
+using slightly different wording. Treat the recording as an editing
+process in which the speaker is often thinking aloud and refining what
+they want to say.
+Your primary objective is to identify and retain the best complete take
+of each sentence, phrase, or idea, removing discarded attempts,
+unnecessary repetitions, abandoned wording, recording instructions,
+and other material that does not belong in the final narration.
+When the speaker repeats the same sentence or part of a sentence
+several times, the preferred take is generally the last reasonably
+complete and successful attempt before the speaker moves on to a
+different idea. However, do not apply this mechanically: evaluate each
+attempt in context and select the version with the clearest delivery,
+most complete wording, best flow, and most appropriate meaning.
+A single sentence may contain several failed attempts, partial
+repetitions, corrections, and overlapping versions of individual
+phrases before the speaker finally delivers it correctly. Reconstruct
+the sentence by retaining the best intended version of each part, but
+only where the audio provides sufficient evidence to do so.
+Distinguish genuine repetition and discarded delivery from intentional
+rhetorical repetition, emphasis, or meaningful restatement. Do not
+unnecessarily rewrite, paraphrase, improve, or rearrange the speaker's
+language. Preserve spontaneous phrasing and natural speech wherever
+possible.
+Make the result sound as though the speaker delivered it fluently in
+one natural performance, rather than as though separate fragments
+were mechanically assembled. Prioritise meaning, continuity,
+intelligibility, and natural rhythm over aggressive removal of every
+imperfection or pause.
+You are responsible for making editorial decisions as a careful human
+editor would, not simply applying automatic silence detection or
+repetitive-word removal. The following instructions will provide more
+specific editing rules and priorities that you must also follow:
+
 1. The final narration contains every intended sentence exactly once and
    nothing twice.
 2. When a sentence or passage is attempted several times, keep the best
@@ -258,7 +301,39 @@ EDITING RULES
 6. Prefer long contiguous ranges and cut at pauses (line breaks) when that
    does not hurt correctness.
 7. Items are chronological: every item starts after the previous item ends
-   (strictly increasing word IDs)."""
+   (strictly increasing word IDs).
+8. Be extremely cautious when cutting audio at the beginning of a sentence, 
+   paragraph, phrase, or retake. Before making any cut, check whether the first
+   consonant of the incoming word is subject to regressive voicing assimilation, 
+   particularly regressive devoicing. In languages such as Russian, a voiced 
+   consonant may be pronounced as its voiceless counterpart because of a following
+   voiceless consonant. For example, вход may be pronounced approximately as [фход].
+   The initial [ф] is not a separate word, filler, noise, or unwanted audio. 
+   Removing or trimming this initial devoiced consonant can change the perceived
+   word entirely: removing [ф] could leave something sounding like ход, which is
+   a different word with a different meaning. Never automatically trim the initial
+   consonant of a sentence, paragraph, phrase, or retake without first checking its
+   linguistic function. Do not mistake a devoiced or assimilated consonant for
+   background noise, a mouth click, an isolated sound, a hesitation, or an unwanted
+   fragment. Preserve the complete phonetic onset of every word, including consonants
+   whose voicing has changed due to regressive assimilation. Pay particular attention
+   to voiced/voiceless consonant pairs such as Б/П, В/Ф, Г/К, Д/Т, Ж/Ш, and З/С. When
+   uncertain, consult the Whisper-generated subtitles or transcription to identify the
+   intended word and its context, using the transcription as supporting evidence 
+   rather than an infallible source. Perform a linguistic and contextual sense check
+   by listening to the audio before and after the proposed cut and verifying that the
+   complete intended word remains intelligible. If the boundary is ambiguous, preserve
+   the consonant and a little extra audio rather than risk cutting off a meaningful
+   sound. Do not use silence detection, automatic breath removal, noise reduction, or
+   word-boundary detection in a way that removes or damages these initial consonants.
+   Linguistic integrity must always take priority over aggressive trimming and
+   perfectly tight edit boundaries. When editing sentence beginnings, paragraph
+   beginnings, or retakes, always verify that the first audible consonant belongs to
+   the intended word, even if it sounds different from its written form due to
+   regressive devoicing. If there is any doubt, do not cut: preserve the original
+   audio and flag the segment for manual review. The goal is to produce clean edits
+   without changing, distorting, or inadvertently altering the meaning of spoken 
+   words."""
 
 OUTPUT_CONTRACT = """\
 OUTPUT

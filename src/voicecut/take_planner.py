@@ -258,7 +258,25 @@ EDITING RULES
 6. Prefer long contiguous ranges and cut at pauses (line breaks) when that
    does not hurt correctness.
 7. Items are chronological: every item starts after the previous item ends
-   (strictly increasing word IDs)."""
+   (strictly increasing word IDs).
+
+CONSERVATIVE EDITING MODE:
+
+- Preserving the original narration is the highest priority.
+- Remove only clearly identifiable failed takes and explicit repetitions.
+- When in doubt, KEEP the original speech.
+- Prefer removing complete failed phrases or sentences.
+- Avoid removing isolated words inside otherwise valid sentences.
+- Never remove unique information.
+- Do not improve grammar, style, wording or sentence structure.
+- Do not shorten valid narration.
+- Do not treat ASR errors as evidence of failed speech.
+- Prefer keeping an accidental repetition over losing a valid word.
+- Minimize the number of cuts.
+- Preserve complete successful takes as contiguous source ranges.
+
+These conservative rules override any conflicting editing rules.
+"""
 
 OUTPUT_CONTRACT = """\
 OUTPUT
